@@ -56,7 +56,7 @@
 - `split`：当前两条用于开发调参，一条为候选测试题。
 - `reviewed_by_user`：本人核对后改为 `true`。
 
-当前共 27 条种子问题，每篇独立论文 3 条。它们由论文内容生成，可用于开发检索流程，但不能直接作为最终简历指标。最终测试集应补充本人从记忆写出的独立问题，并避免根据系统检索结果反向修改测试题。
+当前共 27 条种子问题，每篇独立论文 3 条。它们由论文内容生成，可用于开发检索流程，但不能直接作为最终简历指标。BM25 在这批同源问题上得到 100% Recall@1，只能说明链路和数据映射正确。最终测试集应补充本人从记忆写出的独立问题，并避免根据系统检索结果反向修改测试题。
 
 ## 版本重复的处理
 
@@ -69,6 +69,29 @@
 5. 评测命中任一 TCDI 文件都视为找到正确论文。
 
 这能避免同一论文的多个版本占据 Top-K。
+
+## 运行论文级 BM25 基线
+
+根据模糊描述返回前三篇论文：
+
+```powershell
+python -m src.paper_assistant search "我记得它先粗补，再用扩散模型学习残差" --top-k 3
+```
+
+运行全部种子问题评测：
+
+```powershell
+python -m src.paper_assistant evaluate
+```
+
+只评估开发集或候选测试集：
+
+```powershell
+python -m src.paper_assistant evaluate --split dev
+python -m src.paper_assistant evaluate --split test_candidate
+```
+
+检索以 `paper_id` 为单位。TCDI 的两个 PDF 版本会合并成一个候选结果，但结果中仍会列出两个可用文件。
 
 ## 推荐评测方法
 
@@ -88,10 +111,10 @@ PDF 仅用于个人科研和本地实验，不应随公开仓库分发。公开 
 
 ## 下一步实现
 
-下一阶段将读取 `paper_catalog.csv` 构建论文级 `PaperProfile`，对每篇论文生成一条面向检索的综合文本，然后实现：
+当前已经实现论文级 `PaperProfile`、加权 BM25、版本去重及 Recall@1、Recall@3、MRR 评测。下一阶段将实现：
 
-1. BM25 论文级召回；
-2. Dense 论文级召回；
-3. RRF 融合与候选去重；
-4. `find_paper` MCP 工具；
-5. 基于 `eval_queries.jsonl` 的 Recall@1、Recall@3 和 MRR 评测。
+1. Dense 论文级召回；
+2. BM25 + Dense 的 RRF 融合；
+3. `find_paper` MCP 工具；
+4. 由本人独立编写并冻结的盲测集；
+5. BM25、Dense、RRF 三种方案的消融对比。
