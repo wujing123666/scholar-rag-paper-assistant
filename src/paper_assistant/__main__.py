@@ -71,6 +71,15 @@ def main() -> int:
     inventory_parser.add_argument("--inbox", type=Path, default=DEFAULT_INBOX)
     inventory_parser.add_argument("--output", type=Path)
 
+    prepare_parser = subparsers.add_parser(
+        "prepare-paper", help="Extract an evidence-backed Paper Profile draft"
+    )
+    prepare_parser.add_argument("pdf", type=Path)
+    prepare_parser.add_argument("--inbox", type=Path, default=DEFAULT_INBOX)
+    prepare_parser.add_argument("--output", type=Path)
+    prepare_parser.add_argument("--max-pages", type=int, default=5)
+    prepare_parser.add_argument("--force", action="store_true")
+
     args = parser.parse_args()
     if args.command == "inventory":
         report = build_paper_inventory(args.inbox, args.catalog)
@@ -78,6 +87,45 @@ def main() -> int:
             write_inventory_report(report, args.output)
         print(json.dumps(report.summary_dict(), ensure_ascii=False, indent=2))
         return 0 if report.status == "ok" else 1
+
+    if args.command == "prepare-paper":
+        from src.paper_assistant.profile_draft import (
+            prepare_profile_draft,
+            write_profile_draft,
+        )
+
+        draft = prepare_profile_draft(
+            args.pdf, args.inbox, args.catalog, max_pages=args.max_pages
+        )
+        output = args.output or Path("data/papers/drafts") / f"{args.pdf.stem}.json"
+        write_profile_draft(draft, output, overwrite=args.force)
+        fields = draft["extracted_fields"]
+        print(
+            json.dumps(
+                {
+                    "status": draft["status"],
+                    "pdf_file": draft["file"]["pdf_file"],
+                    "extracted": {
+                        name: (
+                            {
+                                "value": fields[name]["value"],
+                                "confidence": fields[name]["confidence"],
+                            }
+                            if fields[name]
+                            else None
+                        )
+                        for name in ("canonical_title", "authors", "year", "doi")
+                    },
+                    "missing_fields": draft["missing_fields"],
+                    "review_required_fields": draft["review_required_fields"],
+                    "warnings": draft["warnings"],
+                    "draft_file": str(output),
+                },
+                ensure_ascii=False,
+                indent=2,
+            )
+        )
+        return 0
 
     retriever = _build_retriever(
         args.catalog, args.retriever, args.model, args.model_cache

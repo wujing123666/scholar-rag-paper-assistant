@@ -164,6 +164,22 @@ python -m src.paper_assistant inventory --output data/papers/inventory.json
 
 命令只读取 PDF 和 CSV，不会修改目录或论文档案。默认只在终端输出不含绝对路径和文件哈希的检查摘要。状态为 `ok` 时退出码为 0；发现需要人工处理的问题时状态为 `attention_required`，退出码为 1。使用 `--output` 保存的完整报告包含本地绝对路径、文件名、大小和哈希，应继续保存在本地；`data/papers/inventory.json` 已由现有忽略规则排除在 Git 之外。
 
+## 生成待确认的论文档案
+
+对 `inbox/` 中的一篇 PDF 生成候选 Paper Profile：
+
+```powershell
+python -m src.paper_assistant prepare-paper "data/papers/inbox/新论文.pdf"
+```
+
+草稿默认写入 `data/papers/drafts/新论文.json`。如需覆盖已有草稿，显式添加 `--force`；也可以用 `--output` 指定其他本地路径。
+
+第一版不调用大模型。程序从 PDF 元数据、首页排版和前五页原文中提取标题、作者、年份、摘要、DOI 和语言，并为每个字段保存来源、页码、原文证据和置信度。低置信度候选会列入 `review_required_fields`，但不会自动填入 `proposed_profile`。例如 PDF 创建年份不一定是论文发表年份，双盲稿的作者行也可能只有 `Anonymous authors`。`tags`、`method_summary`、`datasets`、`memory_cues` 等语义字段保持为空，等待后续模型生成或本人填写。
+
+生成草稿前还会重新运行文件盘点。已经登记的文件标记为 `already_registered`；与其他文件字节完全相同的 PDF 标记为 `duplicate_review_required`；普通新文件标记为 `needs_review`。命令不会自动修改 `paper_catalog.csv`。
+
+如果 PDF 没有可选择的文字，草稿会提示可能需要 OCR。目前不会根据扫描图片猜测论文信息。
+
 ## 推荐评测方法
 
 第一版至少报告：
