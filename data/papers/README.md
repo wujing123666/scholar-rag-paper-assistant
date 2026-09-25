@@ -124,6 +124,22 @@ python -m src.paper_assistant --retriever hybrid --model-cache data/models/faste
 
 检索以 `paper_id` 为单位。TCDI 的两个 PDF 版本会合并成一个候选结果，但结果中仍会列出两个可用文件。
 
+## 通过 MCP 查找论文
+
+MCP Server 会自动注册 `find_paper` 工具。客户端只需传入模糊描述：
+
+```json
+{
+  "query": "帮我找使用了扩散模型加切比雪夫的论文",
+  "top_k": 3,
+  "retriever": "bm25"
+}
+```
+
+工具返回人类可读文本和结构化结果，包括 `paper_id`、中英文标题、作者、年份、期刊或会议、匹配词、方法摘要和本地 PDF 文件名。同一论文的多个 PDF 版本会出现在一个论文结果下。
+
+`retriever` 可选 `bm25`、`dense` 或 `hybrid`。默认使用 `bm25`，启动快且不需要加载向量模型；只有明确选择 `dense` 或 `hybrid` 时才加载本地 Embedding。
+
 ## 推荐评测方法
 
 第一版至少报告：
@@ -144,8 +160,8 @@ PDF 仅用于个人科研和本地实验，不应随公开仓库分发。公开 
 
 当前已经实现论文级 `PaperProfile`、加权 BM25、本地 BGE Dense、RRF 融合、版本去重及 Recall@1、Recall@3、MRR 评测。下一阶段将实现：
 
-1. `find_paper` MCP 工具；
-2. 未知论文拒答和相似度阈值；
-3. 扩展到约 100 篇本人读过的论文；
+1. 未知论文拒答和相似度阈值；
+2. 扩展到约 100 篇本人读过的论文；
+3. 增量导入、文件哈希与档案更新；
 4. 增加由本人独立编写并冻结的盲测问题；
 5. 加入查询延迟、P95 延迟和拒答准确率评测。

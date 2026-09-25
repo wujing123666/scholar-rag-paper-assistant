@@ -199,6 +199,62 @@ def test_mcp_server_tools_list_stdio() -> None:
     tool_names = [t["name"] for t in tools_response["result"]["tools"]]
     assert "query_knowledge_hub" in tool_names
     assert "list_collections" in tool_names
+    assert "find_paper" in tool_names
+
+
+@pytest.mark.integration
+def test_find_paper_call_stdio() -> None:
+    """Call find_paper through the real MCP stdio transport."""
+    proc = subprocess.Popen(
+        [sys.executable, "-m", "src.mcp_server.server"],
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        encoding="utf-8",
+    )
+    requests = [
+        {
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "initialize",
+            "params": {
+                "protocolVersion": "2025-06-18",
+                "clientInfo": {"name": "pytest", "version": "0.0.0"},
+                "capabilities": {},
+            },
+        },
+        {"jsonrpc": "2.0", "method": "notifications/initialized"},
+        {
+            "jsonrpc": "2.0",
+            "id": 2,
+            "method": "tools/call",
+            "params": {
+                "name": "find_paper",
+                "arguments": {
+                    "query": "使用扩散模型加切比雪夫的论文",
+                    "top_k": 3,
+                },
+            },
+        },
+    ]
+
+    try:
+        lines = send_and_receive(proc, requests, timeout=10.0)
+    finally:
+        proc.terminate()
+        try:
+            proc.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            proc.wait()
+
+    response = find_response(lines, 2)
+    assert response is not None, f"No tools/call response found in: {lines}"
+    result = response["result"]
+    assert result["isError"] is False
+    assert "TCDI：面向群智感知时空监测的拓扑感知条件扩散插补" in result["content"][0]["text"]
+    assert result["structuredContent"]["results"][0]["paper_id"] == "tcdi"
 
 
 # =============================================================================
