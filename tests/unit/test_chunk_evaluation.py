@@ -200,6 +200,80 @@ def test_two_stage_evaluation_fuses_candidates_and_finds_target_evidence():
     assert len(retriever.calls) == 2
 
 
+def test_two_stage_reranks_all_paper_candidates_in_one_comparable_pool():
+    retriever = FakeChunkRetriever(
+        {
+            "target": [
+                _result(
+                    "target",
+                    9,
+                    "Kalman fusion uses uncertainty estimates.",
+                    0.8,
+                )
+            ],
+            "other": [_result("other", 2, "generic prediction fusion", 0.9)],
+        }
+    )
+
+    class RecordingReranker:
+        def __init__(self):
+            self.calls = []
+
+        def rerank(self, query, results, *, top_k):
+            self.calls.append((query, tuple(result.chunk_id for result in results)))
+            return list(reversed(results))[:top_k]
+
+    reranker = RecordingReranker()
+    report = evaluate_chunk_retriever(
+        retriever,
+        [_case()],
+        candidate_resolver=lambda _query: ("target", "other"),
+        reranker=reranker,
+        rerank_candidates=5,
+    )
+
+    assert len(reranker.calls) == 1
+    assert set(reranker.calls[0][1]) == {"target:9", "other:2"}
+    assert report["reranker_fallbacks"] == {}
+
+
+def test_default_reranking_keeps_the_original_global_top_five_candidates():
+    retriever = FakeChunkRetriever(
+        {
+            "target": [
+                _result("target", page, f"target evidence {page}", score)
+                for page, score in ((1, 0.95), (2, 0.85), (3, 0.75))
+            ],
+            "other": [
+                _result("other", page, f"other evidence {page}", score)
+                for page, score in ((1, 0.9), (2, 0.8), (3, 0.1))
+            ],
+        }
+    )
+
+    class RecordingReranker:
+        def __init__(self):
+            self.candidate_ids = ()
+
+        def rerank(self, query, results, *, top_k):
+            self.candidate_ids = tuple(result.chunk_id for result in results)
+            return list(reversed(results))[:top_k]
+
+    reranker = RecordingReranker()
+    report = evaluate_chunk_retriever(
+        retriever,
+        [_case()],
+        candidate_resolver=lambda _query: ("target", "other"),
+        reranker=reranker,
+    )
+
+    assert len(reranker.candidate_ids) == 5
+    assert "other:3" not in reranker.candidate_ids
+    assert {item["chunk_id"] for item in report["cases"][0]["returned_chunks"]} == set(
+        reranker.candidate_ids
+    )
+
+
 def test_chunk_evaluation_rejects_non_positive_top_k():
     with pytest.raises(ValueError, match="top_k"):
         evaluate_chunk_retriever(FakeChunkRetriever({}), [_case()], top_k=0)

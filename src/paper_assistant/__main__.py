@@ -27,6 +27,7 @@ DEFAULT_CHUNK_COLLECTION = "paper_chunks_v1"
 
 
 DEFAULT_DENSE_MODEL = "BAAI/bge-small-zh-v1.5"
+DEFAULT_RERANKER_MODEL = "BAAI/bge-reranker-base"
 
 
 def _configure_stdout_utf8() -> None:
@@ -82,6 +83,15 @@ def main() -> int:
     parser.add_argument("--chroma-host", default="localhost")
     parser.add_argument("--chroma-port", type=int, default=8000)
     parser.add_argument("--chroma-ssl", action="store_true")
+    parser.add_argument(
+        "--chunk-reranker", choices=("none", "fastembed"), default="none"
+    )
+    parser.add_argument("--reranker-model", default=DEFAULT_RERANKER_MODEL)
+    parser.add_argument(
+        "--reranker-cache", type=Path, default=Path("data/models/fastembed")
+    )
+    parser.add_argument("--rerank-candidates", type=int, default=5)
+    parser.add_argument("--rerank-weight", type=float, default=0.35)
     parser.add_argument(
         "--min-score",
         type=float,
@@ -249,6 +259,10 @@ def main() -> int:
 
         if args.candidate_papers < 1:
             parser.error("--candidate-papers must be at least one")
+        if args.rerank_candidates < 1:
+            parser.error("--rerank-candidates must be at least one")
+        if not 0 <= args.rerank_weight <= 1:
+            parser.error("--rerank-weight must be between zero and one")
         catalog = PaperCatalog.from_csv(args.catalog)
         embedding = FastEmbedEmbedding(model=args.model, cache_dir=args.model_cache)
         paper_retriever = None
@@ -326,6 +340,16 @@ def main() -> int:
             chunk_size=args.chunk_size,
             chunk_overlap=args.chunk_overlap,
         )
+        index_sync = chunk_retriever.index_sync
+        chunk_reranker = None
+        if args.chunk_reranker == "fastembed":
+            from src.paper_assistant.chunk_reranker import FastEmbedChunkReranker
+
+            chunk_reranker = FastEmbedChunkReranker(
+                args.reranker_model,
+                cache_dir=args.reranker_cache,
+                weight=args.rerank_weight,
+            )
         if args.command == "evaluate-chunks":
             from src.paper_assistant.chunk_evaluation import (
                 evaluate_chunk_retriever,
@@ -337,6 +361,8 @@ def main() -> int:
                 load_chunk_evaluation_cases(args.queries),
                 top_k=args.top_k,
                 candidate_resolver=None if args.oracle_paper else resolve_candidates,
+                reranker=chunk_reranker,
+                rerank_candidates=args.rerank_candidates,
             )
             report["paper_retriever"] = (
                 "oracle" if args.oracle_paper else args.retriever
@@ -344,34 +370,60 @@ def main() -> int:
             report["candidate_papers"] = (
                 1 if args.oracle_paper else args.candidate_papers
             )
-            report["index_sync"] = asdict(chunk_retriever.index_sync)
+            report["chunk_reranker"] = args.chunk_reranker
+            report["reranker_model"] = (
+                args.reranker_model if args.chunk_reranker != "none" else None
+            )
+            report["index_sync"] = asdict(index_sync)
             print(json.dumps(report, ensure_ascii=False, indent=2))
             return 0
 
+        retrieval_k = (
+            max(args.top_k, args.rerank_candidates)
+            if chunk_reranker
+            else args.top_k
+        )
+        reranker_fallback = None
         if automatic_routing:
             results = []
             for paper_id in candidate_ids:
                 results.extend(
                     chunk_retriever.search(
                         args.query,
-                        top_k=args.top_k,
+                        top_k=retrieval_k,
                         paper_ids=(paper_id,),
                     )
                 )
-            results = apply_paper_routing_prior(results, candidate_ids)[: args.top_k]
+            results = apply_paper_routing_prior(results, candidate_ids)
         else:
             results = chunk_retriever.search(
                 args.query,
-                top_k=args.top_k,
+                top_k=retrieval_k,
                 paper_ids=candidate_ids,
             )
+        if chunk_reranker:
+            from src.paper_assistant.chunk_reranker import rerank_with_fallback
+
+            results = results[:retrieval_k]
+            results, reranker_fallback = rerank_with_fallback(
+                chunk_reranker, args.query, results, top_k=args.top_k
+            )
+        else:
+            results = results[: args.top_k]
         print(
             json.dumps(
                 {
                     "query": args.query,
                     "paper_retriever": args.retriever,
+                    "chunk_reranker": args.chunk_reranker,
+                    "reranker_model": (
+                        args.reranker_model
+                        if args.chunk_reranker != "none"
+                        else None
+                    ),
+                    "reranker_fallback": reranker_fallback,
                     "candidate_papers": list(candidate_ids),
-                    "index_sync": asdict(chunk_retriever.index_sync),
+                    "index_sync": asdict(index_sync),
                     "results": [
                         {
                             "rank": rank,
@@ -379,6 +431,11 @@ def main() -> int:
                             "score": round(result.score, 4),
                             "dense_score": round(result.dense_score, 4),
                             "sparse_score": round(result.sparse_score, 4),
+                            "rerank_score": (
+                                round(result.rerank_score, 4)
+                                if result.rerank_score is not None
+                                else None
+                            ),
                             "routing_rank": result.routing_rank or None,
                             "paper_id": result.paper.paper_id,
                             "paper_title": result.paper.display_title,

@@ -25,6 +25,16 @@ class ChunkRetriever(Protocol):
 CandidateResolver = Callable[[str], tuple[str, ...]]
 
 
+class ChunkReranker(Protocol):
+    def rerank(
+        self,
+        query: str,
+        results: list[ChunkSearchResult],
+        *,
+        top_k: int,
+    ) -> list[ChunkSearchResult]: ...
+
+
 @dataclass(frozen=True)
 class ChunkEvaluationCaseResult:
     query_id: str
@@ -157,12 +167,17 @@ def evaluate_chunk_retriever(
     *,
     top_k: int = 5,
     candidate_resolver: CandidateResolver | None = None,
+    reranker: ChunkReranker | None = None,
+    rerank_candidates: int = 5,
 ) -> dict[str, Any]:
     """Evaluate oracle-paper or routed page-level evidence retrieval."""
     if top_k < 1:
         raise ValueError("top_k must be at least one")
+    if rerank_candidates < 1:
+        raise ValueError("rerank_candidates must be at least one")
     selected_cases = list(cases)
     results: list[ChunkEvaluationCaseResult] = []
+    fallback_reasons: dict[str, str] = {}
     for case in selected_cases:
         expected_paper_id = case["expected_paper_id"]
         if candidate_resolver is None:
@@ -171,10 +186,11 @@ def evaluate_chunk_retriever(
             candidate_ids = tuple(dict.fromkeys(candidate_resolver(case["query"])))
 
         matches: list[ChunkSearchResult] = []
+        retrieval_k = max(top_k, rerank_candidates) if reranker else top_k
         if candidate_ids:
             if candidate_resolver is None:
                 matches = retriever.search(
-                    case["query"], top_k=top_k, paper_ids=candidate_ids
+                    case["query"], top_k=retrieval_k, paper_ids=candidate_ids
                 )
             else:
                 from src.paper_assistant.chunk_retriever import (
@@ -184,10 +200,23 @@ def evaluate_chunk_retriever(
                 for paper_id in candidate_ids:
                     matches.extend(
                         retriever.search(
-                            case["query"], top_k=top_k, paper_ids=(paper_id,)
+                            case["query"],
+                            top_k=retrieval_k,
+                            paper_ids=(paper_id,),
                         )
                     )
-                matches = apply_paper_routing_prior(matches, candidate_ids)[:top_k]
+                matches = apply_paper_routing_prior(matches, candidate_ids)
+            if reranker:
+                from src.paper_assistant.chunk_reranker import rerank_with_fallback
+
+                matches = matches[:retrieval_k]
+                matches, fallback = rerank_with_fallback(
+                    reranker, case["query"], matches, top_k=top_k
+                )
+                if fallback:
+                    fallback_reasons[case["id"]] = fallback
+            else:
+                matches = matches[:top_k]
 
         page_rank = _rank(matches, lambda result: _matches_page(result, case))
         evidence_rank = _rank(matches, lambda result: _matches_evidence(result, case))
@@ -207,6 +236,11 @@ def evaluate_chunk_retriever(
                         "page_number": match.page_number,
                         "chunk_id": match.chunk_id,
                         "score": round(match.score, 6),
+                        "rerank_score": (
+                            round(match.rerank_score, 6)
+                            if match.rerank_score is not None
+                            else None
+                        ),
                     }
                     for rank, match in enumerate(matches, start=1)
                 ),
@@ -218,6 +252,7 @@ def evaluate_chunk_retriever(
     return {
         "mode": "oracle_paper" if candidate_resolver is None else "two_stage",
         "top_k": top_k,
+        "reranker_fallbacks": fallback_reasons,
         "paper_routing": {
             "queries": count,
             "hits": routed,
