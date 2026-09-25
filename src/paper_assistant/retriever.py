@@ -61,6 +61,8 @@ class PaperSearchResult:
 class PaperBM25Retriever:
     """Rank one profile per paper and collapse duplicate PDF versions."""
 
+    name = "paper_bm25"
+
     def __init__(
         self,
         catalog: PaperCatalog,

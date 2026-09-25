@@ -3,9 +3,17 @@
 from __future__ import annotations
 
 import csv
+import sys
+import types
 
+import numpy as np
+
+from src.libs.embedding.base_embedding import BaseEmbedding
+from src.libs.embedding.fastembed_embedding import FastEmbedEmbedding
 from src.paper_assistant.catalog import PaperCatalog
+from src.paper_assistant.dense_retriever import PaperDenseRetriever, profile_text
 from src.paper_assistant.evaluation import evaluate_retriever
+from src.paper_assistant.hybrid_retriever import PaperHybridRetriever
 from src.paper_assistant.retriever import PaperBM25Retriever
 
 CATALOG_FIELDS = [
@@ -125,3 +133,134 @@ def test_evaluation_reports_rank_metrics(tmp_path):
         "recall_at_3": 1.0,
         "mrr": 1.0,
     }
+
+
+class _KeywordEmbedding(BaseEmbedding):
+    """Small deterministic test double; no model download is required."""
+
+    def __init__(self):
+        self.calls = []
+
+    def embed(self, texts, trace=None, **kwargs):
+        del trace
+        self.calls.append((tuple(texts), kwargs.get("is_query", False)))
+        vectors = []
+        for text in texts:
+            vectors.append(
+                [
+                    float("强化学习" in text or "招募" in text),
+                    float("扩散" in text or "插补" in text),
+                ]
+            )
+        return vectors
+
+    def get_dimension(self):
+        return 2
+
+
+def test_dense_retriever_ranks_one_vector_per_paper(tmp_path):
+    catalog = PaperCatalog.from_csv(_write_catalog(tmp_path))
+    embedding = _KeywordEmbedding()
+
+    retriever = PaperDenseRetriever(catalog, embedding)
+    results = retriever.search("帮我找使用强化学习的论文", top_k=2)
+
+    assert results[0].paper.paper_id == "recruitment"
+    assert results[0].matched_terms == ()
+    assert len(embedding.calls[0][0]) == 2
+    assert embedding.calls[0][1] is False
+    assert embedding.calls[1][1] is True
+    assert evaluate_retriever(
+        retriever,
+        [
+            {
+                "id": "q1",
+                "description": "强化学习招募",
+                "expected_paper_id": "recruitment",
+            }
+        ],
+    )["retriever"] == "paper_dense"
+
+
+def test_profile_text_keeps_human_readable_field_labels(tmp_path):
+    profile = PaperCatalog.from_csv(_write_catalog(tmp_path)).get("diffusion")
+
+    text = profile_text(profile)
+
+    assert "中文标题：拓扑扩散插补" in text
+    assert "数据集：Los-loop；PEMS-BAY" in text
+    assert "记忆线索：百分之三观测率和切比雪夫图滤波" in text
+
+
+def test_fastembed_provider_uses_separate_document_and_query_methods(monkeypatch):
+    calls = []
+
+    class FakeTextEmbedding:
+        def __init__(self, **kwargs):
+            calls.append(("init", kwargs))
+
+        def embed(self, texts, **kwargs):
+            calls.append(("documents", tuple(texts), kwargs))
+            return iter([np.asarray([1.0, 0.0]) for _ in texts])
+
+        def query_embed(self, texts, **kwargs):
+            calls.append(("queries", tuple(texts), kwargs))
+            return iter([np.asarray([0.0, 1.0]) for _ in texts])
+
+    monkeypatch.setitem(
+        sys.modules, "fastembed", types.SimpleNamespace(TextEmbedding=FakeTextEmbedding)
+    )
+    embedding = FastEmbedEmbedding(model="BAAI/bge-small-zh-v1.5", threads=2)
+
+    assert embedding.embed(["论文档案"]) == [[1.0, 0.0]]
+    assert embedding.embed(["模糊查询"], is_query=True) == [[0.0, 1.0]]
+    assert calls == [
+        (
+            "init",
+            {
+                "model_name": "BAAI/bge-small-zh-v1.5",
+                "cache_dir": None,
+                "threads": 2,
+            },
+        ),
+        ("documents", ("论文档案",), {}),
+        ("queries", ("模糊查询",), {}),
+    ]
+
+
+def test_hybrid_retriever_combines_sparse_and_dense_ranks(tmp_path):
+    catalog = PaperCatalog.from_csv(_write_catalog(tmp_path))
+    sparse = PaperBM25Retriever(catalog)
+    dense = PaperDenseRetriever(catalog, _KeywordEmbedding())
+    retriever = PaperHybridRetriever(catalog, sparse, dense)
+
+    results = retriever.search("强化学习招募", top_k=2)
+
+    assert results[0].paper.paper_id == "recruitment"
+    assert results[0].score == 2 / 61
+    assert evaluate_retriever(
+        retriever,
+        [
+            {
+                "id": "q1",
+                "description": "强化学习招募",
+                "expected_paper_id": "recruitment",
+            }
+        ],
+    )["retriever"] == "paper_hybrid_rrf"
+
+
+def test_hybrid_retriever_requires_shared_catalog(tmp_path):
+    catalog = PaperCatalog.from_csv(_write_catalog(tmp_path))
+    other_catalog = PaperCatalog.from_csv(_write_catalog(tmp_path))
+
+    try:
+        PaperHybridRetriever(
+            catalog,
+            PaperBM25Retriever(other_catalog),
+            PaperDenseRetriever(catalog, _KeywordEmbedding()),
+        )
+    except ValueError as error:
+        assert "same paper catalog" in str(error)
+    else:
+        raise AssertionError("Expected mismatched catalogs to be rejected")

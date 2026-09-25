@@ -70,12 +70,25 @@
 
 这能避免同一论文的多个版本占据 Top-K。
 
-## 运行论文级 BM25 基线
+## 运行论文级检索
 
 根据模糊描述返回前三篇论文：
 
 ```powershell
 python -m src.paper_assistant search "我记得它先粗补，再用扩散模型学习残差" --top-k 3
+```
+
+Dense 与 Hybrid 模式使用本地中文向量模型。首次运行前安装可选依赖：
+
+```powershell
+pip install -e ".[local]"
+```
+
+首次运行会下载约 90 MB 的 `BAAI/bge-small-zh-v1.5` ONNX 模型，后续从本地缓存加载：
+
+```powershell
+python -m src.paper_assistant --retriever dense --model-cache data/models/fastembed search "使用扩散模型做插补的论文" --top-k 3
+python -m src.paper_assistant --retriever hybrid --model-cache data/models/fastembed search "使用强化学习招募用户的论文" --top-k 3
 ```
 
 运行全部种子问题评测：
@@ -90,6 +103,24 @@ python -m src.paper_assistant evaluate
 python -m src.paper_assistant evaluate --split dev
 python -m src.paper_assistant evaluate --split test_candidate
 ```
+
+比较三种检索器时，只改变 `--retriever`：
+
+```powershell
+python -m src.paper_assistant --retriever bm25 evaluate
+python -m src.paper_assistant --retriever dense --model-cache data/models/fastembed evaluate
+python -m src.paper_assistant --retriever hybrid --model-cache data/models/fastembed evaluate
+```
+
+当前 27 条同源种子问题的结果如下。这些问题来自同一批论文内容，只适合验证流程和做开发期消融，不能作为最终准确率：
+
+| 检索器 | Recall@1 | Recall@3 | MRR |
+|---|---:|---:|---:|
+| 加权 BM25 | 100.0% | 100.0% | 1.000 |
+| BGE Dense | 74.1% | 88.9% | 0.831 |
+| BM25 + Dense + RRF | 85.2% | 100.0% | 0.920 |
+
+这组小数据上 BM25 的精确术语匹配最强，RRF 没有超过 BM25 的 Top-1。这个结果会被保留，而不是为了得到更好看的数字在同源题上反复调参。后续扩大论文库并增加独立盲测问题后，再判断混合检索是否带来稳定收益。
 
 检索以 `paper_id` 为单位。TCDI 的两个 PDF 版本会合并成一个候选结果，但结果中仍会列出两个可用文件。
 
@@ -111,10 +142,10 @@ PDF 仅用于个人科研和本地实验，不应随公开仓库分发。公开 
 
 ## 下一步实现
 
-当前已经实现论文级 `PaperProfile`、加权 BM25、版本去重及 Recall@1、Recall@3、MRR 评测。下一阶段将实现：
+当前已经实现论文级 `PaperProfile`、加权 BM25、本地 BGE Dense、RRF 融合、版本去重及 Recall@1、Recall@3、MRR 评测。下一阶段将实现：
 
-1. Dense 论文级召回；
-2. BM25 + Dense 的 RRF 融合；
-3. `find_paper` MCP 工具；
-4. 由本人独立编写并冻结的盲测集；
-5. BM25、Dense、RRF 三种方案的消融对比。
+1. `find_paper` MCP 工具；
+2. 未知论文拒答和相似度阈值；
+3. 扩展到约 100 篇本人读过的论文；
+4. 增加由本人独立编写并冻结的盲测问题；
+5. 加入查询延迟、P95 延迟和拒答准确率评测。
