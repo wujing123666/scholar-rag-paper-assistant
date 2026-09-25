@@ -19,6 +19,7 @@ from src.paper_assistant.retriever import PaperBM25Retriever
 
 DEFAULT_CATALOG = Path("data/papers/paper_catalog.csv")
 DEFAULT_EVALUATION = Path("data/papers/eval_queries.jsonl")
+DEFAULT_CHUNK_EVALUATION = Path("data/papers/chunk_eval_queries.jsonl")
 DEFAULT_INBOX = Path("data/papers/inbox")
 DEFAULT_PAPER_CHROMA = Path("data/db/chroma")
 DEFAULT_PAPER_COLLECTION = "paper_profiles_v1"
@@ -143,6 +144,23 @@ def main() -> int:
     chunk_parser.add_argument("--chunk-size", type=int, default=1200)
     chunk_parser.add_argument("--chunk-overlap", type=int, default=180)
 
+    chunk_evaluate_parser = subparsers.add_parser(
+        "evaluate-chunks", help="Evaluate page-level evidence retrieval"
+    )
+    chunk_evaluate_parser.add_argument(
+        "--queries", type=Path, default=DEFAULT_CHUNK_EVALUATION
+    )
+    chunk_evaluate_parser.add_argument("--inbox", type=Path, default=DEFAULT_INBOX)
+    chunk_evaluate_parser.add_argument("--candidate-papers", type=int, default=3)
+    chunk_evaluate_parser.add_argument("--top-k", type=int, default=5)
+    chunk_evaluate_parser.add_argument("--chunk-size", type=int, default=1200)
+    chunk_evaluate_parser.add_argument("--chunk-overlap", type=int, default=180)
+    chunk_evaluate_parser.add_argument(
+        "--oracle-paper",
+        action="store_true",
+        help="Evaluate chunk ranking inside the known target paper only.",
+    )
+
     args = parser.parse_args()
     if args.command == "inventory":
         report = build_paper_inventory(args.inbox, args.catalog)
@@ -222,7 +240,7 @@ def main() -> int:
             )
             return 1
 
-    if args.command == "search-chunks":
+    if args.command in {"search-chunks", "evaluate-chunks"}:
         from src.libs.vector_store.chroma_store import ChromaStore
         from src.paper_assistant.chunk_retriever import (
             PaperChunkRetriever,
@@ -233,9 +251,11 @@ def main() -> int:
             parser.error("--candidate-papers must be at least one")
         catalog = PaperCatalog.from_csv(args.catalog)
         embedding = FastEmbedEmbedding(model=args.model, cache_dir=args.model_cache)
-        candidate_ids = tuple(dict.fromkeys(args.paper_id))
-        automatic_routing = not candidate_ids
-        if not candidate_ids:
+        paper_retriever = None
+        needs_paper_router = args.command == "evaluate-chunks" and not args.oracle_paper
+        if args.command == "search-chunks":
+            needs_paper_router = not args.paper_id
+        if needs_paper_router:
             if args.retriever == "bm25":
                 paper_retriever = PaperBM25Retriever(catalog)
             else:
@@ -255,13 +275,27 @@ def main() -> int:
                         catalog, PaperBM25Retriever(catalog), dense
                     )
                 )
-            candidate_ids = tuple(
+
+        def resolve_candidates(query: str) -> tuple[str, ...]:
+            if paper_retriever is None:
+                return ()
+            return tuple(
                 result.paper.paper_id
                 for result in paper_retriever.search(
-                    args.query, top_k=min(args.candidate_papers, len(catalog))
+                    query, top_k=min(args.candidate_papers, len(catalog))
                 )
             )
-        if not candidate_ids:
+
+        if args.command == "search-chunks":
+            candidate_ids = tuple(dict.fromkeys(args.paper_id))
+            automatic_routing = not candidate_ids
+            if automatic_routing:
+                candidate_ids = resolve_candidates(args.query)
+        else:
+            candidate_ids = ()
+            automatic_routing = False
+
+        if args.command == "search-chunks" and not candidate_ids:
             print(
                 json.dumps(
                     {
@@ -292,6 +326,28 @@ def main() -> int:
             chunk_size=args.chunk_size,
             chunk_overlap=args.chunk_overlap,
         )
+        if args.command == "evaluate-chunks":
+            from src.paper_assistant.chunk_evaluation import (
+                evaluate_chunk_retriever,
+                load_chunk_evaluation_cases,
+            )
+
+            report = evaluate_chunk_retriever(
+                chunk_retriever,
+                load_chunk_evaluation_cases(args.queries),
+                top_k=args.top_k,
+                candidate_resolver=None if args.oracle_paper else resolve_candidates,
+            )
+            report["paper_retriever"] = (
+                "oracle" if args.oracle_paper else args.retriever
+            )
+            report["candidate_papers"] = (
+                1 if args.oracle_paper else args.candidate_papers
+            )
+            report["index_sync"] = asdict(chunk_retriever.index_sync)
+            print(json.dumps(report, ensure_ascii=False, indent=2))
+            return 0
+
         if automatic_routing:
             results = []
             for paper_id in candidate_ids:
