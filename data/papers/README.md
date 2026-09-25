@@ -113,6 +113,28 @@ python -m src.paper_assistant --retriever dense --chroma-mode server --chroma-ho
 
 服务器模式要求 Chroma Server 已经启动。本地与服务器模式使用相同的 `paper_profiles_v1` 数据契约，Dense、Hybrid 和 MCP 检索逻辑不需要随部署方式改变。
 
+## 检索论文正文块
+
+论文级索引负责从整个目录中选择候选论文；正文索引使用独立的 Chroma collection `paper_chunks_v1`，负责在候选论文中定位原文证据。每个正文块保存 `paper_id`、PDF 文件名、PDF 页码、章节、块序号、PDF 哈希和正文内容哈希。
+
+自动执行“论文级路由 → 正文块检索”：
+
+```powershell
+python -m src.paper_assistant --retriever bm25 --model-cache data/models/fastembed search-chunks "哪篇论文用CORAL生成伪历史数据，并用卡尔曼滤波融合专用模型和泛化模型，它具体怎么做" --candidate-papers 3 --top-k 5
+```
+
+已经知道目标论文时，可以限定 `paper_id`：
+
+```powershell
+python -m src.paper_assistant --model-cache data/models/fastembed search-chunks "卡尔曼滤波如何根据不确定性融合两路预测" --paper-id mapt_stc_2026 --top-k 5
+```
+
+默认按页处理双栏 PDF，以 1200 个字符为目标块大小、180 个字符重叠；块不会跨越 PDF 页，因此返回页码可以直接核验。程序过滤重复页眉、页脚、低文本质量坐标轴和 References 部分，并保留最近的章节标题。中文查询中的常见科研术语会追加透明的英文别名，然后结合正文 BM25 与 Dense 得分；自动路由时再加入论文级排名先验，降低其他论文中的泛化术语块压过目标论文证据的概率。
+
+每篇逻辑论文当前只选择第一个实际存在的登记 PDF 建立正文索引，避免同一论文的多个修订版本重复召回。首次运行会构建全部正文向量；后续运行根据 PDF 哈希、分块参数、分块规则版本和 Embedding 模型复用未变化的块。本地实测 10 篇论文得到 506 个正文块，第二个进程全部复用。
+
+当前命令返回可供生成模型使用的证据上下文，包括论文标题、PDF、页码、章节、原文和检索分数。基于这些证据生成中文答案并逐条绑定引用仍是下一阶段，当前不会把检索到的正文误称为已经完成的生成式回答。
+
 运行全部种子问题评测：
 
 ```powershell
@@ -261,10 +283,10 @@ PDF 仅用于个人科研和本地实验，不应随公开仓库分发。公开 
 
 ## 下一步实现
 
-当前已经实现论文级 `PaperProfile`、加权 BM25、本地 BGE Dense、Chroma 持久化、阈值拒答、RRF 融合、版本去重、候选档案生成、受控增量入库及 Recall@1、Recall@3、MRR、Rejection Accuracy 和 Open-set Accuracy 评测。下一阶段将实现：
+当前已经实现论文级 `PaperProfile`、加权 BM25、本地 BGE Dense、论文级与正文块 Chroma 持久化、两级论文路由与页级正文 Hybrid 检索、阈值拒答、RRF 融合、版本去重、候选档案生成、受控增量入库及 Recall@1、Recall@3、MRR、Rejection Accuracy 和 Open-set Accuracy 评测。下一阶段将实现：
 
-1. 扩展到约 100 篇本人读过的论文；
-2. 为已有论文增加受控版本导入和档案更新；
-3. 增加由本人独立编写并冻结的已知与未知盲测问题；
-4. 按新语料重新校准拒答阈值，研究 Reranker 或成对判别；
-5. 加入平均查询延迟和 P95 延迟评测。
+1. 基于正文证据调用生成模型，输出逐条绑定论文、页码、章节和原文的回答；
+2. 建立正文问题、正确页码和证据片段组成的 Chunk Recall@K 测试集；
+3. 扩展到约 100 篇本人读过的论文；
+4. 为已有论文增加受控版本导入和档案更新；
+5. 按新语料重新校准拒答阈值，并加入平均查询延迟和 P95 延迟评测。
