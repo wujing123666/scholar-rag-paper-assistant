@@ -3,9 +3,11 @@
 from __future__ import annotations
 
 import csv
+from pathlib import Path
 
 import pytest
 
+from src.libs.embedding.base_embedding import BaseEmbedding
 from src.mcp_server.protocol_handler import ProtocolHandler
 from src.mcp_server.tools.find_paper import (
     TOOL_INPUT_SCHEMA,
@@ -142,3 +144,63 @@ def test_schema_and_registration():
     assert handler.tools["find_paper"].input_schema["properties"]["retriever"][
         "enum"
     ] == ["bm25", "dense", "hybrid"]
+
+
+def test_catalog_edit_invalidates_cached_retriever(catalog_path):
+    tool = FindPaperTool(catalog_path)
+    first_retriever = tool._get_retriever("bm25")
+    assert tool.find_papers("图神经网络")["result_count"] == 0
+
+    with catalog_path.open("a", encoding="utf-8", newline="") as handle:
+        writer = csv.DictWriter(handle, fieldnames=CATALOG_FIELDS)
+        writer.writerow(
+            {
+                "paper_id": "gnn",
+                "pdf_file": "gnn.pdf",
+                "canonical_title": "Graph Neural Networks",
+                "title_zh": "图神经网络综述",
+                "authors": "D",
+                "year": "2026",
+                "venue": "Journal",
+                "language": "zh",
+                "tags": "图神经网络",
+                "method_summary": "总结图神经网络方法",
+                "datasets": "",
+                "memory_cues": "图结构学习",
+                "duplicate_group": "",
+            }
+        )
+
+    payload = tool.find_papers("图神经网络")
+
+    assert payload["results"][0]["paper_id"] == "gnn"
+    assert tool._get_retriever("bm25") is not first_retriever
+
+
+@pytest.mark.asyncio
+async def test_missing_catalog_error_does_not_expose_absolute_path(tmp_path):
+    missing = tmp_path / "private" / "missing.csv"
+
+    result = await FindPaperTool(missing).execute("扩散模型")
+
+    assert result.isError is True
+    assert "论文目录不可用" in result.content[0].text
+    assert str(Path(missing).resolve()) not in result.content[0].text
+
+
+@pytest.mark.asyncio
+async def test_retriever_error_does_not_expose_internal_details(catalog_path):
+    class BrokenEmbedding(BaseEmbedding):
+        def embed(self, texts, trace=None, **kwargs):
+            raise RuntimeError("secret model path C:/private/model.onnx")
+
+        def get_dimension(self):
+            return 2
+
+    result = await FindPaperTool(
+        catalog_path, embedding=BrokenEmbedding()
+    ).execute("扩散模型", retriever="dense")
+
+    assert result.isError is True
+    assert "检索器暂时不可用" in result.content[0].text
+    assert "C:/private" not in result.content[0].text
