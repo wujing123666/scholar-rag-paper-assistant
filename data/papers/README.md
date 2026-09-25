@@ -144,6 +144,27 @@ python -m src.paper_assistant --retriever bm25 --model-cache data/models/fastemb
 
 默认使用 MIT 许可的 `BAAI/bge-reranker-base`，模型约 1.04 GB，第一次运行下载到本地模型缓存。重排默认关闭；开启后先完成论文路由、正文 Hybrid 检索和论文先验融合，再只对最终 Top-5 做统一重排。默认融合 35% Cross-Encoder 分数与 65% 原检索分数，因此不会改变 Top-5 成员，只调整其内部顺序。运行时推理失败会返回原排序，并在 JSON 的 `reranker_fallback` 中说明原因。
 
+## 基于证据回答问题
+
+`answer` 命令复用相同的“论文路由 → 正文检索 → 可选重排”链路，再把编号后的证据块交给已有的可插拔 LLM。自动路由首先经过论文级未知问题阈值，弱匹配不会进入生成阶段。模型必须返回结构化 Claim，每条 Claim 至少引用一个 `C1`、`C2` 等证据编号；程序会拒绝无引用结论、未知编号、非法 JSON 和模型主动报告的证据不足。最终引用由程序绑定到 `paper_id + pdf_file + page_number + section + chunk_id`，不会直接信任模型生成的来源信息。
+
+先复制一份仅保存在本地的 LLM 配置：
+
+```powershell
+Copy-Item config/settings.yaml config/settings.local.yaml
+```
+
+`config/settings.local.yaml` 已被 Git 忽略。使用 DeepSeek 时把其中 `llm.provider` 改为 `deepseek`、`llm.model` 改为实际模型，并通过环境变量设置 `DEEPSEEK_API_KEY`；使用 Ollama 时改为 `ollama` 和本机已有的模型。不要把真实密钥写入公开配置。
+
+```powershell
+$env:DEEPSEEK_API_KEY = "你的密钥"
+python -m src.paper_assistant --retriever hybrid --model-cache data/models/fastembed --chunk-reranker fastembed answer "MapT-STC如何根据不确定性融合两路预测？" --settings config/settings.local.yaml
+```
+
+返回 JSON 包含 `answer`、逐条 `claims`、实际使用的 `citations`、模型名和 token 用量。没有候选论文、正文 Chunk 数量不足、LLM 调用失败或输出未通过引用校验时，系统不会拼凑答案，而是返回 `status=insufficient_evidence` 或明确的配置错误。
+
+当前约束能保证每条输出 Claim 都绑定到真实返回的 Chunk，但“该 Chunk 是否在语义上完全蕴含该 Claim”仍主要依靠生成提示。后续需要用人工标注问答集评测引用正确率和忠实度，必要时增加独立的 Claim-Evidence 判别器。
+
 ## 评测正文证据检索
 
 正文开发集当前包含 10 条问题，每篇逻辑论文 1 条。每条记录保存目标 `paper_id`、一个或多个相关 PDF 页码、证据词和最低证据词命中数。它们由程序根据本地 PDF 定位后逐页核对，`source=system_labeled_from_pdf` 且 `reviewed_by_user=false`，因此是可迭代的开发集，不是用户盲测集。
