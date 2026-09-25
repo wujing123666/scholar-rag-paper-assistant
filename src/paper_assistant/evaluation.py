@@ -7,9 +7,19 @@ from collections import defaultdict
 from collections.abc import Iterable
 from dataclasses import asdict, dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, Protocol
 
-from src.paper_assistant.retriever import PaperBM25Retriever
+from src.paper_assistant.catalog import PaperCatalog
+from src.paper_assistant.retriever import PaperSearchResult
+
+
+class PaperRetriever(Protocol):
+    """Minimal interface shared by sparse and dense paper retrievers."""
+
+    name: str
+    catalog: PaperCatalog
+
+    def search(self, query: str, top_k: int = 3) -> list[PaperSearchResult]: ...
 
 
 @dataclass(frozen=True)
@@ -61,7 +71,7 @@ def _metrics(results: Iterable[EvaluationCaseResult]) -> dict[str, float | int]:
 
 
 def evaluate_retriever(
-    retriever: PaperBM25Retriever,
+    retriever: PaperRetriever,
     cases: Iterable[dict[str, Any]],
     *,
     split: str | None = None,
@@ -90,7 +100,7 @@ def evaluate_retriever(
     for result in results:
         groups[result.difficulty].append(result)
     return {
-        "retriever": "paper_bm25",
+        "retriever": retriever.name,
         "split": split or "all",
         "overall": _metrics(results),
         "by_difficulty": {

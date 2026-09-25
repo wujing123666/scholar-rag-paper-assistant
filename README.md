@@ -2,9 +2,9 @@
 
 > **ScholarRAG 论文助手开发版**
 >
-> 本仓库正在将通用 RAG 框架改造成个人论文检索助手：面向约 100 篇本人读过的论文，支持根据模糊记忆找回目标论文。当前已完成 Windows 运行兼容性修复、论文级 Paper Profile、版本去重、加权 BM25 检索，并建立首批 9 篇独立论文（10 个本地 PDF）的论文档案和 27 条种子检索问题。论文 PDF 仅保存在本地，不进入公开仓库。
+> 本仓库正在将通用 RAG 框架改造成个人论文检索助手：面向约 100 篇本人读过的论文，支持根据模糊记忆找回目标论文。当前已完成 Windows 运行兼容性修复、论文级 Paper Profile、版本去重、加权 BM25、本地中文 Dense 检索和 RRF 混合排序，并建立首批 9 篇独立论文（10 个本地 PDF）的论文档案和 27 条种子检索问题。论文 PDF 仅保存在本地，不进入公开仓库。
 >
-> 本项目基于 [jerry-ai-dev/MODULAR-RAG-MCP-SERVER](https://github.com/jerry-ai-dev/MODULAR-RAG-MCP-SERVER) 二次开发。后续提交会依次加入 Dense 检索、RRF 融合、`find_paper` MCP 工具及基于本人盲测问题的可复现评测。
+> 本项目基于 [jerry-ai-dev/MODULAR-RAG-MCP-SERVER](https://github.com/jerry-ai-dev/MODULAR-RAG-MCP-SERVER) 二次开发。下一阶段将加入 `find_paper` MCP 工具、未知论文拒答和更大规模的独立评测。
 
 > 一个可插拔、可观测的模块化 RAG（检索增强生成）服务框架，通过 MCP（Model Context Protocol）协议对外暴露工具接口，支持 Copilot / Claude 等 AI 助手直接调用。同时也是一份专为**大模型相关岗位学习与面试求职**设计的实战项目与配套教学资源。
 
