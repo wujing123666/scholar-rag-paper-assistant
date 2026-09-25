@@ -16,6 +16,7 @@ from src.libs.embedding.fastembed_embedding import FastEmbedEmbedding
 from src.paper_assistant.catalog import PaperCatalog
 from src.paper_assistant.dense_retriever import PaperDenseRetriever
 from src.paper_assistant.hybrid_retriever import PaperHybridRetriever
+from src.paper_assistant.rejection import decide_retrieval, default_min_score
 from src.paper_assistant.retriever import PaperBM25Retriever, PaperSearchResult
 
 if TYPE_CHECKING:
@@ -78,6 +79,7 @@ class FindPaperTool:
         chroma_host: str = "localhost",
         chroma_port: int = 8000,
         chroma_ssl: bool = False,
+        min_scores: dict[str, float] | None = None,
     ) -> None:
         self.catalog_path = resolve_path(catalog_path)
         self.model = model
@@ -89,6 +91,7 @@ class FindPaperTool:
         self.chroma_host = chroma_host
         self.chroma_port = chroma_port
         self.chroma_ssl = chroma_ssl
+        self.min_scores = dict(min_scores or {})
         self._catalog: PaperCatalog | None = None
         self._catalog_signature: tuple[int, int] | None = None
         self._retrievers: dict[str, PaperRetriever] = {}
@@ -191,10 +194,26 @@ class FindPaperTool:
                 "retriever must be one of: bm25, dense, hybrid"
             )
 
-        matches = self._get_retriever(retriever).search(query.strip(), top_k=top_k)
+        paper_retriever = self._get_retriever(retriever)
+        threshold = self.min_scores.get(retriever, default_min_score(paper_retriever.name))
+        decision = decide_retrieval(
+            paper_retriever,
+            query.strip(),
+            top_k=top_k,
+            min_score=threshold,
+        )
+        matches = decision.results
         return {
             "query": query.strip(),
             "retriever": retriever,
+            "rejected": decision.rejected,
+            "rejection_reason": decision.reason,
+            "top_score": (
+                round(decision.top_score, 6)
+                if decision.top_score is not None
+                else None
+            ),
+            "min_score": round(decision.min_score, 6),
             "result_count": len(matches),
             "results": [
                 self._serialize_result(result, rank)
@@ -205,6 +224,11 @@ class FindPaperTool:
     @staticmethod
     def format_response(payload: dict[str, Any]) -> str:
         results = payload["results"]
+        if payload.get("rejected"):
+            return (
+                "当前论文库中没有找到足够可靠的匹配。"
+                "请补充方法、数据集、作者、年份或期刊等线索后重试。"
+            )
         if not results:
             return "当前论文库中没有找到包含这些关键词的候选论文。"
         lines = [

@@ -13,8 +13,9 @@ from src.libs.embedding.fastembed_embedding import FastEmbedEmbedding
 from src.libs.vector_store.chroma_store import ChromaStore
 from src.paper_assistant.catalog import PaperCatalog
 from src.paper_assistant.dense_retriever import PaperDenseRetriever, profile_text
-from src.paper_assistant.evaluation import evaluate_retriever
+from src.paper_assistant.evaluation import evaluate_retriever, load_evaluation_cases
 from src.paper_assistant.hybrid_retriever import PaperHybridRetriever
+from src.paper_assistant.rejection import decide_retrieval
 from src.paper_assistant.retriever import PaperBM25Retriever
 
 CATALOG_FIELDS = [
@@ -134,6 +135,101 @@ def test_evaluation_reports_rank_metrics(tmp_path):
         "recall_at_3": 1.0,
         "mrr": 1.0,
     }
+
+
+def test_rejection_gate_hides_candidates_below_threshold(tmp_path):
+    retriever = PaperBM25Retriever(PaperCatalog.from_csv(_write_catalog(tmp_path)))
+    raw = retriever.search("强化学习控制机器人", top_k=2)
+
+    assert raw
+    decision = decide_retrieval(
+        retriever,
+        "强化学习控制机器人",
+        top_k=2,
+        min_score=raw[0].score + 0.001,
+    )
+
+    assert decision.rejected is True
+    assert decision.reason == "below_threshold"
+    assert decision.results == ()
+    assert decision.candidates[0].paper.paper_id == "recruitment"
+    assert decision.top_score == raw[0].score
+
+
+def test_rejection_gate_handles_score_boundary_and_no_candidates(tmp_path):
+    retriever = PaperBM25Retriever(PaperCatalog.from_csv(_write_catalog(tmp_path)))
+    raw = retriever.search("强化学习用户招募", top_k=1)
+
+    accepted = decide_retrieval(
+        retriever,
+        "强化学习用户招募",
+        top_k=1,
+        min_score=raw[0].score,
+    )
+    empty = decide_retrieval(
+        retriever,
+        "量子密码协议",
+        top_k=1,
+        min_score=0.0,
+    )
+
+    assert accepted.rejected is False
+    assert accepted.reason == "accepted"
+    assert empty.rejected is True
+    assert empty.reason == "no_candidates"
+    assert empty.top_score is None
+
+
+def test_rejection_gate_rejects_negative_threshold(tmp_path):
+    retriever = PaperBM25Retriever(PaperCatalog.from_csv(_write_catalog(tmp_path)))
+
+    try:
+        decide_retrieval(retriever, "强化学习", min_score=-0.1)
+    except ValueError as error:
+        assert "zero or greater" in str(error)
+    else:
+        raise AssertionError("Expected a negative threshold to be rejected")
+
+
+def test_evaluation_reports_unknown_paper_rejection(tmp_path):
+    retriever = PaperBM25Retriever(PaperCatalog.from_csv(_write_catalog(tmp_path)))
+    cases = [
+        {
+            "id": "known",
+            "description": "强化学习用户招募",
+            "expected_paper_id": "recruitment",
+        },
+        {
+            "id": "unknown",
+            "description": "强化学习控制机器人",
+            "expected_paper_id": None,
+        },
+    ]
+    raw_unknown_score = retriever.search(cases[1]["description"])[0].score
+    known_score = retriever.search(cases[0]["description"])[0].score
+    threshold = (raw_unknown_score + known_score) / 2
+
+    report = evaluate_retriever(retriever, cases, min_score=threshold)
+
+    assert report["overall"]["recall_at_1"] == 1.0
+    assert report["rejection"] == {
+        "queries": 1,
+        "correctly_rejected": 1,
+        "false_accepts": 0,
+        "accuracy": 1.0,
+    }
+    assert report["open_set"] == {"queries": 2, "correct": 2, "accuracy": 1.0}
+    assert report["cases"][1]["rejected"] is True
+
+
+def test_evaluation_loader_allows_explicit_unknown_cases(tmp_path):
+    path = tmp_path / "unknown.jsonl"
+    path.write_text(
+        '{"id":"u1","description":"不存在的论文","expected_paper_id":null}\n',
+        encoding="utf-8",
+    )
+
+    assert load_evaluation_cases(path)[0]["expected_paper_id"] is None
 
 
 class _KeywordEmbedding(BaseEmbedding):

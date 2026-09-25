@@ -91,11 +91,12 @@ def catalog_path(tmp_path):
 
 
 def test_find_papers_returns_ranked_paper_level_candidates(catalog_path):
-    tool = FindPaperTool(catalog_path)
+    tool = FindPaperTool(catalog_path, min_scores={"bm25": 0.0})
 
     payload = tool.find_papers("扩散模型加切比雪夫", top_k=3)
 
     assert payload["retriever"] == "bm25"
+    assert payload["rejected"] is False
     assert payload["result_count"] == 1
     assert payload["results"][0]["paper_id"] == "tcdi"
     assert payload["results"][0]["pdf_files"] == [
@@ -107,7 +108,9 @@ def test_find_papers_returns_ranked_paper_level_candidates(catalog_path):
 
 @pytest.mark.asyncio
 async def test_execute_returns_text_and_structured_content(catalog_path):
-    result = await FindPaperTool(catalog_path).execute(
+    result = await FindPaperTool(
+        catalog_path, min_scores={"bm25": 0.0}
+    ).execute(
         "使用强化学习进行用户招募", top_k=1
     )
 
@@ -115,6 +118,28 @@ async def test_execute_returns_text_and_structured_content(catalog_path):
     assert result.structuredContent["results"][0]["paper_id"] == "recruitment"
     assert "在线用户招募" in result.content[0].text
     assert "recruitment.pdf" in result.content[0].text
+
+
+@pytest.mark.asyncio
+async def test_execute_rejects_a_weak_match_to_an_unknown_paper(catalog_path):
+    result = await FindPaperTool(catalog_path).execute(
+        "使用强化学习控制机器人的论文", top_k=3
+    )
+
+    assert result.isError is False
+    assert result.structuredContent["rejected"] is True
+    assert result.structuredContent["rejection_reason"] == "below_threshold"
+    assert result.structuredContent["results"] == []
+    assert "没有找到足够可靠的匹配" in result.content[0].text
+
+
+def test_rejection_threshold_can_be_configured(catalog_path):
+    tool = FindPaperTool(catalog_path, min_scores={"bm25": 0.0})
+
+    payload = tool.find_papers("使用强化学习控制机器人的论文")
+
+    assert payload["rejected"] is False
+    assert payload["results"][0]["paper_id"] == "recruitment"
 
 
 @pytest.mark.parametrize(
@@ -147,7 +172,7 @@ def test_schema_and_registration():
 
 
 def test_catalog_edit_invalidates_cached_retriever(catalog_path):
-    tool = FindPaperTool(catalog_path)
+    tool = FindPaperTool(catalog_path, min_scores={"bm25": 0.0})
     first_retriever = tool._get_retriever("bm25")
     assert tool.find_papers("图神经网络")["result_count"] == 0
 
