@@ -199,7 +199,36 @@ def _abstract_from_pages(page_texts: list[str]) -> FieldEvidence | None:
     return None
 
 
-def _doi_from_pages(page_texts: list[str]) -> FieldEvidence | None:
+def _doi_from_metadata_or_pages(
+    metadata: dict[str, Any], page_texts: list[str]
+) -> FieldEvidence | None:
+    for key in ("subject", "keywords"):
+        raw = _metadata_value(metadata, key)
+        match = DOI_PATTERN.search(raw)
+        if match:
+            value = match.group(0).rstrip(".,;)")
+            return FieldEvidence(
+                value=value,
+                source=f"pdf_metadata.{key}",
+                page=None,
+                source_text=raw,
+                confidence="high",
+            )
+    citation_pattern = re.compile(
+        r"citation\s+information\s*:\s*doi\s*(10\.\d{4,9}/[-._;()/:A-Z0-9]+)",
+        re.IGNORECASE,
+    )
+    for page_number, text in enumerate(page_texts[:3], start=1):
+        match = citation_pattern.search(text)
+        if match:
+            value = match.group(1).rstrip(".,;)")
+            return FieldEvidence(
+                value=value,
+                source="page_text.citation_information",
+                page=page_number,
+                source_text=_clean_text(match.group(0)),
+                confidence="high",
+            )
     for page_number, text in enumerate(page_texts[:3], start=1):
         match = DOI_PATTERN.search(text)
         if match:
@@ -217,17 +246,6 @@ def _doi_from_pages(page_texts: list[str]) -> FieldEvidence | None:
 def _year_from_metadata_or_pages(
     metadata: dict[str, Any], page_texts: list[str]
 ) -> FieldEvidence | None:
-    for key in ("creationDate", "modDate"):
-        raw = _metadata_value(metadata, key)
-        match = re.search(r"D:((?:19|20)\d{2})", raw) or YEAR_PATTERN.search(raw)
-        if match:
-            return FieldEvidence(
-                value=match.group(1) if match.lastindex else match.group(0),
-                source=f"pdf_metadata.{key}",
-                page=None,
-                source_text=raw,
-                confidence="low",
-            )
     for page_number, text in enumerate(page_texts[:2], start=1):
         contextual = re.search(
             r"(?:published|accepted|copyright|©|出版|发表)[^\n]{0,80}?((?:19|20)\d{2})",
@@ -241,6 +259,17 @@ def _year_from_metadata_or_pages(
                 page=page_number,
                 source_text=_clean_text(contextual.group(0)),
                 confidence="medium",
+            )
+    for key in ("creationDate", "modDate"):
+        raw = _metadata_value(metadata, key)
+        match = re.search(r"D:((?:19|20)\d{2})", raw) or YEAR_PATTERN.search(raw)
+        if match:
+            return FieldEvidence(
+                value=match.group(1) if match.lastindex else match.group(0),
+                source=f"pdf_metadata.{key}",
+                page=None,
+                source_text=raw,
+                confidence="low",
             )
     return None
 
@@ -322,7 +351,7 @@ def extract_pdf_facts(pdf_path: str | Path, max_pages: int = 5) -> ExtractedPape
                 authors=authors,
                 year=_year_from_metadata_or_pages(metadata, page_texts),
                 abstract=_abstract_from_pages(page_texts),
-                doi=_doi_from_pages(page_texts),
+                doi=_doi_from_metadata_or_pages(metadata, page_texts),
                 language=_detect_language(page_texts),
                 warnings=tuple(warnings),
             )

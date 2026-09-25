@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import codecs
 import csv
 import json
 import shutil
@@ -116,6 +117,18 @@ def test_import_preview_is_read_only_and_ready(import_files):
     assert catalog.read_bytes() == original
 
 
+def test_import_preserves_multiple_spaces_inside_pdf_filename(import_files):
+    inbox, pdf, catalog, draft = import_files
+    spaced_pdf = inbox / "new  paper .pdf"
+    pdf.replace(spaced_pdf)
+    _write_draft(draft, spaced_pdf)
+
+    plan = plan_catalog_import(draft, inbox, catalog)
+
+    assert plan.ready is True
+    assert plan.pdf_file == "new  paper .pdf"
+
+
 def test_import_preview_blocks_incomplete_and_stale_drafts(import_files):
     inbox, pdf, catalog, draft = import_files
     _write_draft(draft, pdf, memory_cues="")
@@ -183,6 +196,19 @@ def test_confirmed_import_backs_up_validates_and_atomically_appends(import_files
     second_plan = plan_catalog_import(draft, inbox, catalog)
     assert second_plan.ready is False
     assert any("paper_id already exists" in error for error in second_plan.errors)
+
+
+def test_confirmed_import_preserves_catalog_bom_and_line_endings(import_files):
+    inbox, _, catalog, draft = import_files
+    normalized = catalog.read_text(encoding="utf-8").replace("\r\n", "\n")
+    catalog.write_bytes(codecs.BOM_UTF8 + normalized.encode("utf-8"))
+    plan = plan_catalog_import(draft, inbox, catalog)
+
+    apply_catalog_import(plan, inbox, catalog, catalog.parent / "backups")
+
+    written = catalog.read_bytes()
+    assert written.startswith(codecs.BOM_UTF8)
+    assert b"\r\n" not in written
 
 
 def test_confirmed_import_stops_if_catalog_changed_after_preview(import_files):
