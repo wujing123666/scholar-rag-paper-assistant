@@ -122,6 +122,7 @@ class ChunkSearchResult:
     dense_score: float
     sparse_score: float = 0.0
     routing_rank: int = 0
+    rerank_score: float | None = None
 
 
 @dataclass(frozen=True)

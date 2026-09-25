@@ -136,6 +136,14 @@ python -m src.paper_assistant --model-cache data/models/fastembed search-chunks 
 
 当前命令返回可供生成模型使用的证据上下文，包括论文标题、PDF、页码、章节、原文和检索分数。基于这些证据生成中文答案并逐条绑定引用仍是下一阶段，当前不会把检索到的正文误称为已经完成的生成式回答。
 
+需要改善前几条证据的顺序时，可以显式启用本地 ONNX Cross-Encoder：
+
+```powershell
+python -m src.paper_assistant --retriever bm25 --model-cache data/models/fastembed --chunk-reranker fastembed --reranker-cache data/models/fastembed search-chunks "MapT-STC如何根据不确定性融合两路预测" --top-k 5
+```
+
+默认使用 MIT 许可的 `BAAI/bge-reranker-base`，模型约 1.04 GB，第一次运行下载到本地模型缓存。重排默认关闭；开启后先完成论文路由、正文 Hybrid 检索和论文先验融合，再只对最终 Top-5 做统一重排。默认融合 35% Cross-Encoder 分数与 65% 原检索分数，因此不会改变 Top-5 成员，只调整其内部顺序。运行时推理失败会返回原排序，并在 JSON 的 `reranker_fallback` 中说明原因。
+
 ## 评测正文证据检索
 
 正文开发集当前包含 10 条问题，每篇逻辑论文 1 条。每条记录保存目标 `paper_id`、一个或多个相关 PDF 页码、证据词和最低证据词命中数。它们由程序根据本地 PDF 定位后逐页核对，`source=system_labeled_from_pdf` 且 `reviewed_by_user=false`，因此是可迭代的开发集，不是用户盲测集。
@@ -152,7 +160,9 @@ python -m src.paper_assistant --model-cache data/models/fastembed evaluate-chunk
 python -m src.paper_assistant --retriever bm25 --model-cache data/models/fastembed evaluate-chunks
 ```
 
-报告分别给出论文候选 Recall、正确页的 Recall@1/3/5 与 MRR，以及同时满足页码和证据词条件的 Evidence Recall@1/3/5 与 MRR。首批 10 条开发题的两级检索基线为：论文路由 Recall=1.00，Page/Evidence Recall@1=0.30、Recall@3=0.50、Recall@5=0.90、MRR=0.495。唯一 Top-5 失败是 STEI 自适应系数的方法公式页。
+报告分别给出论文候选 Recall、正确页的 Recall@1/3/5 与 MRR，以及同时满足页码和证据词条件的 Evidence Recall@1/3/5 与 MRR。逐字核对 STEI 摘要后，第 1 页也被认定为能完整支撑自适应系数问题的相关证据页。修正后的首批 10 条开发题基线为：论文路由 Recall=1.00，Page/Evidence Recall@1=0.30、Recall@3=0.50、Recall@5=1.00、MRR=0.520。
+
+启用默认 Cross-Encoder 后，Recall@1=0.30、Recall@3=0.70、Recall@5=1.00、MRR=0.553。10 条题的独立命令行运行时间在当前 CPU 环境约从 2.0 秒增至 8.0 秒；常驻服务只需加载一次模型。扩大重排候选池曾使 Recall@5 降低，因此默认只重排原 Top-5。
 
 这些数字只反映当前 10 条系统构造开发题，问题数量较少，而且术语扩展曾根据失败分析迭代，不能作为盲测成绩或最终准确率。后续需要由本人独立编写并冻结新的正文问题，再报告独立测试结果。
 
