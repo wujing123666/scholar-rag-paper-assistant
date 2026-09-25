@@ -19,6 +19,7 @@ from src.paper_assistant.hybrid_retriever import PaperHybridRetriever
 from src.paper_assistant.retriever import PaperBM25Retriever, PaperSearchResult
 
 if TYPE_CHECKING:
+    from src.libs.vector_store.base_vector_store import BaseVectorStore
     from src.mcp_server.protocol_handler import ProtocolHandler
     from src.paper_assistant.evaluation import PaperRetriever
 
@@ -71,11 +72,23 @@ class FindPaperTool:
         model: str = FastEmbedEmbedding.DEFAULT_MODEL,
         model_cache: str | Path = "data/models/fastembed",
         embedding: BaseEmbedding | None = None,
+        vector_store: BaseVectorStore | None = None,
+        chroma_mode: str = "local",
+        chroma_path: str | Path = "data/db/chroma",
+        chroma_host: str = "localhost",
+        chroma_port: int = 8000,
+        chroma_ssl: bool = False,
     ) -> None:
         self.catalog_path = resolve_path(catalog_path)
         self.model = model
         self.model_cache = resolve_path(model_cache)
         self._embedding = embedding
+        self._vector_store = vector_store
+        self.chroma_mode = chroma_mode
+        self.chroma_path = resolve_path(chroma_path)
+        self.chroma_host = chroma_host
+        self.chroma_port = chroma_port
+        self.chroma_ssl = chroma_ssl
         self._catalog: PaperCatalog | None = None
         self._catalog_signature: tuple[int, int] | None = None
         self._retrievers: dict[str, PaperRetriever] = {}
@@ -103,6 +116,20 @@ class FindPaperTool:
             )
         return self._embedding
 
+    def _get_vector_store(self) -> BaseVectorStore:
+        if self._vector_store is None:
+            from src.libs.vector_store.chroma_store import ChromaStore
+
+            self._vector_store = ChromaStore(
+                persist_directory=self.chroma_path,
+                collection_name="paper_profiles_v1",
+                mode=self.chroma_mode,
+                host=self.chroma_host,
+                port=self.chroma_port,
+                ssl=self.chroma_ssl,
+            )
+        return self._vector_store
+
     def _get_retriever(self, name: str) -> PaperRetriever:
         with self._init_lock:
             # Accessing the property detects catalog edits and clears stale retrievers.
@@ -112,7 +139,9 @@ class FindPaperTool:
             if name == "bm25":
                 retriever: PaperRetriever = PaperBM25Retriever(catalog)
             elif name == "dense":
-                retriever = PaperDenseRetriever(catalog, self._get_embedding())
+                retriever = PaperDenseRetriever(
+                    catalog, self._get_embedding(), self._get_vector_store()
+                )
             elif name == "hybrid":
                 sparse = self._get_retriever("bm25")
                 dense = self._get_retriever("dense")

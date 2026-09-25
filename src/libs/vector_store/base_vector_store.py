@@ -253,3 +253,9 @@ class BaseVectorStore(ABC):
             f"{self.__class__.__name__} does not implement get_by_ids() method. "
             "This operation is required for SparseRetriever support."
         )
+
+    def list_ids(self, **kwargs: Any) -> List[str]:
+        """Return all record IDs in the selected collection."""
+        raise NotImplementedError(
+            f"{self.__class__.__name__} does not implement list_ids() method."
+        )

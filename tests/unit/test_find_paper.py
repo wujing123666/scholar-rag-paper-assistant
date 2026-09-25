@@ -189,7 +189,9 @@ async def test_missing_catalog_error_does_not_expose_absolute_path(tmp_path):
 
 
 @pytest.mark.asyncio
-async def test_retriever_error_does_not_expose_internal_details(catalog_path):
+async def test_retriever_error_does_not_expose_internal_details(
+    catalog_path, tmp_path
+):
     class BrokenEmbedding(BaseEmbedding):
         def embed(self, texts, trace=None, **kwargs):
             raise RuntimeError("secret model path C:/private/model.onnx")
@@ -198,7 +200,9 @@ async def test_retriever_error_does_not_expose_internal_details(catalog_path):
             return 2
 
     result = await FindPaperTool(
-        catalog_path, embedding=BrokenEmbedding()
+        catalog_path,
+        embedding=BrokenEmbedding(),
+        chroma_path=tmp_path / "chroma",
     ).execute("扩散模型", retriever="dense")
 
     assert result.isError is True

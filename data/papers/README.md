@@ -91,6 +91,16 @@ python -m src.paper_assistant --retriever dense --model-cache data/models/fastem
 python -m src.paper_assistant --retriever hybrid --model-cache data/models/fastembed search "使用强化学习招募用户的论文" --top-k 3
 ```
 
+论文级 Dense 向量存储在本地 Chroma collection `paper_profiles_v1`，默认目录为 `data/db/chroma/`。每条记录对应一个 `paper_id`，并记录 Paper Profile 内容哈希、Embedding 模型名称和向量维度。首次运行会写入全部论文向量；再次启动时复用未变化的向量，只重新计算新增或修改的论文，并删除目录中已经移除的论文记录。
+
+本地开发使用默认的 `PersistentClient`。代码也支持通过同一个 `ChromaStore` 接口连接服务器模式：
+
+```powershell
+python -m src.paper_assistant --retriever dense --chroma-mode server --chroma-host localhost --chroma-port 8000 search "使用强化学习招募用户的论文"
+```
+
+服务器模式要求 Chroma Server 已经启动。本地与服务器模式使用相同的 `paper_profiles_v1` 数据契约，Dense、Hybrid 和 MCP 检索逻辑不需要随部署方式改变。
+
 运行全部种子问题评测：
 
 ```powershell
@@ -198,7 +208,7 @@ PDF 仅用于个人科研和本地实验，不应随公开仓库分发。公开 
 
 ## 下一步实现
 
-当前已经实现论文级 `PaperProfile`、加权 BM25、本地 BGE Dense、RRF 融合、版本去重及 Recall@1、Recall@3、MRR 评测。下一阶段将实现：
+当前已经实现论文级 `PaperProfile`、加权 BM25、本地 BGE Dense、Chroma 持久化、RRF 融合、版本去重及 Recall@1、Recall@3、MRR 评测。下一阶段将实现：
 
 1. 未知论文拒答和相似度阈值；
 2. 扩展到约 100 篇本人读过的论文；

@@ -18,6 +18,8 @@ from src.paper_assistant.retriever import PaperBM25Retriever
 DEFAULT_CATALOG = Path("data/papers/paper_catalog.csv")
 DEFAULT_EVALUATION = Path("data/papers/eval_queries.jsonl")
 DEFAULT_INBOX = Path("data/papers/inbox")
+DEFAULT_PAPER_CHROMA = Path("data/db/chroma")
+DEFAULT_PAPER_COLLECTION = "paper_profiles_v1"
 
 
 DEFAULT_DENSE_MODEL = "BAAI/bge-small-zh-v1.5"
@@ -35,12 +37,28 @@ def _build_retriever(
     retriever_name: str,
     model: str,
     model_cache: Path | None,
+    *,
+    chroma_mode: str,
+    chroma_path: Path,
+    chroma_host: str,
+    chroma_port: int,
+    chroma_ssl: bool,
 ) -> PaperBM25Retriever | PaperDenseRetriever | PaperHybridRetriever:
     catalog = PaperCatalog.from_csv(catalog_path)
     if retriever_name == "bm25":
         return PaperBM25Retriever(catalog)
+    from src.libs.vector_store.chroma_store import ChromaStore
+
     embedding = FastEmbedEmbedding(model=model, cache_dir=model_cache)
-    dense = PaperDenseRetriever(catalog, embedding)
+    vector_store = ChromaStore(
+        persist_directory=chroma_path,
+        collection_name=DEFAULT_PAPER_COLLECTION,
+        mode=chroma_mode,
+        host=chroma_host,
+        port=chroma_port,
+        ssl=chroma_ssl,
+    )
+    dense = PaperDenseRetriever(catalog, embedding, vector_store)
     if retriever_name == "dense":
         return dense
     return PaperHybridRetriever(catalog, PaperBM25Retriever(catalog), dense)
@@ -55,6 +73,11 @@ def main() -> int:
     )
     parser.add_argument("--model", default=DEFAULT_DENSE_MODEL)
     parser.add_argument("--model-cache", type=Path)
+    parser.add_argument("--chroma-mode", choices=("local", "server"), default="local")
+    parser.add_argument("--chroma-path", type=Path, default=DEFAULT_PAPER_CHROMA)
+    parser.add_argument("--chroma-host", default="localhost")
+    parser.add_argument("--chroma-port", type=int, default=8000)
+    parser.add_argument("--chroma-ssl", action="store_true")
     subparsers = parser.add_subparsers(dest="command", required=True)
 
     search_parser = subparsers.add_parser("search", help="Find papers from a description")
@@ -128,7 +151,15 @@ def main() -> int:
         return 0
 
     retriever = _build_retriever(
-        args.catalog, args.retriever, args.model, args.model_cache
+        args.catalog,
+        args.retriever,
+        args.model,
+        args.model_cache,
+        chroma_mode=args.chroma_mode,
+        chroma_path=args.chroma_path,
+        chroma_host=args.chroma_host,
+        chroma_port=args.chroma_port,
+        chroma_ssl=args.chroma_ssl,
     )
 
     if args.command == "search":
