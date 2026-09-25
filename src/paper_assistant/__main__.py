@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import json
 import sys
+from dataclasses import asdict
 from pathlib import Path
 
 from src.libs.embedding.fastembed_embedding import FastEmbedEmbedding
@@ -21,6 +22,7 @@ DEFAULT_EVALUATION = Path("data/papers/eval_queries.jsonl")
 DEFAULT_INBOX = Path("data/papers/inbox")
 DEFAULT_PAPER_CHROMA = Path("data/db/chroma")
 DEFAULT_PAPER_COLLECTION = "paper_profiles_v1"
+DEFAULT_CHUNK_COLLECTION = "paper_chunks_v1"
 
 
 DEFAULT_DENSE_MODEL = "BAAI/bge-small-zh-v1.5"
@@ -130,6 +132,17 @@ def main() -> int:
         help="Write the validated row after creating a catalog backup.",
     )
 
+    chunk_parser = subparsers.add_parser(
+        "search-chunks", help="Find page-level evidence inside candidate papers"
+    )
+    chunk_parser.add_argument("query")
+    chunk_parser.add_argument("--inbox", type=Path, default=DEFAULT_INBOX)
+    chunk_parser.add_argument("--paper-id", action="append", default=[])
+    chunk_parser.add_argument("--candidate-papers", type=int, default=3)
+    chunk_parser.add_argument("--top-k", type=int, default=5)
+    chunk_parser.add_argument("--chunk-size", type=int, default=1200)
+    chunk_parser.add_argument("--chunk-overlap", type=int, default=180)
+
     args = parser.parse_args()
     if args.command == "inventory":
         report = build_paper_inventory(args.inbox, args.catalog)
@@ -208,6 +221,124 @@ def main() -> int:
                 )
             )
             return 1
+
+    if args.command == "search-chunks":
+        from src.libs.vector_store.chroma_store import ChromaStore
+        from src.paper_assistant.chunk_retriever import (
+            PaperChunkRetriever,
+            apply_paper_routing_prior,
+        )
+
+        if args.candidate_papers < 1:
+            parser.error("--candidate-papers must be at least one")
+        catalog = PaperCatalog.from_csv(args.catalog)
+        embedding = FastEmbedEmbedding(model=args.model, cache_dir=args.model_cache)
+        candidate_ids = tuple(dict.fromkeys(args.paper_id))
+        automatic_routing = not candidate_ids
+        if not candidate_ids:
+            if args.retriever == "bm25":
+                paper_retriever = PaperBM25Retriever(catalog)
+            else:
+                profile_store = ChromaStore(
+                    persist_directory=args.chroma_path,
+                    collection_name=DEFAULT_PAPER_COLLECTION,
+                    mode=args.chroma_mode,
+                    host=args.chroma_host,
+                    port=args.chroma_port,
+                    ssl=args.chroma_ssl,
+                )
+                dense = PaperDenseRetriever(catalog, embedding, profile_store)
+                paper_retriever = (
+                    dense
+                    if args.retriever == "dense"
+                    else PaperHybridRetriever(
+                        catalog, PaperBM25Retriever(catalog), dense
+                    )
+                )
+            candidate_ids = tuple(
+                result.paper.paper_id
+                for result in paper_retriever.search(
+                    args.query, top_k=min(args.candidate_papers, len(catalog))
+                )
+            )
+        if not candidate_ids:
+            print(
+                json.dumps(
+                    {
+                        "query": args.query,
+                        "candidate_papers": [],
+                        "results": [],
+                        "message": "No candidate papers matched the query.",
+                    },
+                    ensure_ascii=False,
+                    indent=2,
+                )
+            )
+            return 0
+
+        chunk_store = ChromaStore(
+            persist_directory=args.chroma_path,
+            collection_name=DEFAULT_CHUNK_COLLECTION,
+            mode=args.chroma_mode,
+            host=args.chroma_host,
+            port=args.chroma_port,
+            ssl=args.chroma_ssl,
+        )
+        chunk_retriever = PaperChunkRetriever(
+            catalog,
+            args.inbox,
+            embedding,
+            chunk_store,
+            chunk_size=args.chunk_size,
+            chunk_overlap=args.chunk_overlap,
+        )
+        if automatic_routing:
+            results = []
+            for paper_id in candidate_ids:
+                results.extend(
+                    chunk_retriever.search(
+                        args.query,
+                        top_k=args.top_k,
+                        paper_ids=(paper_id,),
+                    )
+                )
+            results = apply_paper_routing_prior(results, candidate_ids)[: args.top_k]
+        else:
+            results = chunk_retriever.search(
+                args.query,
+                top_k=args.top_k,
+                paper_ids=candidate_ids,
+            )
+        print(
+            json.dumps(
+                {
+                    "query": args.query,
+                    "paper_retriever": args.retriever,
+                    "candidate_papers": list(candidate_ids),
+                    "index_sync": asdict(chunk_retriever.index_sync),
+                    "results": [
+                        {
+                            "rank": rank,
+                            "chunk_id": result.chunk_id,
+                            "score": round(result.score, 4),
+                            "dense_score": round(result.dense_score, 4),
+                            "sparse_score": round(result.sparse_score, 4),
+                            "routing_rank": result.routing_rank or None,
+                            "paper_id": result.paper.paper_id,
+                            "paper_title": result.paper.display_title,
+                            "pdf_file": result.pdf_file,
+                            "page_number": result.page_number,
+                            "section": result.section,
+                            "text": result.text,
+                        }
+                        for rank, result in enumerate(results, start=1)
+                    ],
+                },
+                ensure_ascii=False,
+                indent=2,
+            )
+        )
+        return 0
 
     retriever = _build_retriever(
         args.catalog,
