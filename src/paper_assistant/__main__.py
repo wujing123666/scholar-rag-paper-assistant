@@ -13,6 +13,7 @@ from src.paper_assistant.dense_retriever import PaperDenseRetriever
 from src.paper_assistant.evaluation import evaluate_retriever, load_evaluation_cases
 from src.paper_assistant.hybrid_retriever import PaperHybridRetriever
 from src.paper_assistant.inventory import build_paper_inventory, write_inventory_report
+from src.paper_assistant.rejection import decide_retrieval, default_min_score
 from src.paper_assistant.retriever import PaperBM25Retriever
 
 DEFAULT_CATALOG = Path("data/papers/paper_catalog.csv")
@@ -78,6 +79,16 @@ def main() -> int:
     parser.add_argument("--chroma-host", default="localhost")
     parser.add_argument("--chroma-port", type=int, default=8000)
     parser.add_argument("--chroma-ssl", action="store_true")
+    parser.add_argument(
+        "--min-score",
+        type=float,
+        help="Override the retriever-specific unknown-paper rejection threshold.",
+    )
+    parser.add_argument(
+        "--disable-rejection",
+        action="store_true",
+        help="Return raw rankings without the unknown-paper confidence gate.",
+    )
     subparsers = parser.add_subparsers(dest="command", required=True)
 
     search_parser = subparsers.add_parser("search", help="Find papers from a description")
@@ -86,7 +97,9 @@ def main() -> int:
 
     evaluate_parser = subparsers.add_parser("evaluate", help="Evaluate a paper retriever")
     evaluate_parser.add_argument("--queries", type=Path, default=DEFAULT_EVALUATION)
-    evaluate_parser.add_argument("--split", choices=("dev", "test_candidate"))
+    evaluate_parser.add_argument(
+        "--split", choices=("dev", "test_candidate", "dev_rejection")
+    )
 
     inventory_parser = subparsers.add_parser(
         "inventory", help="Audit local PDFs against the paper catalog"
@@ -163,23 +176,47 @@ def main() -> int:
     )
 
     if args.command == "search":
-        results = retriever.search(args.query, top_k=args.top_k)
-        output = [
-            {
-                "rank": rank,
-                "paper_id": result.paper.paper_id,
-                "title": result.paper.display_title,
-                "score": round(result.score, 4),
-                "matched_terms": result.matched_terms,
-                "pdf_files": result.paper.pdf_files,
-            }
-            for rank, result in enumerate(results, start=1)
-        ]
+        threshold = args.min_score
+        if threshold is None and not args.disable_rejection:
+            threshold = default_min_score(retriever.name)
+        if threshold is None:
+            results = retriever.search(args.query, top_k=args.top_k)
+            rejected = not results
+            top_score = results[0].score if results else None
+        else:
+            decision = decide_retrieval(
+                retriever, args.query, top_k=args.top_k, min_score=threshold
+            )
+            results = list(decision.results)
+            rejected = decision.rejected
+            top_score = decision.top_score
+        output = {
+            "query": args.query,
+            "retriever": args.retriever,
+            "rejected": rejected,
+            "top_score": round(top_score, 6) if top_score is not None else None,
+            "min_score": threshold,
+            "results": [
+                {
+                    "rank": rank,
+                    "paper_id": result.paper.paper_id,
+                    "title": result.paper.display_title,
+                    "score": round(result.score, 4),
+                    "matched_terms": result.matched_terms,
+                    "pdf_files": result.paper.pdf_files,
+                }
+                for rank, result in enumerate(results, start=1)
+            ],
+        }
     else:
+        threshold = args.min_score
+        if threshold is None and not args.disable_rejection:
+            threshold = default_min_score(retriever.name)
         output = evaluate_retriever(
             retriever,
             load_evaluation_cases(args.queries),
             split=args.split,
+            min_score=threshold,
         )
     print(json.dumps(output, ensure_ascii=False, indent=2))
     return 0

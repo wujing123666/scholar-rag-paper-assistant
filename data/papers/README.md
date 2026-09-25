@@ -56,7 +56,9 @@
 - `split`：当前两条用于开发调参，一条为候选测试题。
 - `reviewed_by_user`：本人核对后改为 `true`。
 
-当前共 27 条种子问题，每篇独立论文 3 条。它们由论文内容生成，可用于开发检索流程，但不能直接作为最终简历指标。BM25 在这批同源问题上得到 100% Recall@1，只能说明链路和数据映射正确。最终测试集应补充本人从记忆写出的独立问题，并避免根据系统检索结果反向修改测试题。
+当前共有 36 条开发数据：27 条已知论文种子问题，每篇独立论文 3 条；另外有 9 条 `expected_paper_id=null` 的近领域未知论文问题，用于开发拒答阈值。已知题由论文内容生成，未知题由系统构造，都不是独立盲测，不能直接作为最终简历指标。最终测试集应补充本人从记忆写出的已知和未知问题，并避免根据系统结果反向修改测试题。
+
+未知论文问题使用 `split=dev_rejection` 和 `source=system_authored_negative`。它们故意包含“扩散模型”“强化学习”“群智感知”等库内常见词，但描述的是库中没有收录的研究，例如扩散模型生成人脸、强化学习控制机器人。这样比完全无关的关键词更能暴露强行匹配问题。
 
 ## 版本重复的处理
 
@@ -90,6 +92,15 @@ pip install -e ".[local]"
 python -m src.paper_assistant --retriever dense --model-cache data/models/fastembed search "使用扩散模型做插补的论文" --top-k 3
 python -m src.paper_assistant --retriever hybrid --model-cache data/models/fastembed search "使用强化学习招募用户的论文" --top-k 3
 ```
+
+搜索默认启用未知论文拒答。不同检索器使用各自的开发阈值；返回 JSON 中的 `rejected`、`top_score` 和 `min_score` 说明本次判定。可以临时覆盖阈值或查看未经过滤的原始排序：
+
+```powershell
+python -m src.paper_assistant --retriever bm25 --min-score 9.0 search "使用强化学习控制机器人的论文"
+python -m src.paper_assistant --retriever bm25 --disable-rejection search "使用强化学习控制机器人的论文"
+```
+
+当前默认值为 BM25 `8.0`、Dense `0.78`、Hybrid `2/61`。它们来自当前 27 条已知开发题和 9 条未知开发题，只是小语料起点；论文库、Embedding 模型或 RRF 参数变化后必须重新校准。
 
 论文级 Dense 向量存储在本地 Chroma collection `paper_profiles_v1`，默认目录为 `data/db/chroma/`。每条记录对应一个 `paper_id`，并记录 Paper Profile 内容哈希、Embedding 模型名称和向量维度。首次运行会写入全部论文向量；再次启动时复用未变化的向量，只重新计算新增或修改的论文，并删除目录中已经移除的论文记录。
 
@@ -132,6 +143,16 @@ python -m src.paper_assistant --retriever hybrid --model-cache data/models/faste
 
 这组小数据上 BM25 的精确术语匹配最强，RRF 没有超过 BM25 的 Top-1。这个结果会被保留，而不是为了得到更好看的数字在同源题上反复调参。后续扩大论文库并增加独立盲测问题后，再判断混合检索是否带来稳定收益。
 
+启用开发阈值后，对 27 条已知题和 9 条未知题得到：
+
+| 检索器 | 阈值后已知 Recall@1 | Rejection Accuracy | Open-set Accuracy |
+|---|---:|---:|---:|
+| 加权 BM25 | 96.3% | 100.0% | 97.2% |
+| BGE Dense | 70.4% | 66.7% | 69.4% |
+| BM25 + Dense + RRF | 74.1% | 77.8% | 75.0% |
+
+这里的 Open-set Accuracy 把“已知题第一名正确”和“未知题成功拒答”都计为正确。阈值和指标使用同一批开发数据，因此只能说明实现链路和当前取舍；不能当作未见数据上的泛化结果。Dense 和 Hybrid 的结果也表明，简单分数阈值仍无法可靠区分所有近领域未知问题。
+
 检索以 `paper_id` 为单位。TCDI 的两个 PDF 版本会合并成一个候选结果，但结果中仍会列出两个可用文件。
 
 ## 通过 MCP 查找论文
@@ -146,7 +167,7 @@ MCP Server 会自动注册 `find_paper` 工具。客户端只需传入模糊描�
 }
 ```
 
-工具返回人类可读文本和结构化结果，包括 `paper_id`、中英文标题、作者、年份、期刊或会议、匹配词、方法摘要和本地 PDF 文件名。同一论文的多个 PDF 版本会出现在一个论文结果下。
+工具返回人类可读文本和结构化结果，包括 `rejected`、`rejection_reason`、`top_score`、`min_score`，以及通过门槛后的 `paper_id`、中英文标题、作者、年份、期刊或会议、匹配词、方法摘要和本地 PDF 文件名。同一论文的多个 PDF 版本会出现在一个论文结果下。未达到门槛时 `results` 为空，并提示用户补充方法、数据集、作者、年份或期刊等线索。
 
 `retriever` 可选 `bm25`、`dense` 或 `hybrid`。默认使用 `bm25`，启动快且不需要加载向量模型；只有明确选择 `dense` 或 `hybrid` 时才加载本地 Embedding。
 
@@ -208,10 +229,10 @@ PDF 仅用于个人科研和本地实验，不应随公开仓库分发。公开 
 
 ## 下一步实现
 
-当前已经实现论文级 `PaperProfile`、加权 BM25、本地 BGE Dense、Chroma 持久化、RRF 融合、版本去重及 Recall@1、Recall@3、MRR 评测。下一阶段将实现：
+当前已经实现论文级 `PaperProfile`、加权 BM25、本地 BGE Dense、Chroma 持久化、阈值拒答、RRF 融合、版本去重及 Recall@1、Recall@3、MRR、Rejection Accuracy 和 Open-set Accuracy 评测。下一阶段将实现：
 
-1. 未知论文拒答和相似度阈值；
-2. 扩展到约 100 篇本人读过的论文；
-3. 增量导入、文件哈希与档案更新；
-4. 增加由本人独立编写并冻结的盲测问题；
-5. 加入查询延迟、P95 延迟和拒答准确率评测。
+1. 扩展到约 100 篇本人读过的论文；
+2. 增量导入、文件哈希与档案更新；
+3. 增加由本人独立编写并冻结的已知与未知盲测问题；
+4. 按新语料重新校准拒答阈值，研究 Reranker 或成对判别；
+5. 加入平均查询延迟和 P95 延迟评测。
