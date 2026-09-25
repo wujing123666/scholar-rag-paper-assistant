@@ -154,6 +154,22 @@ def main() -> int:
     chunk_parser.add_argument("--chunk-size", type=int, default=1200)
     chunk_parser.add_argument("--chunk-overlap", type=int, default=180)
 
+    answer_parser = subparsers.add_parser(
+        "answer", help="Answer a question from cited paper chunks"
+    )
+    answer_parser.add_argument("query")
+    answer_parser.add_argument("--inbox", type=Path, default=DEFAULT_INBOX)
+    answer_parser.add_argument("--paper-id", action="append", default=[])
+    answer_parser.add_argument("--candidate-papers", type=int, default=3)
+    answer_parser.add_argument("--top-k", type=int, default=5)
+    answer_parser.add_argument("--chunk-size", type=int, default=1200)
+    answer_parser.add_argument("--chunk-overlap", type=int, default=180)
+    answer_parser.add_argument(
+        "--settings", type=Path, default=Path("config/settings.yaml")
+    )
+    answer_parser.add_argument("--max-context-chars", type=int, default=12000)
+    answer_parser.add_argument("--min-evidence-chunks", type=int, default=1)
+
     chunk_evaluate_parser = subparsers.add_parser(
         "evaluate-chunks", help="Evaluate page-level evidence retrieval"
     )
@@ -250,7 +266,7 @@ def main() -> int:
             )
             return 1
 
-    if args.command in {"search-chunks", "evaluate-chunks"}:
+    if args.command in {"search-chunks", "answer", "evaluate-chunks"}:
         from src.libs.vector_store.chroma_store import ChromaStore
         from src.paper_assistant.chunk_retriever import (
             PaperChunkRetriever,
@@ -263,11 +279,16 @@ def main() -> int:
             parser.error("--rerank-candidates must be at least one")
         if not 0 <= args.rerank_weight <= 1:
             parser.error("--rerank-weight must be between zero and one")
+        if args.command == "answer":
+            if args.max_context_chars < 1000:
+                parser.error("--max-context-chars must be at least 1000")
+            if args.min_evidence_chunks < 1:
+                parser.error("--min-evidence-chunks must be at least one")
         catalog = PaperCatalog.from_csv(args.catalog)
         embedding = FastEmbedEmbedding(model=args.model, cache_dir=args.model_cache)
         paper_retriever = None
         needs_paper_router = args.command == "evaluate-chunks" and not args.oracle_paper
-        if args.command == "search-chunks":
+        if args.command in {"search-chunks", "answer"}:
             needs_paper_router = not args.paper_id
         if needs_paper_router:
             if args.retriever == "bm25":
@@ -300,16 +321,52 @@ def main() -> int:
                 )
             )
 
-        if args.command == "search-chunks":
+        if args.command in {"search-chunks", "answer"}:
             candidate_ids = tuple(dict.fromkeys(args.paper_id))
             automatic_routing = not candidate_ids
             if automatic_routing:
-                candidate_ids = resolve_candidates(args.query)
+                if args.command == "answer" and not args.disable_rejection:
+                    if paper_retriever is None:
+                        candidate_ids = ()
+                    else:
+                        threshold = args.min_score
+                        if threshold is None:
+                            threshold = default_min_score(paper_retriever.name)
+                        decision = decide_retrieval(
+                            paper_retriever,
+                            args.query,
+                            top_k=min(args.candidate_papers, len(catalog)),
+                            min_score=threshold,
+                        )
+                        candidate_ids = tuple(
+                            result.paper.paper_id for result in decision.results
+                        )
+                else:
+                    candidate_ids = resolve_candidates(args.query)
         else:
             candidate_ids = ()
             automatic_routing = False
 
-        if args.command == "search-chunks" and not candidate_ids:
+        if args.command in {"search-chunks", "answer"} and not candidate_ids:
+            if args.command == "answer":
+                from src.paper_assistant.grounded_answer import REFUSAL_TEXT
+
+                print(
+                    json.dumps(
+                        {
+                            "query": args.query,
+                            "status": "insufficient_evidence",
+                            "answer": REFUSAL_TEXT,
+                            "claims": [],
+                            "citations": [],
+                            "reason": "no_candidate_papers",
+                            "candidate_papers": [],
+                        },
+                        ensure_ascii=False,
+                        indent=2,
+                    )
+                )
+                return 0
             print(
                 json.dumps(
                     {
@@ -410,20 +467,60 @@ def main() -> int:
             )
         else:
             results = results[: args.top_k]
+        retrieval_payload = {
+            "query": args.query,
+            "paper_retriever": args.retriever,
+            "chunk_reranker": args.chunk_reranker,
+            "reranker_model": (
+                args.reranker_model if args.chunk_reranker != "none" else None
+            ),
+            "reranker_fallback": reranker_fallback,
+            "candidate_papers": list(candidate_ids),
+            "index_sync": asdict(index_sync),
+        }
+        if args.command == "answer":
+            from src.core.settings import load_settings
+            from src.libs.llm import LLMFactory
+            from src.paper_assistant.grounded_answer import answer_from_evidence
+
+            try:
+                llm = LLMFactory.create(load_settings(args.settings))
+                answer = answer_from_evidence(
+                    llm,
+                    args.query,
+                    results,
+                    max_context_chars=args.max_context_chars,
+                    min_evidence_chunks=args.min_evidence_chunks,
+                )
+            except (OSError, RuntimeError, ValueError):
+                print(
+                    json.dumps(
+                        {
+                            **retrieval_payload,
+                            "status": "error",
+                            "message": (
+                                "LLM 配置或服务不可用，请检查 --settings 指向的私有配置"
+                                "以及对应服务端日志。"
+                            ),
+                        },
+                        ensure_ascii=False,
+                        indent=2,
+                    )
+                )
+                return 1
+            print(
+                json.dumps(
+                    {**retrieval_payload, **answer.to_dict()},
+                    ensure_ascii=False,
+                    indent=2,
+                )
+            )
+            return 0
+
         print(
             json.dumps(
                 {
-                    "query": args.query,
-                    "paper_retriever": args.retriever,
-                    "chunk_reranker": args.chunk_reranker,
-                    "reranker_model": (
-                        args.reranker_model
-                        if args.chunk_reranker != "none"
-                        else None
-                    ),
-                    "reranker_fallback": reranker_fallback,
-                    "candidate_papers": list(candidate_ids),
-                    "index_sync": asdict(index_sync),
+                    **retrieval_payload,
                     "results": [
                         {
                             "rank": rank,

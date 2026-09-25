@@ -114,6 +114,8 @@ traces.jsonl
 .env.local
 .env.*.local
 secrets.yaml
+config/settings.local.yaml
+config/settings.*.local.yaml
 nonexistent_traces.jsonl/
 # Personal paper corpus (keep the directory, do not commit PDFs)
 data/papers/inbox/*
