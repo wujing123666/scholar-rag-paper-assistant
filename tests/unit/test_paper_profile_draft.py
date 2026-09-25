@@ -104,6 +104,40 @@ def test_extract_pdf_facts_preserves_page_evidence(tmp_path):
     assert facts.language.value == "en"
 
 
+def test_extract_pdf_facts_prefers_article_doi_and_published_year(tmp_path):
+    pdf = tmp_path / "journal-version.pdf"
+    document = fitz.open()
+    page = document.new_page()
+    page.insert_text((72, 72), "Journal Paper", fontsize=20)
+    page.insert_text(
+        (72, 120),
+        "Earlier version DOI: 10.1109/OLD.2024.1234567",
+        fontsize=10,
+    )
+    page.insert_text(
+        (72, 160),
+        "Accepted for publication. Citation information: DOI 10.1109/TMC.2026.7654321",
+        fontsize=10,
+    )
+    page.insert_text((72, 190), "© 2026 IEEE", fontsize=10)
+    document.set_metadata(
+        {
+            "subject": "IEEE Transactions;10.1109/TMC.2026.7654321",
+            "creationDate": "D:20240901000000Z",
+        }
+    )
+    document.save(pdf)
+    document.close()
+
+    facts = extract_pdf_facts(pdf)
+
+    assert facts.doi.value == "10.1109/TMC.2026.7654321"
+    assert facts.doi.source == "pdf_metadata.subject"
+    assert facts.year.value == "2026"
+    assert facts.year.source == "page_text"
+    assert facts.year.confidence == "medium"
+
+
 def test_prepare_draft_uses_layout_fallback_and_does_not_change_catalog(tmp_path):
     inbox = tmp_path / "inbox"
     inbox.mkdir()

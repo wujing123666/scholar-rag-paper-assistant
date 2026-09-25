@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import codecs
 import csv
 import json
 import re
@@ -32,6 +33,16 @@ def _clean_cell(value: Any) -> str:
     if not isinstance(value, str):
         raise ValueError("Catalog profile values must be strings")
     return re.sub(r"\s+", " ", value).strip()
+
+
+def _clean_profile_value(field: str, value: Any) -> str:
+    if field != "pdf_file":
+        return _clean_cell(value)
+    if value is None:
+        return ""
+    if not isinstance(value, str):
+        raise ValueError("Catalog profile values must be strings")
+    return value.strip()
 
 
 def _relative_pdf_path(value: str) -> str:
@@ -128,7 +139,9 @@ def plan_catalog_import(
         proposed = {}
         errors.append("Draft proposed_profile must be an object")
     try:
-        profile = {key: _clean_cell(proposed.get(key, "")) for key in proposed}
+        profile = {
+            key: _clean_profile_value(key, proposed.get(key, "")) for key in proposed
+        }
     except ValueError as error:
         profile = {}
         errors.append(str(error))
@@ -279,6 +292,11 @@ def apply_catalog_import(
         raise RuntimeError("Catalog changed after preview; generate a new import plan")
 
     fields, rows = _read_catalog(catalog_file)
+    catalog_bytes = catalog_file.read_bytes()
+    output_encoding = (
+        "utf-8-sig" if catalog_bytes.startswith(codecs.BOM_UTF8) else "utf-8"
+    )
+    line_ending = "\r\n" if b"\r\n" in catalog_bytes else "\n"
     row = {field: plan.profile.get(field, "") for field in fields}
     row["paper_id"] = plan.paper_id
     row["pdf_file"] = plan.pdf_file
@@ -295,8 +313,10 @@ def apply_catalog_import(
 
     temporary = catalog_file.with_name(f".{catalog_file.name}.import.tmp")
     try:
-        with temporary.open("w", encoding="utf-8", newline="") as handle:
-            writer = csv.DictWriter(handle, fieldnames=fields)
+        with temporary.open("w", encoding=output_encoding, newline="") as handle:
+            writer = csv.DictWriter(
+                handle, fieldnames=fields, lineterminator=line_ending
+            )
             writer.writeheader()
             writer.writerows([*rows, row])
         validated = PaperCatalog.from_csv(temporary)
