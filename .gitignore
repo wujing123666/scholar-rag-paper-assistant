@@ -99,6 +99,7 @@ data/papers/*
 !data/papers/README.md
 !data/papers/paper_catalog.csv
 !data/papers/eval_queries.jsonl
+!data/papers/chunk_eval_queries.jsonl
 !data/papers/inbox/
 cache/
 logs/

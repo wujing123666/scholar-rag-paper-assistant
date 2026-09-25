@@ -152,6 +152,20 @@ def test_expand_chunk_query_adds_transparent_english_aliases():
     assert "generalized model" in expanded
 
 
+def test_expand_chunk_query_covers_cross_language_evaluation_terms():
+    expanded = expand_chunk_query(
+        "历史数据最相似片段、贝叶斯推断、主动学习、时域和频域，通过交叉注意力融合"
+    )
+
+    assert "historical data" in expanded
+    assert "Frobenius norm" in expanded
+    assert "Bayesian inference" in expanded
+    assert "active learning" in expanded
+    assert "temporal domain" in expanded
+    assert "frequency domain" in expanded
+    assert "cross-attention" in expanded
+
+
 def test_paper_routing_prior_prevents_generic_lower_ranked_chunks_from_winning():
     first = _profile("first", "first.pdf")
     second = _profile("second", "second.pdf")

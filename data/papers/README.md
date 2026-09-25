@@ -7,6 +7,7 @@
 - `inbox/`：个人论文 PDF。目录内容被 Git 忽略，仅保留 `.gitkeep`。
 - `paper_catalog.csv`：论文级档案，作为 Paper Profile 的人工可读输入。
 - `eval_queries.jsonl`：模糊找论文的种子评测问题。
+- `chunk_eval_queries.jsonl`：正文检索开发集，标注目标论文、相关 PDF 页码和证据词。
 
 ## 当前语料概况
 
@@ -134,6 +135,26 @@ python -m src.paper_assistant --model-cache data/models/fastembed search-chunks 
 每篇逻辑论文当前只选择第一个实际存在的登记 PDF 建立正文索引，避免同一论文的多个修订版本重复召回。首次运行会构建全部正文向量；后续运行根据 PDF 哈希、分块参数、分块规则版本和 Embedding 模型复用未变化的块。本地实测 10 篇论文得到 506 个正文块，第二个进程全部复用。
 
 当前命令返回可供生成模型使用的证据上下文，包括论文标题、PDF、页码、章节、原文和检索分数。基于这些证据生成中文答案并逐条绑定引用仍是下一阶段，当前不会把检索到的正文误称为已经完成的生成式回答。
+
+## 评测正文证据检索
+
+正文开发集当前包含 10 条问题，每篇逻辑论文 1 条。每条记录保存目标 `paper_id`、一个或多个相关 PDF 页码、证据词和最低证据词命中数。它们由程序根据本地 PDF 定位后逐页核对，`source=system_labeled_from_pdf` 且 `reviewed_by_user=false`，因此是可迭代的开发集，不是用户盲测集。
+
+只评测已知目标论文内部的 Chunk 排序，用于隔离正文检索问题：
+
+```powershell
+python -m src.paper_assistant --model-cache data/models/fastembed evaluate-chunks --oracle-paper
+```
+
+评测完整的“BM25 论文路由 → 候选论文正文检索”：
+
+```powershell
+python -m src.paper_assistant --retriever bm25 --model-cache data/models/fastembed evaluate-chunks
+```
+
+报告分别给出论文候选 Recall、正确页的 Recall@1/3/5 与 MRR，以及同时满足页码和证据词条件的 Evidence Recall@1/3/5 与 MRR。首批 10 条开发题的两级检索基线为：论文路由 Recall=1.00，Page/Evidence Recall@1=0.30、Recall@3=0.50、Recall@5=0.90、MRR=0.495。唯一 Top-5 失败是 STEI 自适应系数的方法公式页。
+
+这些数字只反映当前 10 条系统构造开发题，问题数量较少，而且术语扩展曾根据失败分析迭代，不能作为盲测成绩或最终准确率。后续需要由本人独立编写并冻结新的正文问题，再报告独立测试结果。
 
 运行全部种子问题评测：
 
@@ -286,7 +307,7 @@ PDF 仅用于个人科研和本地实验，不应随公开仓库分发。公开 
 当前已经实现论文级 `PaperProfile`、加权 BM25、本地 BGE Dense、论文级与正文块 Chroma 持久化、两级论文路由与页级正文 Hybrid 检索、阈值拒答、RRF 融合、版本去重、候选档案生成、受控增量入库及 Recall@1、Recall@3、MRR、Rejection Accuracy 和 Open-set Accuracy 评测。下一阶段将实现：
 
 1. 基于正文证据调用生成模型，输出逐条绑定论文、页码、章节和原文的回答；
-2. 建立正文问题、正确页码和证据片段组成的 Chunk Recall@K 测试集；
+2. 扩展并冻结本人编写的正文盲测问题，独立报告 Chunk Recall@K；
 3. 扩展到约 100 篇本人读过的论文；
 4. 为已有论文增加受控版本导入和档案更新；
 5. 按新语料重新校准拒答阈值，并加入平均查询延迟和 P95 延迟评测。
