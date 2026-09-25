@@ -116,6 +116,20 @@ def main() -> int:
     prepare_parser.add_argument("--max-pages", type=int, default=5)
     prepare_parser.add_argument("--force", action="store_true")
 
+    import_parser = subparsers.add_parser(
+        "import-paper", help="Preview or confirm a reviewed Paper Profile import"
+    )
+    import_parser.add_argument("draft", type=Path)
+    import_parser.add_argument("--inbox", type=Path, default=DEFAULT_INBOX)
+    import_parser.add_argument(
+        "--backup-dir", type=Path, default=Path("data/papers/backups")
+    )
+    import_parser.add_argument(
+        "--confirm",
+        action="store_true",
+        help="Write the validated row after creating a catalog backup.",
+    )
+
     args = parser.parse_args()
     if args.command == "inventory":
         report = build_paper_inventory(args.inbox, args.catalog)
@@ -162,6 +176,38 @@ def main() -> int:
             )
         )
         return 0
+
+    if args.command == "import-paper":
+        from src.paper_assistant.catalog_import import (
+            apply_catalog_import,
+            plan_catalog_import,
+        )
+
+        try:
+            plan = plan_catalog_import(args.draft, args.inbox, args.catalog)
+            if not args.confirm or not plan.ready:
+                print(
+                    json.dumps(
+                        {"status": "ready" if plan.ready else "blocked", **plan.summary_dict()},
+                        ensure_ascii=False,
+                        indent=2,
+                    )
+                )
+                return 0 if plan.ready else 1
+            result = apply_catalog_import(
+                plan, args.inbox, args.catalog, args.backup_dir
+            )
+            print(json.dumps(result.to_dict(), ensure_ascii=False, indent=2))
+            return 0
+        except (FileNotFoundError, ValueError, RuntimeError, json.JSONDecodeError) as error:
+            print(
+                json.dumps(
+                    {"status": "error", "message": str(error)},
+                    ensure_ascii=False,
+                    indent=2,
+                )
+            )
+            return 1
 
     retriever = _build_retriever(
         args.catalog,

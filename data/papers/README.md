@@ -211,6 +211,37 @@ python -m src.paper_assistant prepare-paper "data/papers/inbox/新论文.pdf"
 
 如果 PDF 没有可选择的文字，草稿会提示可能需要 OCR。目前不会根据扫描图片猜测论文信息。
 
+## 人工确认后受控写入目录
+
+生成草稿后，先在本地 JSON 的 `proposed_profile` 中核对并补全信息。全新论文至少需要：
+
+- `paper_id`：稳定的小写标识，只使用字母、数字、点、下划线和连字符；
+- `pdf_file`、`canonical_title` 和 `language`；
+- `tags`、`method_summary` 和 `memory_cues`，保证新增论文具备可检索线索。
+
+作者、年份、期刊和数据集允许暂时留空，但预览会给出提醒。先运行不带确认参数的只读预览：
+
+```powershell
+python -m src.paper_assistant --catalog data/papers/paper_catalog.csv import-paper data/papers/drafts/新论文.json --inbox data/papers/inbox
+```
+
+只有预览返回 `status=ready` 后，才执行明确确认：
+
+```powershell
+python -m src.paper_assistant --catalog data/papers/paper_catalog.csv import-paper data/papers/drafts/新论文.json --inbox data/papers/inbox --confirm
+```
+
+确认写入会依次执行：
+
+1. 校验草稿版本和 `needs_review` 状态；
+2. 拒绝已经登记的 PDF、已有 `paper_id`、重复标题和完全重复文件；
+3. 重新计算 inbox 中 PDF 的 SHA-256 和文件大小，识别草稿生成后的文件替换；
+4. 在本地 `data/papers/backups/` 保存原 CSV 备份；
+5. 生成临时 CSV，并使用 `PaperCatalog` 完整加载验证；
+6. 再次确认正式 CSV 没有被其他进程修改，然后原子替换。
+
+默认只支持全新论文。给已有论文增加新 PDF 版本需要单独的版本导入流程，避免把不同论文误合并。备份、草稿和 PDF 均由 Git 忽略。导入成功后，下一次初始化 Dense 检索器时会根据 Paper Profile 哈希只补算新增论文向量。
+
 ## 推荐评测方法
 
 第一版至少报告：
@@ -229,10 +260,10 @@ PDF 仅用于个人科研和本地实验，不应随公开仓库分发。公开 
 
 ## 下一步实现
 
-当前已经实现论文级 `PaperProfile`、加权 BM25、本地 BGE Dense、Chroma 持久化、阈值拒答、RRF 融合、版本去重及 Recall@1、Recall@3、MRR、Rejection Accuracy 和 Open-set Accuracy 评测。下一阶段将实现：
+当前已经实现论文级 `PaperProfile`、加权 BM25、本地 BGE Dense、Chroma 持久化、阈值拒答、RRF 融合、版本去重、候选档案生成、受控增量入库及 Recall@1、Recall@3、MRR、Rejection Accuracy 和 Open-set Accuracy 评测。下一阶段将实现：
 
 1. 扩展到约 100 篇本人读过的论文；
-2. 增量导入、文件哈希与档案更新；
+2. 为已有论文增加受控版本导入和档案更新；
 3. 增加由本人独立编写并冻结的已知与未知盲测问题；
 4. 按新语料重新校准拒答阈值，研究 Reranker 或成对判别；
 5. 加入平均查询延迟和 P95 延迟评测。
