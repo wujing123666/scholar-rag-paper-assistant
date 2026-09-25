@@ -51,8 +51,12 @@ vision_llm:
 # =============================================================================
 vector_store:
   provider: "chroma"  # Options: chroma, qdrant, pinecone
+  mode: "local"  # local=PersistentClient, server=HttpClient
   persist_directory: "./data/db/chroma"
   collection_name: "knowledge_hub"
+  host: "localhost"  # Used when mode=server
+  port: 8000
+  ssl: false
 
 # =============================================================================
 # Retrieval Configuration

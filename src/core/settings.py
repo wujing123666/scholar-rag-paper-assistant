@@ -121,6 +121,10 @@ class VectorStoreSettings:
     provider: str
     persist_directory: str
     collection_name: str
+    mode: str = "local"
+    host: str = "localhost"
+    port: int = 8000
+    ssl: bool = False
 
 
 @dataclass(frozen=True)
@@ -255,6 +259,26 @@ class Settings:
                 provider=_require_str(vector_store, "provider", "vector_store"),
                 persist_directory=_require_str(vector_store, "persist_directory", "vector_store"),
                 collection_name=_require_str(vector_store, "collection_name", "vector_store"),
+                mode=(
+                    _require_str(vector_store, "mode", "vector_store")
+                    if "mode" in vector_store
+                    else "local"
+                ),
+                host=(
+                    _require_str(vector_store, "host", "vector_store")
+                    if "host" in vector_store
+                    else "localhost"
+                ),
+                port=(
+                    _require_int(vector_store, "port", "vector_store")
+                    if "port" in vector_store
+                    else 8000
+                ),
+                ssl=(
+                    _require_bool(vector_store, "ssl", "vector_store")
+                    if "ssl" in vector_store
+                    else False
+                ),
             ),
             retrieval=RetrievalSettings(
                 dense_top_k=_require_int(retrieval, "dense_top_k", "retrieval"),

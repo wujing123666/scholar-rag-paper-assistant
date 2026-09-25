@@ -64,6 +64,10 @@ def test_load_settings_success(tmp_path: Path) -> None:
     assert settings.llm.provider == "openai"
     assert settings.embedding.dimensions == 1536
     assert settings.vector_store.collection_name == "knowledge_hub"
+    assert settings.vector_store.mode == "local"
+    assert settings.vector_store.host == "localhost"
+    assert settings.vector_store.port == 8000
+    assert settings.vector_store.ssl is False
     assert settings.retrieval.rrf_k == 60
     assert settings.rerank.provider == "none"
     assert settings.evaluation.metrics == ["hit_rate", "mrr"]

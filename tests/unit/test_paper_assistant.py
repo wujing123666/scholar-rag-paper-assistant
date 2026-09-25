@@ -10,6 +10,7 @@ import numpy as np
 
 from src.libs.embedding.base_embedding import BaseEmbedding
 from src.libs.embedding.fastembed_embedding import FastEmbedEmbedding
+from src.libs.vector_store.chroma_store import ChromaStore
 from src.paper_assistant.catalog import PaperCatalog
 from src.paper_assistant.dense_retriever import PaperDenseRetriever, profile_text
 from src.paper_assistant.evaluation import evaluate_retriever
@@ -162,24 +163,95 @@ def test_dense_retriever_ranks_one_vector_per_paper(tmp_path):
     catalog = PaperCatalog.from_csv(_write_catalog(tmp_path))
     embedding = _KeywordEmbedding()
 
-    retriever = PaperDenseRetriever(catalog, embedding)
-    results = retriever.search("帮我找使用强化学习的论文", top_k=2)
+    with ChromaStore(
+        persist_directory=tmp_path / "chroma", collection_name="paper_profiles_test"
+    ) as store:
+        retriever = PaperDenseRetriever(catalog, embedding, store)
+        results = retriever.search("帮我找使用强化学习的论文", top_k=2)
 
-    assert results[0].paper.paper_id == "recruitment"
-    assert results[0].matched_terms == ()
-    assert len(embedding.calls[0][0]) == 2
-    assert embedding.calls[0][1] is False
-    assert embedding.calls[1][1] is True
-    assert evaluate_retriever(
-        retriever,
-        [
-            {
-                "id": "q1",
-                "description": "强化学习招募",
-                "expected_paper_id": "recruitment",
-            }
-        ],
-    )["retriever"] == "paper_dense"
+        assert results[0].paper.paper_id == "recruitment"
+        assert results[0].matched_terms == ()
+        assert len(embedding.calls[0][0]) == 2
+        assert embedding.calls[0][1] is False
+        assert embedding.calls[1][1] is True
+        assert evaluate_retriever(
+            retriever,
+            [
+                {
+                    "id": "q1",
+                    "description": "强化学习招募",
+                    "expected_paper_id": "recruitment",
+                }
+            ],
+        )["retriever"] == "paper_dense"
+
+
+def test_dense_retriever_reuses_persisted_profile_vectors(tmp_path):
+    catalog = PaperCatalog.from_csv(_write_catalog(tmp_path))
+    first_embedding = _KeywordEmbedding()
+
+    with ChromaStore(
+        persist_directory=tmp_path / "chroma", collection_name="paper_profiles_test"
+    ) as store:
+        first = PaperDenseRetriever(catalog, first_embedding, store)
+        second_embedding = _KeywordEmbedding()
+        second = PaperDenseRetriever(catalog, second_embedding, store)
+
+        assert first.index_sync.embedded == 2
+        assert second.index_sync.embedded == 0
+        assert second.index_sync.reused == 2
+        assert second_embedding.calls == []
+        assert set(store.list_ids()) == {"paper:diffusion", "paper:recruitment"}
+
+        store.upsert(
+            [
+                {
+                    "id": "paper:removed",
+                    "vector": [1.0, 0.0],
+                    "document": "removed paper",
+                    "metadata": {
+                        "paper_id": "removed",
+                        "profile_hash": "old",
+                        "embedding_model": "_KeywordEmbedding",
+                        "embedding_dimension": 2,
+                    },
+                }
+            ]
+        )
+        third = PaperDenseRetriever(catalog, _KeywordEmbedding(), store)
+        assert third.index_sync.deleted == 1
+        assert "paper:removed" not in store.list_ids()
+
+
+def test_dense_model_change_keeps_old_index_when_reembedding_fails(tmp_path):
+    catalog = PaperCatalog.from_csv(_write_catalog(tmp_path))
+    original_embedding = _KeywordEmbedding()
+    original_embedding.model = "test-model-v1"
+
+    class BrokenReplacement(_KeywordEmbedding):
+        model = "test-model-v2"
+
+        def embed(self, texts, trace=None, **kwargs):
+            raise RuntimeError("replacement model failed")
+
+    with ChromaStore(
+        persist_directory=tmp_path / "chroma", collection_name="paper_profiles_test"
+    ) as store:
+        PaperDenseRetriever(catalog, original_embedding, store)
+        original_ids = set(store.list_ids())
+
+        try:
+            PaperDenseRetriever(catalog, BrokenReplacement(), store)
+        except RuntimeError as error:
+            assert "replacement model failed" in str(error)
+        else:
+            raise AssertionError("Expected replacement embedding to fail")
+
+        assert set(store.list_ids()) == original_ids
+        records = store.get_by_ids(sorted(original_ids))
+        assert {
+            record["metadata"]["embedding_model"] for record in records
+        } == {"test-model-v1"}
 
 
 def test_profile_text_keeps_human_readable_field_labels(tmp_path):
@@ -231,36 +303,41 @@ def test_fastembed_provider_uses_separate_document_and_query_methods(monkeypatch
 def test_hybrid_retriever_combines_sparse_and_dense_ranks(tmp_path):
     catalog = PaperCatalog.from_csv(_write_catalog(tmp_path))
     sparse = PaperBM25Retriever(catalog)
-    dense = PaperDenseRetriever(catalog, _KeywordEmbedding())
-    retriever = PaperHybridRetriever(catalog, sparse, dense)
+    with ChromaStore(
+        persist_directory=tmp_path / "chroma", collection_name="paper_profiles_test"
+    ) as store:
+        dense = PaperDenseRetriever(catalog, _KeywordEmbedding(), store)
+        retriever = PaperHybridRetriever(catalog, sparse, dense)
+        results = retriever.search("强化学习招募", top_k=2)
 
-    results = retriever.search("强化学习招募", top_k=2)
-
-    assert results[0].paper.paper_id == "recruitment"
-    assert results[0].score == 2 / 61
-    assert evaluate_retriever(
-        retriever,
-        [
-            {
-                "id": "q1",
-                "description": "强化学习招募",
-                "expected_paper_id": "recruitment",
-            }
-        ],
-    )["retriever"] == "paper_hybrid_rrf"
+        assert results[0].paper.paper_id == "recruitment"
+        assert results[0].score == 2 / 61
+        assert evaluate_retriever(
+            retriever,
+            [
+                {
+                    "id": "q1",
+                    "description": "强化学习招募",
+                    "expected_paper_id": "recruitment",
+                }
+            ],
+        )["retriever"] == "paper_hybrid_rrf"
 
 
 def test_hybrid_retriever_requires_shared_catalog(tmp_path):
     catalog = PaperCatalog.from_csv(_write_catalog(tmp_path))
     other_catalog = PaperCatalog.from_csv(_write_catalog(tmp_path))
 
-    try:
-        PaperHybridRetriever(
-            catalog,
-            PaperBM25Retriever(other_catalog),
-            PaperDenseRetriever(catalog, _KeywordEmbedding()),
-        )
-    except ValueError as error:
-        assert "same paper catalog" in str(error)
-    else:
-        raise AssertionError("Expected mismatched catalogs to be rejected")
+    with ChromaStore(
+        persist_directory=tmp_path / "chroma", collection_name="paper_profiles_test"
+    ) as store:
+        try:
+            PaperHybridRetriever(
+                catalog,
+                PaperBM25Retriever(other_catalog),
+                PaperDenseRetriever(catalog, _KeywordEmbedding(), store),
+            )
+        except ValueError as error:
+            assert "same paper catalog" in str(error)
+        else:
+            raise AssertionError("Expected mismatched catalogs to be rejected")

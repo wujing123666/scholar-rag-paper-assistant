@@ -59,7 +59,7 @@ class ChromaStore(BaseVectorStore):
         >>> results = store.query([0.1, 0.2, 0.3], top_k=5)
     """
     
-    def __init__(self, settings: Settings, **kwargs: Any) -> None:
+    def __init__(self, settings: Settings | None = None, **kwargs: Any) -> None:
         """Initialize ChromaStore with configuration.
         
         Args:
@@ -77,20 +77,27 @@ class ChromaStore(BaseVectorStore):
                 "Install it with: pip install chromadb"
             )
         
-        # Extract configuration
-        try:
-            vector_store_config = settings.vector_store
-        except AttributeError as e:
-            raise ValueError(
-                "Missing required configuration: settings.vector_store. "
-                "Please ensure 'vector_store' section exists in settings.yaml"
-            ) from e
+        vector_store_config = getattr(settings, "vector_store", None)
         
         # Collection name (allow override)
         self.collection_name = kwargs.get(
             'collection_name',
             getattr(vector_store_config, 'collection_name', 'knowledge_hub')
         )
+        self.mode = kwargs.get(
+            'mode', getattr(vector_store_config, 'mode', 'local')
+        )
+        self.host = kwargs.get(
+            'host', getattr(vector_store_config, 'host', 'localhost')
+        )
+        self.port = int(kwargs.get(
+            'port', getattr(vector_store_config, 'port', 8000)
+        ))
+        self.ssl = bool(kwargs.get(
+            'ssl', getattr(vector_store_config, 'ssl', False)
+        ))
+        if self.mode not in {'local', 'server'}:
+            raise ValueError("Chroma mode must be either 'local' or 'server'")
         
         # Persist directory (allow override)
         persist_dir_str = kwargs.get(
@@ -99,12 +106,12 @@ class ChromaStore(BaseVectorStore):
         )
         self.persist_directory = resolve_path(persist_dir_str)
         
-        # Ensure persist directory exists
-        self.persist_directory.mkdir(parents=True, exist_ok=True)
+        if self.mode == 'local':
+            self.persist_directory.mkdir(parents=True, exist_ok=True)
         
         logger.info(
             f"Initializing ChromaStore: collection='{self.collection_name}', "
-            f"persist_directory='{self.persist_directory}'"
+            f"mode='{self.mode}'"
         )
         
         self.client = None
@@ -123,16 +130,24 @@ class ChromaStore(BaseVectorStore):
 
         try:
             with CHROMA_CLIENT_LOCK:
-                self.client = chromadb.PersistentClient(
-                    path=str(self.persist_directory),
-                    settings=ChromaSettings(
-                        anonymized_telemetry=False,
-                        allow_reset=True,
+                if self.mode == 'local':
+                    self.client = chromadb.PersistentClient(
+                        path=str(self.persist_directory),
+                        settings=ChromaSettings(
+                            anonymized_telemetry=False,
+                            allow_reset=True,
+                        )
                     )
-                )
+                else:
+                    self.client = chromadb.HttpClient(
+                        host=self.host,
+                        port=self.port,
+                        ssl=self.ssl,
+                        settings=ChromaSettings(anonymized_telemetry=False),
+                    )
         except Exception as e:
             raise RuntimeError(
-                f"Failed to initialize ChromaDB client at '{self.persist_directory}': {e}"
+                f"Failed to initialize ChromaDB client in {self.mode!r} mode: {e}"
             ) from e
         
         try:
@@ -220,7 +235,7 @@ class ChromaStore(BaseVectorStore):
             metadatas.append(sanitized_metadata)
             
             # Document: use metadata.text if available, otherwise use id
-            document = metadata.get('text', record['id'])
+            document = record.get('document', metadata.get('text', record['id']))
             documents.append(str(document))
         
         # Perform upsert (ChromaDB's add() is idempotent with same IDs)
@@ -571,3 +586,15 @@ class ChromaStore(BaseVectorStore):
         
         logger.debug(f"Retrieved {len([r for r in output if r])} of {len(ids)} records by IDs")
         return output
+
+    def list_ids(self, **kwargs: Any) -> List[str]:
+        """Return all IDs in this collection for synchronization jobs."""
+        del kwargs
+        self._ensure_open()
+        try:
+            results = self.collection.get(include=[])
+        except Exception as e:
+            raise RuntimeError(
+                f"Failed to list IDs from collection '{self.collection_name}': {e}"
+            ) from e
+        return [str(record_id) for record_id in results.get('ids', [])]
