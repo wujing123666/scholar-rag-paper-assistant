@@ -7,7 +7,6 @@ a lightweight, open-source embedding database designed for local-first deploymen
 from __future__ import annotations
 
 import logging
-from pathlib import Path
 from typing import TYPE_CHECKING, Any, Dict, List, Optional
 
 try:
@@ -19,6 +18,7 @@ except ImportError:
 
 from src.core.settings import resolve_path
 from src.libs.vector_store.base_vector_store import BaseVectorStore
+from src.libs.vector_store.chroma_lock import CHROMA_CLIENT_LOCK
 
 if TYPE_CHECKING:
     from src.core.settings import Settings
@@ -107,21 +107,34 @@ class ChromaStore(BaseVectorStore):
             f"persist_directory='{self.persist_directory}'"
         )
         
-        # Initialize ChromaDB client with persistent storage
+        self.client = None
+        self.collection = None
+        self._ensure_open()
+
+        logger.info(
+            f"ChromaStore initialized successfully. "
+            f"Collection count: {self.collection.count()}"
+        )
+
+    def _ensure_open(self) -> None:
+        """Open the persistent client and collection when currently closed."""
+        if self.client is not None and self.collection is not None:
+            return
+
         try:
-            self.client = chromadb.PersistentClient(
-                path=str(self.persist_directory),
-                settings=ChromaSettings(
-                    anonymized_telemetry=False,
-                    allow_reset=True,
+            with CHROMA_CLIENT_LOCK:
+                self.client = chromadb.PersistentClient(
+                    path=str(self.persist_directory),
+                    settings=ChromaSettings(
+                        anonymized_telemetry=False,
+                        allow_reset=True,
+                    )
                 )
-            )
         except Exception as e:
             raise RuntimeError(
                 f"Failed to initialize ChromaDB client at '{self.persist_directory}': {e}"
             ) from e
         
-        # Get or create collection
         try:
             self.collection = self.client.get_or_create_collection(
                 name=self.collection_name,
@@ -131,11 +144,33 @@ class ChromaStore(BaseVectorStore):
             raise RuntimeError(
                 f"Failed to get or create collection '{self.collection_name}': {e}"
             ) from e
-        
-        logger.info(
-            f"ChromaStore initialized successfully. "
-            f"Collection count: {self.collection.count()}"
-        )
+
+    def close(self) -> None:
+        """Release ChromaDB file handles and shared-system references."""
+        client = getattr(self, "client", None)
+        if client is None:
+            return
+
+        self.collection = None
+        self.client = None
+        close = getattr(client, "close", None)
+        if callable(close):
+            close()
+
+    def __enter__(self) -> ChromaStore:
+        """Return this store as a context manager."""
+        return self
+
+    def __exit__(self, exc_type: Any, exc_value: Any, traceback: Any) -> None:
+        """Close the underlying client when leaving a context."""
+        self.close()
+
+    def __del__(self) -> None:
+        """Best-effort cleanup for callers that do not use ``close``."""
+        try:
+            self.close()
+        except Exception:
+            pass
     
     def upsert(
         self,
@@ -157,6 +192,8 @@ class ChromaStore(BaseVectorStore):
             ValueError: If records list is empty or contains invalid entries.
             RuntimeError: If the upsert operation fails.
         """
+        self._ensure_open()
+
         # Validate records
         self.validate_records(records)
         
@@ -228,6 +265,8 @@ class ChromaStore(BaseVectorStore):
             ValueError: If vector is empty or top_k is invalid.
             RuntimeError: If the query operation fails.
         """
+        self._ensure_open()
+
         # Validate query parameters
         self.validate_query_vector(vector, top_k)
         
@@ -291,6 +330,8 @@ class ChromaStore(BaseVectorStore):
             ValueError: If ids list is empty.
             RuntimeError: If the delete operation fails.
         """
+        self._ensure_open()
+
         if not ids:
             raise ValueError("IDs list cannot be empty")
         
@@ -318,6 +359,8 @@ class ChromaStore(BaseVectorStore):
         Raises:
             RuntimeError: If the clear operation fails.
         """
+        self._ensure_open()
+
         try:
             target_collection = collection_name or self.collection_name
             
@@ -332,6 +375,10 @@ class ChromaStore(BaseVectorStore):
             raise RuntimeError(
                 f"Failed to clear collection '{collection_name or self.collection_name}': {e}"
             ) from e
+        finally:
+            # Re-open lazily on the next operation. Closing here releases
+            # SQLite/HNSW handles before callers remove a temporary directory.
+            self.close()
 
     def delete_by_metadata(
         self,
@@ -352,6 +399,8 @@ class ChromaStore(BaseVectorStore):
             ValueError: If *filter_dict* is empty.
             RuntimeError: If the operation fails.
         """
+        self._ensure_open()
+
         if not filter_dict:
             raise ValueError("filter_dict cannot be empty")
 
@@ -442,6 +491,7 @@ class ChromaStore(BaseVectorStore):
                 - name: Collection name
                 - metadata: Collection metadata
         """
+        self._ensure_open()
         return {
             'count': self.collection.count(),
             'name': self.collection_name,
@@ -476,6 +526,8 @@ class ChromaStore(BaseVectorStore):
             ValueError: If ids list is empty.
             RuntimeError: If the retrieval operation fails.
         """
+        self._ensure_open()
+
         if not ids:
             raise ValueError("IDs list cannot be empty")
         

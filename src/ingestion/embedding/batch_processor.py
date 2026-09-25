@@ -11,9 +11,9 @@ Design Principles:
 - Deterministic: Same inputs produce same batching and results
 """
 
-from typing import List, Dict, Any, Optional, Tuple
 import time
 from dataclasses import dataclass
+from typing import Any, Dict, List, Optional
 
 from src.core.types import Chunk
 from src.ingestion.embedding.dense_encoder import DenseEncoder
@@ -135,7 +135,7 @@ class BatchProcessor:
         if not chunks:
             raise ValueError("Cannot process empty chunks list")
         
-        start_time = time.time()
+        start_time_ns = time.perf_counter_ns()
         
         # Create batches
         batches = self._create_batches(chunks)
@@ -148,7 +148,7 @@ class BatchProcessor:
         failed_chunks = 0
         
         for batch_idx, batch in enumerate(batches):
-            batch_start = time.time()
+            batch_start_ns = time.perf_counter_ns()
             
             try:
                 # Dense encoding
@@ -170,7 +170,10 @@ class BatchProcessor:
                         {"error": str(e), "batch_size": len(batch)}
                     )
             
-            batch_duration = time.time() - batch_start
+            batch_duration = max(
+                (time.perf_counter_ns() - batch_start_ns) / 1_000_000_000,
+                1e-9,
+            )
             
             # Record batch timing if trace available
             if trace:
@@ -183,7 +186,10 @@ class BatchProcessor:
                     }
                 )
         
-        total_time = time.time() - start_time
+        total_time = max(
+            (time.perf_counter_ns() - start_time_ns) / 1_000_000_000,
+            1e-9,
+        )
         
         # Record overall processing statistics
         if trace:

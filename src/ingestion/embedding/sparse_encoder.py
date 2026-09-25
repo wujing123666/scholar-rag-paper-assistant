@@ -146,18 +146,18 @@ class SparseEncoder:
         """
         tokens: List[str] = []
 
-        # Use jieba to segment the text (handles both Chinese and English)
-        raw_tokens = jieba.lcut(text)
-
-        # Clean tokens: keep only alphanumeric and Chinese characters
-        for token in raw_tokens:
-            token = token.strip()
-            if not token:
-                continue
-            # Skip pure punctuation / whitespace
-            if re.fullmatch(r'[\s\W]+', token, re.UNICODE):
-                continue
-            tokens.append(token)
+        # Extract Latin/numeric compounds before Chinese segmentation. Jieba
+        # otherwise splits useful search terms such as "gpt-4" and
+        # "deep_learning" at their connectors.
+        spans = re.findall(
+            r"[A-Za-zÀ-ÖØ-öø-ÿ0-9]+(?:[._-][A-Za-zÀ-ÖØ-öø-ÿ0-9]+)*|[\u3400-\u9fff]+",
+            text,
+        )
+        for span in spans:
+            if re.fullmatch(r"[\u3400-\u9fff]+", span):
+                tokens.extend(token.strip() for token in jieba.lcut(span) if token.strip())
+            else:
+                tokens.append(span)
         
         # Apply lowercase if configured
         if self.lowercase:

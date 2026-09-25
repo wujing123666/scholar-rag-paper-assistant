@@ -129,13 +129,17 @@ class ChunkRefiner(BaseTransform):
                 refined_text = rule_refined_text
                 refined_by = "rule"
             
+            refined_metadata = {
+                **(chunk.metadata or {}),
+                "refined_by": refined_by,
+            }
+            if refined_by == "rule" and self.use_llm and self.llm:
+                refined_metadata["refine_fallback_reason"] = "llm_failed"
+
             refined_chunk = Chunk(
                 id=chunk.id,
                 text=refined_text,
-                metadata={
-                    **(chunk.metadata or {}),
-                    'refined_by': refined_by
-                },
+                metadata=refined_metadata,
                 source_ref=chunk.source_ref
             )
             return (refined_chunk, refined_by, None)
@@ -229,21 +233,23 @@ class ChunkRefiner(BaseTransform):
                         refined_text = rule_refined_text
                         refined_by = "rule"
                         fallback_count += 1
-                        if chunk.metadata:
-                            chunk.metadata['refine_fallback_reason'] = "llm_failed"
                 else:
                     # LLM disabled, use rule-based
                     refined_text = rule_refined_text
                     refined_by = "rule"
                 
                 # Create refined chunk
+                refined_metadata = {
+                    **(chunk.metadata or {}),
+                    "refined_by": refined_by,
+                }
+                if refined_by == "rule" and self.use_llm and self.llm:
+                    refined_metadata["refine_fallback_reason"] = "llm_failed"
+
                 refined_chunk = Chunk(
                     id=chunk.id,
                     text=refined_text,
-                    metadata={
-                        **(chunk.metadata or {}),
-                        'refined_by': refined_by
-                    },
+                    metadata=refined_metadata,
                     source_ref=chunk.source_ref
                 )
                 refined_chunks.append(refined_chunk)

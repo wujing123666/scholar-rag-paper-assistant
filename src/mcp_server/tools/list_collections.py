@@ -21,7 +21,8 @@ from mcp import types
 
 if TYPE_CHECKING:
     from src.mcp_server.protocol_handler import ProtocolHandler
-    from src.core.settings import Settings
+from src.core.settings import Settings
+from src.libs.vector_store.chroma_lock import CHROMA_CLIENT_LOCK
 
 logger = logging.getLogger(__name__)
 
@@ -170,13 +171,14 @@ class ListCollectionsTool:
             persist_path.mkdir(parents=True, exist_ok=True)
         
         try:
-            client = chromadb.PersistentClient(
-                path=str(persist_path),
-                settings=ChromaSettings(
-                    anonymized_telemetry=False,
-                    allow_reset=True,
+            with CHROMA_CLIENT_LOCK:
+                client = chromadb.PersistentClient(
+                    path=str(persist_path),
+                    settings=ChromaSettings(
+                        anonymized_telemetry=False,
+                        allow_reset=True,
+                    )
                 )
-            )
             return client
         except Exception as e:
             raise RuntimeError(
@@ -227,6 +229,10 @@ class ListCollectionsTool:
         except Exception as e:
             logger.error(f"Failed to list collections: {e}")
             return []
+        finally:
+            close = getattr(client, "close", None)
+            if callable(close):
+                close()
         
         logger.info(f"Found {len(collections_info)} collections")
         return collections_info
@@ -288,7 +294,7 @@ class ListCollectionsTool:
             # Run blocking ChromaDB I/O in a thread to avoid blocking
             # the async event loop / MCP stdio transport
             collections = await asyncio.to_thread(
-                self.list_collections, include_stats,
+                self.list_collections, include_stats=include_stats,
             )
             response_text = self.format_response(collections)
             

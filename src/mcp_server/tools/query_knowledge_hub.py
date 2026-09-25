@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import threading
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, TYPE_CHECKING
 
@@ -124,7 +125,10 @@ class QueryKnowledgeHubTool:
         self._hybrid_search = hybrid_search
         self._reranker = reranker
         self._embedding_client = None
+        self._vector_store = None
+        self._collection_is_empty = False
         self._response_builder = response_builder or ResponseBuilder()
+        self._init_lock = threading.RLock()
         
         # Track initialization state
         self._initialized = False
@@ -155,9 +159,19 @@ class QueryKnowledgeHubTool:
         Args:
             collection: Target collection name.
         """
-        # Always rebuild vector_store and retriever components so that
-        # data ingested by other processes (e.g. Dashboard) is visible
-        # immediately without requiring an MCP Server restart.
+        with self._init_lock:
+            self._initialize_components(collection)
+
+    def _initialize_components(self, collection: str) -> None:
+        """Initialize or refresh components while holding the init lock."""
+        if (
+            self._initialized
+            and self._current_collection == collection
+            and self._vector_store is not None
+        ):
+            stats = self._vector_store.get_collection_stats()
+            self._collection_is_empty = stats.get("count", 0) == 0
+            return
         
         logger.info(f"Initializing query components for collection: {collection}")
         
@@ -182,9 +196,18 @@ class QueryKnowledgeHubTool:
         # ChromaDB PersistentClient uses SQLite under the hood —
         # concurrent readers see committed writes from other processes
         # (dashboard ingestion), so caching the client is safe.
+        if self._vector_store is not None:
+            close = getattr(self._vector_store, "close", None)
+            if callable(close):
+                close()
+
         vector_store = VectorStoreFactory.create(
             self.settings,
             collection_name=collection,
+        )
+        self._vector_store = vector_store
+        self._collection_is_empty = (
+            vector_store.get_collection_stats().get("count", 0) == 0
         )
         
         dense_retriever = create_dense_retriever(
@@ -270,10 +293,15 @@ class QueryKnowledgeHubTool:
                 "cold_start": _init_elapsed > 500,  # >500ms ≈ cold
             }, elapsed_ms=_init_elapsed)
             
-            # Perform hybrid search (blocking: embedding API + DB queries)
-            results = await asyncio.to_thread(
-                self._perform_search, query, effective_top_k, trace,
-            )
+            # An empty collection cannot return dense or sparse matches. Avoid
+            # an unnecessary embedding API call, especially with fresh installs.
+            if self._collection_is_empty:
+                results = []
+            else:
+                # Perform hybrid search (blocking: embedding API + DB queries)
+                results = await asyncio.to_thread(
+                    self._perform_search, query, effective_top_k, trace,
+                )
             
             # Apply reranking if enabled (may call LLM API)
             if self.config.enable_rerank and results:
@@ -313,6 +341,23 @@ class QueryKnowledgeHubTool:
             TraceCollector().collect(trace)
             # Return error response
             return self._build_error_response(query, effective_collection, str(e))
+
+    def close(self) -> None:
+        """Release the cached vector-store client."""
+        vector_store = self._vector_store
+        self._vector_store = None
+        self._hybrid_search = None
+        self._initialized = False
+        close = getattr(vector_store, "close", None)
+        if callable(close):
+            close()
+
+    def __del__(self) -> None:
+        """Best-effort cleanup for the module-level tool instance."""
+        try:
+            self.close()
+        except Exception:
+            pass
     
     def _perform_search(
         self,
@@ -404,7 +449,7 @@ class QueryKnowledgeHubTool:
         Returns:
             MCPToolResponse indicating error.
         """
-        content = f"## 查询失败\n\n"
+        content = "## 查询失败\n\n"
         content += f"查询: **{query}**\n"
         content += f"集合: `{collection}`\n\n"
         content += f"**错误信息:** {error_message}\n\n"
@@ -500,7 +545,7 @@ async def query_knowledge_hub_handler(
             content=[
                 types.TextContent(
                     type="text",
-                    text=f"内部错误: 查询处理失败",
+                    text="内部错误: 查询处理失败",
                 )
             ],
             isError=True,
