@@ -57,6 +57,10 @@ TOOL_INPUT_SCHEMA: dict[str, Any] = {
 }
 
 
+class FindPaperInputError(ValueError):
+    """Raised when MCP arguments fail tool-level validation."""
+
+
 class FindPaperTool:
     """Search the paper catalog with a lazily initialized retriever."""
 
@@ -73,14 +77,23 @@ class FindPaperTool:
         self.model_cache = resolve_path(model_cache)
         self._embedding = embedding
         self._catalog: PaperCatalog | None = None
+        self._catalog_signature: tuple[int, int] | None = None
         self._retrievers: dict[str, PaperRetriever] = {}
         self._init_lock = threading.RLock()
 
+    def _current_catalog_signature(self) -> tuple[int, int]:
+        stat = self.catalog_path.stat()
+        return stat.st_mtime_ns, stat.st_size
+
     @property
     def catalog(self) -> PaperCatalog:
-        if self._catalog is None:
-            self._catalog = PaperCatalog.from_csv(self.catalog_path)
-        return self._catalog
+        with self._init_lock:
+            signature = self._current_catalog_signature()
+            if self._catalog is None or signature != self._catalog_signature:
+                self._catalog = PaperCatalog.from_csv(self.catalog_path)
+                self._catalog_signature = signature
+                self._retrievers.clear()
+            return self._catalog
 
     def _get_embedding(self) -> BaseEmbedding:
         if self._embedding is None:
@@ -92,12 +105,14 @@ class FindPaperTool:
 
     def _get_retriever(self, name: str) -> PaperRetriever:
         with self._init_lock:
+            # Accessing the property detects catalog edits and clears stale retrievers.
+            catalog = self.catalog
             if name in self._retrievers:
                 return self._retrievers[name]
             if name == "bm25":
-                retriever: PaperRetriever = PaperBM25Retriever(self.catalog)
+                retriever: PaperRetriever = PaperBM25Retriever(catalog)
             elif name == "dense":
-                retriever = PaperDenseRetriever(self.catalog, self._get_embedding())
+                retriever = PaperDenseRetriever(catalog, self._get_embedding())
             elif name == "hybrid":
                 sparse = self._get_retriever("bm25")
                 dense = self._get_retriever("dense")
@@ -105,9 +120,11 @@ class FindPaperTool:
                     dense, PaperDenseRetriever
                 ):
                     raise RuntimeError("Hybrid paper retriever dependencies are invalid")
-                retriever = PaperHybridRetriever(self.catalog, sparse, dense)
+                retriever = PaperHybridRetriever(catalog, sparse, dense)
             else:
-                raise ValueError("retriever must be one of: bm25, dense, hybrid")
+                raise FindPaperInputError(
+                    "retriever must be one of: bm25, dense, hybrid"
+                )
             self._retrievers[name] = retriever
             return retriever
 
@@ -137,11 +154,13 @@ class FindPaperTool:
     ) -> dict[str, Any]:
         """Return structured paper candidates for one fuzzy query."""
         if not isinstance(query, str) or not query.strip():
-            raise ValueError("query cannot be empty")
+            raise FindPaperInputError("query cannot be empty")
         if not isinstance(top_k, int) or isinstance(top_k, bool) or not 1 <= top_k <= 10:
-            raise ValueError("top_k must be an integer between 1 and 10")
+            raise FindPaperInputError("top_k must be an integer between 1 and 10")
         if retriever not in {"bm25", "dense", "hybrid"}:
-            raise ValueError("retriever must be one of: bm25, dense, hybrid")
+            raise FindPaperInputError(
+                "retriever must be one of: bm25, dense, hybrid"
+            )
 
         matches = self._get_retriever(retriever).search(query.strip(), top_k=top_k)
         return {
@@ -195,10 +214,32 @@ class FindPaperTool:
                 structuredContent=payload,
                 isError=False,
             )
-        except (FileNotFoundError, ValueError, RuntimeError) as error:
-            logger.warning("find_paper failed: %s", error)
+        except FindPaperInputError as error:
+            logger.warning("find_paper rejected invalid input: %s", error)
             return types.CallToolResult(
                 content=[types.TextContent(type="text", text=f"查找论文失败：{error}")],
+                isError=True,
+            )
+        except FileNotFoundError:
+            logger.exception("Paper catalog is not available: %s", self.catalog_path)
+            return types.CallToolResult(
+                content=[
+                    types.TextContent(
+                        type="text",
+                        text="查找论文失败：论文目录不可用，请检查服务端配置。",
+                    )
+                ],
+                isError=True,
+            )
+        except (ValueError, RuntimeError):
+            logger.exception("Paper retriever initialization failed")
+            return types.CallToolResult(
+                content=[
+                    types.TextContent(
+                        type="text",
+                        text="查找论文失败：检索器暂时不可用，请检查服务端日志。",
+                    )
+                ],
                 isError=True,
             )
 
