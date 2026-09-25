@@ -42,11 +42,14 @@ def chroma_store(test_settings):
     """Create a ChromaStore instance for testing."""
     store = ChromaStore(settings=test_settings)
     yield store
-    # Cleanup: clear collection after each test
+    # Cleanup: clear data and release SQLite handles before TemporaryDirectory
+    # removes the persistence directory on Windows.
     try:
         store.clear()
     except Exception:
         pass
+    finally:
+        store.close()
 
 
 class TestChromaStoreBasicOperations:

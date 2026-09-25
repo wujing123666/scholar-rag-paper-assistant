@@ -22,7 +22,8 @@ from mcp import types
 
 if TYPE_CHECKING:
     from src.mcp_server.protocol_handler import ProtocolHandler
-    from src.core.settings import Settings
+from src.core.settings import Settings
+from src.libs.vector_store.chroma_lock import CHROMA_CLIENT_LOCK
 
 logger = logging.getLogger(__name__)
 
@@ -212,18 +213,34 @@ class GetDocumentSummaryTool:
             persist_path.mkdir(parents=True, exist_ok=True)
         
         try:
-            self._chroma_client = chromadb.PersistentClient(
-                path=str(persist_path),
-                settings=ChromaSettings(
-                    anonymized_telemetry=False,
-                    allow_reset=True,
+            with CHROMA_CLIENT_LOCK:
+                self._chroma_client = chromadb.PersistentClient(
+                    path=str(persist_path),
+                    settings=ChromaSettings(
+                        anonymized_telemetry=False,
+                        allow_reset=True,
+                    )
                 )
-            )
             return self._chroma_client
         except Exception as e:
             raise RuntimeError(
                 f"Failed to initialize ChromaDB client at '{persist_path}': {e}"
             ) from e
+
+    def close(self) -> None:
+        """Release the cached ChromaDB client."""
+        client = self._chroma_client
+        self._chroma_client = None
+        close = getattr(client, "close", None)
+        if callable(close):
+            close()
+
+    def __del__(self) -> None:
+        """Best-effort cleanup for the module-level tool instance."""
+        try:
+            self.close()
+        except Exception:
+            pass
     
     def _get_collection(self, collection_name: Optional[str] = None) -> Any:
         """Get ChromaDB collection.
