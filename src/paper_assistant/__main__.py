@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import sys
 from pathlib import Path
 
 from src.libs.embedding.fastembed_embedding import FastEmbedEmbedding
@@ -11,13 +12,22 @@ from src.paper_assistant.catalog import PaperCatalog
 from src.paper_assistant.dense_retriever import PaperDenseRetriever
 from src.paper_assistant.evaluation import evaluate_retriever, load_evaluation_cases
 from src.paper_assistant.hybrid_retriever import PaperHybridRetriever
+from src.paper_assistant.inventory import build_paper_inventory, write_inventory_report
 from src.paper_assistant.retriever import PaperBM25Retriever
 
 DEFAULT_CATALOG = Path("data/papers/paper_catalog.csv")
 DEFAULT_EVALUATION = Path("data/papers/eval_queries.jsonl")
+DEFAULT_INBOX = Path("data/papers/inbox")
 
 
 DEFAULT_DENSE_MODEL = "BAAI/bge-small-zh-v1.5"
+
+
+def _configure_stdout_utf8() -> None:
+    """Keep Chinese JSON readable on Windows and in redirected output."""
+    reconfigure = getattr(sys.stdout, "reconfigure", None)
+    if callable(reconfigure):
+        reconfigure(encoding="utf-8")
 
 
 def _build_retriever(
@@ -37,6 +47,7 @@ def _build_retriever(
 
 
 def main() -> int:
+    _configure_stdout_utf8()
     parser = argparse.ArgumentParser(description="ScholarRAG paper-level retrieval")
     parser.add_argument("--catalog", type=Path, default=DEFAULT_CATALOG)
     parser.add_argument(
@@ -54,7 +65,20 @@ def main() -> int:
     evaluate_parser.add_argument("--queries", type=Path, default=DEFAULT_EVALUATION)
     evaluate_parser.add_argument("--split", choices=("dev", "test_candidate"))
 
+    inventory_parser = subparsers.add_parser(
+        "inventory", help="Audit local PDFs against the paper catalog"
+    )
+    inventory_parser.add_argument("--inbox", type=Path, default=DEFAULT_INBOX)
+    inventory_parser.add_argument("--output", type=Path)
+
     args = parser.parse_args()
+    if args.command == "inventory":
+        report = build_paper_inventory(args.inbox, args.catalog)
+        if args.output:
+            write_inventory_report(report, args.output)
+        print(json.dumps(report.summary_dict(), ensure_ascii=False, indent=2))
+        return 0 if report.status == "ok" else 1
+
     retriever = _build_retriever(
         args.catalog, args.retriever, args.model, args.model_cache
     )

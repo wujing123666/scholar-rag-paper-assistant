@@ -140,6 +140,30 @@ MCP Server 会自动注册 `find_paper` 工具。客户端只需传入模糊描�
 
 `retriever` 可选 `bm25`、`dense` 或 `hybrid`。默认使用 `bm25`，启动快且不需要加载向量模型；只有明确选择 `dense` 或 `hybrid` 时才加载本地 Embedding。
 
+## 盘点本地论文目录
+
+新增论文前先运行只读盘点：
+
+```powershell
+python -m src.paper_assistant inventory
+```
+
+需要保留完整报告时：
+
+```powershell
+python -m src.paper_assistant inventory --output data/papers/inventory.json
+```
+
+盘点会递归扫描 `inbox/` 下的 PDF，逐文件流式计算 SHA-256，并检查：
+
+- PDF 是否已经登记到 `paper_catalog.csv`；
+- CSV 引用的 PDF 是否真实存在；
+- 不同文件是否具有完全相同的内容哈希；
+- 同一 `paper_id` 是否包含多个 PDF 版本；
+- 同一路径是否被错误分配给多个 `paper_id`。
+
+命令只读取 PDF 和 CSV，不会修改目录或论文档案。默认只在终端输出不含绝对路径和文件哈希的检查摘要。状态为 `ok` 时退出码为 0；发现需要人工处理的问题时状态为 `attention_required`，退出码为 1。使用 `--output` 保存的完整报告包含本地绝对路径、文件名、大小和哈希，应继续保存在本地；`data/papers/inventory.json` 已由现有忽略规则排除在 Git 之外。
+
 ## 推荐评测方法
 
 第一版至少报告：
