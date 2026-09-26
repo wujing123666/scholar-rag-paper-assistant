@@ -154,7 +154,7 @@ python -m src.paper_assistant --retriever bm25 --model-cache data/models/fastemb
 Copy-Item config/settings.yaml config/settings.local.yaml
 ```
 
-`config/settings.local.yaml` 已被 Git 忽略。使用 DeepSeek 时把其中 `llm.provider` 改为 `deepseek`、`llm.model` 改为实际模型，并通过环境变量设置 `DEEPSEEK_API_KEY`；使用 Ollama 时改为 `ollama` 和本机已有的模型。不要把真实密钥写入公开配置。
+`config/settings.local.yaml` 和 `config/settings.*.local.yaml` 已被 Git 忽略。使用 DeepSeek 时把其中 `llm.provider` 改为 `deepseek`、`llm.model` 改为实际模型；密钥可以放在这份私有配置的 `llm.api_key`，也可以通过环境变量 `DEEPSEEK_API_KEY` 提供。使用 Ollama 时改为 `ollama` 和本机已有的模型。不要把真实密钥写入公开配置。
 
 ```powershell
 $env:DEEPSEEK_API_KEY = "你的密钥"
