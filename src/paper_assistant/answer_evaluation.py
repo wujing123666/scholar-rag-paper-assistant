@@ -390,6 +390,7 @@ def build_answer_case_result(
         "claim_judge_error": claim_judgement.error,
         "generation_model": answer.model,
         "generation_usage": answer.usage,
+        "service_diagnostics": answer.service_diagnostics,
         "judge_model": judgement.model,
         "judge_usage": judgement.usage,
         "claim_judge_model": claim_judgement.model,
@@ -455,7 +456,18 @@ def summarize_answer_results(results: list[dict[str, Any]]) -> dict[str, Any]:
         int(report.get("accepted_claims", 0)) for report in verified_reports
     )
     verification_tokens = sum(
-        int(report.get("judge_tokens", 0)) for report in verified_reports
+        int(report.get("judge_tokens", 0)) for report in verification_reports
+    )
+    verification_unavailable = sum(
+        report.get("status") == "verification_unavailable"
+        for report in verification_reports
+    )
+    generation_fallbacks = sum(
+        bool((result.get("service_diagnostics") or {}).get("fallback_used"))
+        for result in results
+    )
+    paper_retriever_fallbacks = sum(
+        bool(result.get("paper_retriever_fallback")) for result in results
     )
 
     return {
@@ -528,7 +540,10 @@ def summarize_answer_results(results: list[dict[str, Any]]) -> dict[str, Any]:
             and int(report.get("accepted_claims", 0)) == 0
             for report in verification_reports
         ),
+        "claim_verification_unavailable_cases": verification_unavailable,
         "claim_verification_tokens": verification_tokens,
+        "generation_fallback_cases": generation_fallbacks,
+        "paper_retriever_fallback_cases": paper_retriever_fallbacks,
         "total_tokens": token_total("generation_usage")
         + token_total("judge_usage")
         + token_total("claim_judge_usage")

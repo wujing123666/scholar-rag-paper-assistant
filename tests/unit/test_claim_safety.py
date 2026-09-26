@@ -199,3 +199,49 @@ def test_rule_gate_rejects_citation_metadata_mismatch_without_model_call():
     assert result.answer.status == "insufficient_evidence"
     assert result.report["removed_claims"][0]["reason"] == "citation_metadata_mismatch"
     assert llm.calls == []
+
+
+def test_judge_failure_strict_mode_refuses_without_retrieval_retry():
+    evidence = _result("chunk-1", 2, "直接证据")
+    answer = _answer([GroundedClaim("结论", ("C1",))], [evidence])
+
+    class BrokenJudge:
+        def chat(self, messages, **kwargs):
+            raise RuntimeError("judge unavailable")
+
+    retrieval_calls = []
+    result = verify_and_filter_claims(
+        BrokenJudge(),
+        answer,
+        [evidence],
+        judge_models=["judge"],
+        retrieve_more=lambda *args: retrieval_calls.append(args) or [],
+    )
+
+    assert result.answer.status == "insufficient_evidence"
+    assert result.answer.reason == "claim_judge_unavailable"
+    assert result.report["status"] == "verification_unavailable"
+    assert retrieval_calls == []
+
+
+def test_judge_failure_evidence_only_mode_returns_citations_without_claims():
+    evidence = _result("chunk-1", 2, "直接证据")
+    answer = _answer([GroundedClaim("结论", ("C1",))], [evidence])
+
+    class BrokenJudge:
+        def chat(self, messages, **kwargs):
+            raise RuntimeError("judge unavailable")
+
+    result = verify_and_filter_claims(
+        BrokenJudge(),
+        answer,
+        [evidence],
+        judge_models=["judge"],
+        failure_policy="evidence_only",
+    )
+
+    assert result.answer.status == "verification_unavailable"
+    assert result.answer.reason == "claim_judge_unavailable"
+    assert result.answer.claims == ()
+    assert result.answer.citations[0].chunk_id == "chunk-1"
+    assert result.report["failure_policy"] == "evidence_only"

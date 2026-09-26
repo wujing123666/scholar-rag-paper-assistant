@@ -17,6 +17,7 @@ from src.paper_assistant.grounded_answer import (
 )
 
 SupplementRetriever = Callable[[str, tuple[str, ...], int], list[ChunkSearchResult]]
+EVIDENCE_ONLY_TEXT = "严格核验暂时不可用，以下仅返回检索到的论文证据。"
 
 
 @dataclass(frozen=True)
@@ -60,6 +61,20 @@ def _answer_with_claims(
         reason=None,
         model=source.model,
         usage=source.usage,
+        service_diagnostics=source.service_diagnostics,
+    )
+
+
+def _verification_unavailable_answer(source: GroundedAnswer) -> GroundedAnswer:
+    return GroundedAnswer(
+        status="verification_unavailable",
+        answer=EVIDENCE_ONLY_TEXT,
+        claims=(),
+        citations=source.citations,
+        reason="claim_judge_unavailable",
+        model=source.model,
+        usage=source.usage,
+        service_diagnostics=source.service_diagnostics,
     )
 
 
@@ -109,6 +124,7 @@ def verify_and_filter_claims(
     retrieve_more: SupplementRetriever | None = None,
     retry_k: int = 3,
     disable_thinking: bool = False,
+    failure_policy: str = "strict",
 ) -> ClaimSafetyResult:
     """Keep only claims supported by every judge, with one retrieval retry."""
     models = list(dict.fromkeys(model.strip() for model in judge_models if model.strip()))
@@ -116,6 +132,8 @@ def verify_and_filter_claims(
         raise ValueError("At least one claim judge model is required")
     if retry_k < 1:
         raise ValueError("retry_k must be at least one")
+    if failure_policy not in {"strict", "evidence_only"}:
+        raise ValueError("failure_policy must be strict or evidence_only")
     if answer.status != "answered":
         return ClaimSafetyResult(
             answer,
@@ -133,6 +151,31 @@ def verify_and_filter_claims(
         citation.chunk_id: citation.citation_id for citation in answer.citations
     }
     valid_pairs, invalid = _validate_claim_structure(answer, evidence_by_chunk)
+    if not valid_pairs:
+        return ClaimSafetyResult(
+            GroundedAnswer(
+                status="insufficient_evidence",
+                answer=REFUSAL_TEXT,
+                claims=(),
+                citations=(),
+                reason="claim_verification_removed_all",
+                model=answer.model,
+                usage=answer.usage,
+                service_diagnostics=answer.service_diagnostics,
+            ),
+            {
+                "status": "verified",
+                "failure_policy": failure_policy,
+                "judge_models": models,
+                "original_claims": len(answer.claims),
+                "accepted_claims": 0,
+                "removed_claims": invalid,
+                "retrieval_retries": [],
+                "judge_runs": [],
+                "judge_tokens": 0,
+            },
+            tuple(evidence_by_chunk.values()),
+        )
     valid_claims = [claim for _, claim in valid_pairs]
     valid_answer = _answer_with_claims(answer, valid_claims, citations_by_id)
 
@@ -167,11 +210,47 @@ def verify_and_filter_claims(
             }
         )
 
+    unavailable_models = [
+        run["requested_model"] for run in judge_runs if run["error"]
+    ]
+    if unavailable_models:
+        unavailable_answer = (
+            _verification_unavailable_answer(answer)
+            if failure_policy == "evidence_only"
+            else GroundedAnswer(
+                status="insufficient_evidence",
+                answer=REFUSAL_TEXT,
+                claims=(),
+                citations=(),
+                reason="claim_judge_unavailable",
+                model=answer.model,
+                usage=answer.usage,
+                service_diagnostics=answer.service_diagnostics,
+            )
+        )
+        return ClaimSafetyResult(
+            unavailable_answer,
+            {
+                "status": "verification_unavailable",
+                "failure_policy": failure_policy,
+                "judge_models": models,
+                "unavailable_models": unavailable_models,
+                "original_claims": len(answer.claims),
+                "accepted_claims": 0,
+                "removed_claims": [],
+                "retrieval_retries": [],
+                "judge_runs": judge_runs,
+                "judge_tokens": total_judge_tokens,
+            },
+            tuple(evidence_by_chunk.values()),
+        )
+
     accepted_ids = set.intersection(*support_by_model.values()) if support_by_model else set()
     accepted: dict[str, GroundedClaim] = {
         claim_id: claim for claim_id, claim in valid_pairs if claim_id in accepted_ids
     }
     retry_records: list[dict[str, Any]] = []
+    retry_judge_unavailable = False
     next_citation_number = max(
         (
             int(citation_id[1:])
@@ -231,6 +310,7 @@ def verify_and_filter_claims(
                 disable_thinking=disable_thinking,
             )
             model_supported = not judgement.error and "K1" in judgement.supported_claim_ids
+            retry_judge_unavailable = retry_judge_unavailable or bool(judgement.error)
             retry_supported = retry_supported and model_supported
             tokens = int((judgement.usage or {}).get("total_tokens", 0))
             total_judge_tokens += tokens
@@ -253,6 +333,31 @@ def verify_and_filter_claims(
                 "accepted": retry_supported,
                 "judges": retry_models,
             }
+        )
+
+    if retry_judge_unavailable and failure_policy == "evidence_only":
+        return ClaimSafetyResult(
+            _verification_unavailable_answer(answer),
+            {
+                "status": "verification_unavailable",
+                "failure_policy": failure_policy,
+                "judge_models": models,
+                "unavailable_models": sorted(
+                    {
+                        judge["requested_model"]
+                        for retry in retry_records
+                        for judge in retry.get("judges", [])
+                        if judge.get("error")
+                    }
+                ),
+                "original_claims": len(answer.claims),
+                "accepted_claims": 0,
+                "removed_claims": [],
+                "retrieval_retries": retry_records,
+                "judge_runs": judge_runs,
+                "judge_tokens": total_judge_tokens,
+            },
+            tuple(evidence_by_chunk.values()),
         )
 
     kept_claims = [
@@ -278,11 +383,13 @@ def verify_and_filter_claims(
             reason="claim_verification_removed_all",
             model=answer.model,
             usage=answer.usage,
+            service_diagnostics=answer.service_diagnostics,
         )
     return ClaimSafetyResult(
         filtered_answer,
         {
             "status": "verified",
+            "failure_policy": failure_policy,
             "judge_models": models,
             "original_claims": len(answer.claims),
             "accepted_claims": len(kept_claims),
