@@ -105,6 +105,8 @@ python -m src.paper_assistant --retriever bm25 --disable-rejection search "使�
 
 当前默认值为 BM25 `8.0`、Dense `0.78`、Hybrid `2/61`。它们来自当前 30 条已知开发题和 9 条未知开发题，只是小语料起点；论文库、Embedding 模型或 RRF 参数变化后必须重新校准。
 
+如果查询明确写出档案中的 `paper_id` 简称，例如 `TCDI`、`DEMI` 或 `MapT-STC`，Hybrid 检索会把对应论文提升到首位并越过开放集阈值。这条确定性规则用于处理用户已经记得论文简称、只是继续追问方法细节的场景。
+
 论文级 Dense 向量存储在本地 Chroma collection `paper_profiles_v1`，默认目录为 `data/db/chroma/`。每条记录对应一个 `paper_id`，并记录 Paper Profile 内容哈希、Embedding 模型名称和向量维度。首次运行会写入全部论文向量；再次启动时复用未变化的向量，只重新计算新增或修改的论文，并删除目录中已经移除的论文记录。
 
 本地开发使用默认的 `PersistentClient`。代码也支持通过同一个 `ChromaStore` 接口连接服务器模式：
@@ -186,6 +188,14 @@ python -m src.paper_assistant --retriever hybrid --model-cache data/models/faste
 - `reviewed_by_user=false`：用户尚未逐条确认；确认后才能改成 `true`。
 
 这 15 条数据适合评估论文路由、正文召回、回答完整度和引用页码是否正确。它们不适合单独证明系统对真实用户问题的泛化能力，因为编写时已经看过论文和当前检索结构。最终简历指标应另留一批不参与调参的本人盲测问题，并补充库外问题来评估拒答能力。
+
+使用 Hybrid 论文路由、本地 Cross-Encoder 重排和私有 DeepSeek 配置运行整套评测：
+
+```powershell
+python -m src.paper_assistant --retriever hybrid --model-cache data/models/fastembed --chunk-reranker fastembed --reranker-cache data/models/fastembed evaluate-answers --settings config/settings.deepseek.local.yaml --output tmp/answer_evaluation_deepseek.json
+```
+
+评测器每完成一题就原子写入本地报告，可在相同命令末尾增加 `--resume` 从已有结果继续。报告包含论文 Top-1 正确率、候选论文召回率、回答成功率、必备事实覆盖率、标注页对齐率、延迟和 token 用量。必备事实覆盖率由同一 LLM 的独立严格判分调用给出，属于模型评审指标；标注页对齐率只衡量引用是否落在人工登记页，不能代替 Claim 与 Chunk 的语义蕴含检查。完整回答和评测报告默认写入被 Git 忽略的 `tmp/`。
 
 ## 评测正文证据检索
 

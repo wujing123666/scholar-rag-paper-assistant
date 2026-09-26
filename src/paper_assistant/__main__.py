@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import json
 import sys
+import time
 from dataclasses import asdict
 from pathlib import Path
 
@@ -20,6 +21,7 @@ from src.paper_assistant.retriever import PaperBM25Retriever
 DEFAULT_CATALOG = Path("data/papers/paper_catalog.csv")
 DEFAULT_EVALUATION = Path("data/papers/eval_queries.jsonl")
 DEFAULT_CHUNK_EVALUATION = Path("data/papers/chunk_eval_queries.jsonl")
+DEFAULT_ANSWER_EVALUATION = Path("data/papers/answer_eval_queries.jsonl")
 DEFAULT_INBOX = Path("data/papers/inbox")
 DEFAULT_PAPER_CHROMA = Path("data/db/chroma")
 DEFAULT_PAPER_COLLECTION = "paper_profiles_v1"
@@ -187,6 +189,28 @@ def main() -> int:
         help="Evaluate chunk ranking inside the known target paper only.",
     )
 
+    answer_evaluate_parser = subparsers.add_parser(
+        "evaluate-answers", help="Evaluate routed, cited answers against PDF labels"
+    )
+    answer_evaluate_parser.add_argument(
+        "--queries", type=Path, default=DEFAULT_ANSWER_EVALUATION
+    )
+    answer_evaluate_parser.add_argument("--inbox", type=Path, default=DEFAULT_INBOX)
+    answer_evaluate_parser.add_argument("--candidate-papers", type=int, default=3)
+    answer_evaluate_parser.add_argument("--top-k", type=int, default=5)
+    answer_evaluate_parser.add_argument("--chunk-size", type=int, default=1200)
+    answer_evaluate_parser.add_argument("--chunk-overlap", type=int, default=180)
+    answer_evaluate_parser.add_argument(
+        "--settings", type=Path, default=Path("config/settings.yaml")
+    )
+    answer_evaluate_parser.add_argument("--max-context-chars", type=int, default=12000)
+    answer_evaluate_parser.add_argument("--min-evidence-chunks", type=int, default=1)
+    answer_evaluate_parser.add_argument(
+        "--output", type=Path, default=Path("tmp/answer_evaluation_report.json")
+    )
+    answer_evaluate_parser.add_argument("--limit", type=int)
+    answer_evaluate_parser.add_argument("--resume", action="store_true")
+
     args = parser.parse_args()
     if args.command == "inventory":
         report = build_paper_inventory(args.inbox, args.catalog)
@@ -266,7 +290,12 @@ def main() -> int:
             )
             return 1
 
-    if args.command in {"search-chunks", "answer", "evaluate-chunks"}:
+    if args.command in {
+        "search-chunks",
+        "answer",
+        "evaluate-chunks",
+        "evaluate-answers",
+    }:
         from src.libs.vector_store.chroma_store import ChromaStore
         from src.paper_assistant.chunk_retriever import (
             PaperChunkRetriever,
@@ -279,15 +308,19 @@ def main() -> int:
             parser.error("--rerank-candidates must be at least one")
         if not 0 <= args.rerank_weight <= 1:
             parser.error("--rerank-weight must be between zero and one")
-        if args.command == "answer":
+        if args.command in {"answer", "evaluate-answers"}:
             if args.max_context_chars < 1000:
                 parser.error("--max-context-chars must be at least 1000")
             if args.min_evidence_chunks < 1:
                 parser.error("--min-evidence-chunks must be at least one")
+        if args.command == "evaluate-answers" and args.limit is not None and args.limit < 1:
+            parser.error("--limit must be at least one")
         catalog = PaperCatalog.from_csv(args.catalog)
         embedding = FastEmbedEmbedding(model=args.model, cache_dir=args.model_cache)
         paper_retriever = None
         needs_paper_router = args.command == "evaluate-chunks" and not args.oracle_paper
+        if args.command == "evaluate-answers":
+            needs_paper_router = True
         if args.command in {"search-chunks", "answer"}:
             needs_paper_router = not args.paper_id
         if needs_paper_router:
@@ -407,6 +440,152 @@ def main() -> int:
                 cache_dir=args.reranker_cache,
                 weight=args.rerank_weight,
             )
+        if args.command == "evaluate-answers":
+            from src.core.settings import load_settings
+            from src.libs.llm import LLMFactory
+            from src.paper_assistant.answer_evaluation import (
+                FactJudgement,
+                build_answer_case_result,
+                judge_required_facts,
+                load_answer_evaluation_cases,
+                summarize_answer_results,
+                write_answer_evaluation_report,
+            )
+            from src.paper_assistant.chunk_reranker import rerank_with_fallback
+            from src.paper_assistant.grounded_answer import answer_from_evidence
+
+            cases = load_answer_evaluation_cases(args.queries)
+            if args.limit is not None:
+                cases = cases[: args.limit]
+            llm = LLMFactory.create(load_settings(args.settings))
+            run_config = {
+                "paper_retriever": args.retriever,
+                "chunk_reranker": args.chunk_reranker,
+                "reranker_model": (
+                    args.reranker_model if args.chunk_reranker != "none" else None
+                ),
+                "rerank_candidates": args.rerank_candidates,
+                "candidate_papers": args.candidate_papers,
+                "top_k": args.top_k,
+                "queries": str(args.queries),
+            }
+            completed: dict[str, dict[str, object]] = {}
+            if args.resume and args.output.exists():
+                previous = json.loads(args.output.read_text(encoding="utf-8"))
+                if previous.get("config") != run_config:
+                    raise ValueError(
+                        "Cannot resume an answer evaluation with different settings"
+                    )
+                completed = {
+                    result["id"]: result for result in previous.get("results", [])
+                }
+            results = []
+            retrieval_k = (
+                max(args.top_k, args.rerank_candidates)
+                if chunk_reranker
+                else args.top_k
+            )
+            threshold = args.min_score
+            if threshold is None and not args.disable_rejection:
+                threshold = default_min_score(paper_retriever.name)
+
+            for index, case in enumerate(cases, start=1):
+                if case["id"] in completed:
+                    previous_result = completed[case["id"]]
+                    if any(
+                        previous_result.get(field) != case[field]
+                        for field in (
+                            "question",
+                            "expected_paper_id",
+                            "relevant_pages",
+                            "reference_answer",
+                            "required_facts",
+                        )
+                    ):
+                        raise ValueError(
+                            f"Cannot resume changed evaluation case {case['id']}"
+                        )
+                    results.append(previous_result)
+                    continue
+                started = time.perf_counter()
+                if threshold is None:
+                    candidate_ids = resolve_candidates(case["question"])
+                else:
+                    decision = decide_retrieval(
+                        paper_retriever,
+                        case["question"],
+                        top_k=min(args.candidate_papers, len(catalog)),
+                        min_score=threshold,
+                    )
+                    candidate_ids = tuple(
+                        result.paper.paper_id for result in decision.results
+                    )
+                matches = []
+                for paper_id in candidate_ids:
+                    matches.extend(
+                        chunk_retriever.search(
+                            case["question"],
+                            top_k=retrieval_k,
+                            paper_ids=(paper_id,),
+                        )
+                    )
+                matches = apply_paper_routing_prior(matches, candidate_ids)
+                reranker_fallback = None
+                if chunk_reranker:
+                    matches, reranker_fallback = rerank_with_fallback(
+                        chunk_reranker,
+                        case["question"],
+                        matches[:retrieval_k],
+                        top_k=args.top_k,
+                    )
+                else:
+                    matches = matches[: args.top_k]
+                answer = answer_from_evidence(
+                    llm,
+                    case["question"],
+                    matches,
+                    max_context_chars=args.max_context_chars,
+                    min_evidence_chunks=args.min_evidence_chunks,
+                )
+                judgement = (
+                    judge_required_facts(llm, answer.answer, case["required_facts"])
+                    if answer.status == "answered"
+                    else FactJudgement((), None, None, "answer_not_generated")
+                )
+                result = build_answer_case_result(
+                    case,
+                    candidate_ids,
+                    answer,
+                    judgement,
+                    latency_seconds=time.perf_counter() - started,
+                    reranker_fallback=reranker_fallback,
+                )
+                results.append(result)
+                report = {
+                    "config": run_config,
+                    "summary": summarize_answer_results(results),
+                    "results": results,
+                }
+                write_answer_evaluation_report(args.output, report)
+                print(
+                    f"[{index}/{len(cases)}] {case['id']}: {answer.status}",
+                    file=sys.stderr,
+                )
+
+            report = {
+                "config": run_config,
+                "summary": summarize_answer_results(results),
+                "results": results,
+            }
+            write_answer_evaluation_report(args.output, report)
+            print(
+                json.dumps(
+                    {"output": str(args.output), **report["summary"]},
+                    ensure_ascii=False,
+                    indent=2,
+                )
+            )
+            return 0
         if args.command == "evaluate-chunks":
             from src.paper_assistant.chunk_evaluation import (
                 evaluate_chunk_retriever,

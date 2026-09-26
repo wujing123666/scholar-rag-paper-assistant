@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import re
+
 from src.paper_assistant.catalog import PaperCatalog
 from src.paper_assistant.dense_retriever import PaperDenseRetriever
 from src.paper_assistant.retriever import PaperBM25Retriever, PaperSearchResult
@@ -46,6 +48,18 @@ class PaperHybridRetriever:
                 paper_id = result.paper.paper_id
                 scores[paper_id] = scores.get(paper_id, 0.0) + 1 / (self.rrf_k + rank)
                 matches.setdefault(paper_id, set()).update(result.matched_terms)
+
+        normalized_query = re.sub(r"[^a-z0-9]+", "", query.casefold())
+        maximum_rrf_score = 2 / (self.rrf_k + 1)
+        identifier_score = maximum_rrf_score + 1 / (self.rrf_k + 1) ** 2
+        for profile in self.catalog.profiles:
+            identifier = re.sub(r"_\d{4}$", "", profile.paper_id.casefold())
+            normalized_identifier = re.sub(r"[^a-z0-9]+", "", identifier)
+            if len(normalized_identifier) >= 4 and normalized_identifier in normalized_query:
+                scores[profile.paper_id] = max(
+                    scores.get(profile.paper_id, 0.0), identifier_score
+                )
+                matches.setdefault(profile.paper_id, set()).add(profile.paper_id)
 
         ranked_ids = sorted(scores, key=lambda paper_id: (-scores[paper_id], paper_id))
         return [
