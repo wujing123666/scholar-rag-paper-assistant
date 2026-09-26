@@ -170,6 +170,23 @@ def judge_claim_support(
             "section": citation.section,
             "text": result.text,
         }
+    return _run_claim_support_judge(
+        llm,
+        claim_map,
+        evidence_map,
+        model=model,
+        disable_thinking=disable_thinking,
+    )
+
+
+def _run_claim_support_judge(
+    llm: ChatModel,
+    claim_map: dict[str, dict[str, Any]],
+    evidence_map: dict[str, dict[str, Any]],
+    *,
+    model: str | None = None,
+    disable_thinking: bool = False,
+) -> ClaimSupportJudgement:
     messages = [
         Message(
             role="system",
@@ -209,6 +226,94 @@ def judge_claim_support(
         return ClaimSupportJudgement((), None, None, "claim_judge_failed")
 
 
+def freeze_cited_evidence(
+    answer: GroundedAnswer, evidence_results: list[ChunkSearchResult]
+) -> list[dict[str, Any]]:
+    """Capture the full cited chunks needed to replay claim judging later."""
+    result_by_chunk = {result.chunk_id: result for result in evidence_results}
+    frozen: list[dict[str, Any]] = []
+    for citation in answer.citations:
+        result = result_by_chunk.get(citation.chunk_id)
+        if result is None:
+            raise ValueError(f"Missing evidence chunk {citation.chunk_id}")
+        frozen.append(
+            {
+                "citation_id": citation.citation_id,
+                "chunk_id": citation.chunk_id,
+                "paper_id": citation.paper_id,
+                "paper_title": citation.paper_title,
+                "pdf_file": citation.pdf_file,
+                "page_number": citation.page_number,
+                "section": citation.section,
+                "text": result.text,
+            }
+        )
+    return frozen
+
+
+def judge_frozen_claim_support(
+    llm: ChatModel,
+    frozen_result: dict[str, Any],
+    *,
+    model: str | None = None,
+    disable_thinking: bool = False,
+) -> ClaimSupportJudgement:
+    """Replay claim judging from a frozen answer without retrieval or generation."""
+    claims = frozen_result.get("claims")
+    evidence = frozen_result.get("evidence")
+    if not isinstance(claims, list) or not claims:
+        return ClaimSupportJudgement((), None, None, "no_claims_to_judge")
+    if not isinstance(evidence, list) or not evidence:
+        return ClaimSupportJudgement((), None, None, "frozen_evidence_missing")
+
+    claim_map: dict[str, dict[str, Any]] = {}
+    used_citation_ids: set[str] = set()
+    for index, claim in enumerate(claims, start=1):
+        if not isinstance(claim, dict):
+            return ClaimSupportJudgement((), None, None, "frozen_claim_invalid")
+        text = claim.get("text")
+        citation_ids = claim.get("citations")
+        if (
+            not isinstance(text, str)
+            or not text.strip()
+            or not isinstance(citation_ids, list)
+            or not citation_ids
+            or any(not isinstance(item, str) for item in citation_ids)
+        ):
+            return ClaimSupportJudgement((), None, None, "frozen_claim_invalid")
+        claim_map[f"K{index}"] = {
+            "text": text,
+            "citation_ids": citation_ids,
+        }
+        used_citation_ids.update(citation_ids)
+
+    evidence_by_id: dict[str, dict[str, Any]] = {}
+    for item in evidence:
+        if not isinstance(item, dict) or not isinstance(item.get("citation_id"), str):
+            return ClaimSupportJudgement((), None, None, "frozen_evidence_invalid")
+        evidence_by_id[item["citation_id"]] = item
+    if not used_citation_ids.issubset(evidence_by_id):
+        return ClaimSupportJudgement((), None, None, "frozen_evidence_missing")
+    evidence_map = {
+        citation_id: {
+            "paper_id": evidence_by_id[citation_id].get("paper_id"),
+            "page_number": evidence_by_id[citation_id].get("page_number"),
+            "section": evidence_by_id[citation_id].get("section"),
+            "text": evidence_by_id[citation_id].get("text"),
+        }
+        for citation_id in sorted(used_citation_ids)
+    }
+    if any(not isinstance(item["text"], str) for item in evidence_map.values()):
+        return ClaimSupportJudgement((), None, None, "frozen_evidence_invalid")
+    return _run_claim_support_judge(
+        llm,
+        claim_map,
+        evidence_map,
+        model=model,
+        disable_thinking=disable_thinking,
+    )
+
+
 def _parse_json_object(content: str) -> dict[str, Any]:
     stripped = content.strip()
     if stripped.startswith("```"):
@@ -232,6 +337,7 @@ def build_answer_case_result(
     *,
     latency_seconds: float,
     reranker_fallback: str | None = None,
+    evidence_results: list[ChunkSearchResult] | None = None,
 ) -> dict[str, Any]:
     """Build deterministic per-case metrics from one grounded answer."""
     expected = case["expected_paper_id"]
@@ -260,6 +366,11 @@ def build_answer_case_result(
         "answer": answer.answer,
         "claims": [asdict(claim) for claim in answer.claims],
         "citations": [asdict(citation) for citation in answer.citations],
+        "evidence": (
+            freeze_cited_evidence(answer, evidence_results)
+            if evidence_results is not None
+            else []
+        ),
         "labeled_page_precision": (
             len(correct_citations) / len(answer.citations) if answer.citations else 0.0
         ),

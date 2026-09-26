@@ -211,6 +211,16 @@ python -m src.paper_assistant --retriever hybrid --model-cache data/models/faste
 
 改用`deepseek-v4-pro`作为不同模型评审的一次运行中，14/15题成功回答，59个必备事实覆盖43个（72.88%）；175条Claim全部被Pro判为有证据支撑，判分失败0次、拒答后跳过1次，平均总延迟7.65秒。Pro与Flash虽是不同模型，但仍属于同一DeepSeek模型家族，因此100%只能作为交叉模型开发指标，不能替代人工抽检或不同供应商评审。
 
+为避免不同生成结果干扰评审模型对比，`evaluate-answers`现在会把每条Claim实际引用的完整Chunk写入本地报告。可以让多个模型只复判同一份冻结答案，不再执行检索或生成：
+
+```powershell
+python -m src.paper_assistant compare-judges --input tmp/frozen_answer_evaluation.json --settings config/settings.deepseek.local.yaml --judge-model deepseek-chat --judge-model deepseek-v4-pro --output tmp/frozen_judge_comparison.json --audit-output tmp/codex_claim_audit.md --agreement-sample 20 --seed 20260926
+```
+
+命令会报告逐Claim判断、一致率和实际响应模型，并把全部分歧项、全部共同拒绝项及固定随机种子抽取的共同支持项写入审查Markdown。审查标签可再通过`score-judge-audit`计算各模型相对审查结果的准确率、错误放行和错误拒绝；标签文件必须记录审查者、审查类型、限制、结论与理由，避免把AI代理复核写成人类专家金标准。
+
+一次冻结运行得到14个回答和170条Claim。Flash与Pro对167条判断一致，对3条存在分歧，一致率98.24%；Flash支持167条，Pro支持170条。Codex随后核验全部3条分歧项和随机抽取的20条共同支持项：23条中22条有直接证据、1条引用不足。在这组有意偏向风险项的审查样本上，Flash与审查结果一致21/23，包含2次错误拒绝和0次错误放行；Pro一致22/23，包含0次错误拒绝和1次错误放行。该样本不是随机无偏的人类标注集，因此这些比例用于定位评审差异，不能宣称为模型总体准确率。
+
 ## 评测正文证据检索
 
 正文开发集当前包含 10 条问题，每篇逻辑论文 1 条。每条记录保存目标 `paper_id`、一个或多个相关 PDF 页码、证据词和最低证据词命中数。它们由程序根据本地 PDF 定位后逐页核对，`source=system_labeled_from_pdf` 且 `reviewed_by_user=false`，因此是可迭代的开发集，不是用户盲测集。
