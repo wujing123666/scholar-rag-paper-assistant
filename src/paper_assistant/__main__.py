@@ -92,7 +92,7 @@ def main() -> int:
     parser.add_argument(
         "--reranker-cache", type=Path, default=Path("data/models/fastembed")
     )
-    parser.add_argument("--rerank-candidates", type=int, default=5)
+    parser.add_argument("--rerank-candidates", type=int, default=14)
     parser.add_argument("--rerank-weight", type=float, default=0.35)
     parser.add_argument(
         "--min-score",
@@ -163,13 +163,13 @@ def main() -> int:
     answer_parser.add_argument("--inbox", type=Path, default=DEFAULT_INBOX)
     answer_parser.add_argument("--paper-id", action="append", default=[])
     answer_parser.add_argument("--candidate-papers", type=int, default=3)
-    answer_parser.add_argument("--top-k", type=int, default=5)
+    answer_parser.add_argument("--top-k", type=int, default=7)
     answer_parser.add_argument("--chunk-size", type=int, default=1200)
     answer_parser.add_argument("--chunk-overlap", type=int, default=180)
     answer_parser.add_argument(
         "--settings", type=Path, default=Path("config/settings.yaml")
     )
-    answer_parser.add_argument("--max-context-chars", type=int, default=12000)
+    answer_parser.add_argument("--max-context-chars", type=int, default=16000)
     answer_parser.add_argument("--min-evidence-chunks", type=int, default=1)
 
     chunk_evaluate_parser = subparsers.add_parser(
@@ -197,13 +197,13 @@ def main() -> int:
     )
     answer_evaluate_parser.add_argument("--inbox", type=Path, default=DEFAULT_INBOX)
     answer_evaluate_parser.add_argument("--candidate-papers", type=int, default=3)
-    answer_evaluate_parser.add_argument("--top-k", type=int, default=5)
+    answer_evaluate_parser.add_argument("--top-k", type=int, default=7)
     answer_evaluate_parser.add_argument("--chunk-size", type=int, default=1200)
     answer_evaluate_parser.add_argument("--chunk-overlap", type=int, default=180)
     answer_evaluate_parser.add_argument(
         "--settings", type=Path, default=Path("config/settings.yaml")
     )
-    answer_evaluate_parser.add_argument("--max-context-chars", type=int, default=12000)
+    answer_evaluate_parser.add_argument("--max-context-chars", type=int, default=16000)
     answer_evaluate_parser.add_argument("--min-evidence-chunks", type=int, default=1)
     answer_evaluate_parser.add_argument(
         "--output", type=Path, default=Path("tmp/answer_evaluation_report.json")
@@ -451,7 +451,10 @@ def main() -> int:
                 summarize_answer_results,
                 write_answer_evaluation_report,
             )
-            from src.paper_assistant.chunk_reranker import rerank_with_fallback
+            from src.paper_assistant.chunk_reranker import (
+                rerank_with_fallback,
+                select_rerank_candidates,
+            )
             from src.paper_assistant.grounded_answer import answer_from_evidence
 
             cases = load_answer_evaluation_cases(args.queries)
@@ -532,10 +535,13 @@ def main() -> int:
                 matches = apply_paper_routing_prior(matches, candidate_ids)
                 reranker_fallback = None
                 if chunk_reranker:
+                    matches = select_rerank_candidates(
+                        matches, top_k=retrieval_k
+                    )
                     matches, reranker_fallback = rerank_with_fallback(
                         chunk_reranker,
                         case["question"],
-                        matches[:retrieval_k],
+                        matches,
                         top_k=args.top_k,
                     )
                 else:

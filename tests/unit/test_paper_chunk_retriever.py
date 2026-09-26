@@ -12,8 +12,10 @@ from src.paper_assistant.chunk_retriever import (
     ChunkSearchResult,
     PaperChunkRetriever,
     apply_paper_routing_prior,
+    evidence_query_variants,
     expand_chunk_query,
     extract_paper_chunks,
+    select_focused_evidence,
 )
 
 
@@ -270,7 +272,28 @@ def test_repeated_candidate_search_reuses_the_same_query_embedding(tmp_path):
     retriever.search("卡尔曼滤波", paper_ids=("paper_a",))
 
     query_calls = [call for call in embedding.calls if call[1] is True]
-    assert len(query_calls) == 1
+    assert len(query_calls) == 2
+
+
+def test_query_embedding_cache_evicts_oldest_entry(tmp_path):
+    inbox = tmp_path / "inbox"
+    inbox.mkdir()
+    _write_pdf(inbox / "paper.pdf")
+    retriever = PaperChunkRetriever(
+        PaperCatalog([_profile()]),
+        inbox,
+        FakeEmbedding(),
+        FakeStore(),
+        chunk_size=300,
+        chunk_overlap=40,
+    )
+
+    for index in range(129):
+        retriever._search_single(f"query-{index}", paper_ids=("paper_a",))
+
+    assert len(retriever._query_embeddings) == 128
+    assert "query-0" not in retriever._query_embeddings
+    assert "query-128" in retriever._query_embeddings
 
 
 def test_chunk_retriever_rejects_unknown_paper_filter(tmp_path):
@@ -299,3 +322,56 @@ def test_chunk_retriever_fails_before_writes_when_registered_pdf_is_missing(tmp_
         )
 
     assert store.records == {}
+
+
+def test_evidence_query_variants_focus_distinct_method_aspects():
+    variants = evidence_query_variants(
+        "怎样用自适应系数抑制演化噪声并扩展局部相关性？"
+    )
+
+    assert variants[0].startswith("怎样用自适应系数")
+    assert any("adaptive coefficient" in variant for variant in variants)
+    assert any("evolutionary inference" in variant for variant in variants)
+    assert len(variants) <= 4
+
+
+def test_select_focused_evidence_prefers_distinct_formula_pages():
+    def result(chunk_id: str, page_number: int, text: str) -> ChunkSearchResult:
+        return ChunkSearchResult(
+            chunk_id,
+            _profile(),
+            "paper.pdf",
+            page_number,
+            0,
+            "Method",
+            text,
+            0.8,
+            0.8,
+        )
+
+    first = result(
+        chunk_id="page-8",
+        page_number=8,
+        text="Algorithm 1 describes the complete process.",
+    )
+    duplicate_page = result(
+        chunk_id="page-8-second",
+        page_number=8,
+        text="The value is defined as another expression.",
+    )
+    second = result(
+        chunk_id="page-6",
+        page_number=6,
+        text="The adaptive coefficient is defined as follows.",
+    )
+    third = result(
+        chunk_id="page-7",
+        page_number=7,
+        text="Algorithm 2 performs temporal evolution.",
+    )
+
+    selected = select_focused_evidence(
+        [[], [first], [duplicate_page, second], [first, third]]
+    )
+
+    assert [result.page_number for result in selected] == [8, 6, 7]

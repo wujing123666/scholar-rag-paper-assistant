@@ -207,9 +207,12 @@ def evaluate_chunk_retriever(
                     )
                 matches = apply_paper_routing_prior(matches, candidate_ids)
             if reranker:
-                from src.paper_assistant.chunk_reranker import rerank_with_fallback
+                from src.paper_assistant.chunk_reranker import (
+                    rerank_with_fallback,
+                    select_rerank_candidates,
+                )
 
-                matches = matches[:retrieval_k]
+                matches = select_rerank_candidates(matches, top_k=retrieval_k)
                 matches, fallback = rerank_with_fallback(
                     reranker, case["query"], matches, top_k=top_k
                 )

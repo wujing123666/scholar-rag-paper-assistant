@@ -5,7 +5,7 @@ from __future__ import annotations
 import hashlib
 import math
 import re
-from collections import Counter
+from collections import Counter, OrderedDict
 from dataclasses import dataclass, replace
 from pathlib import Path
 
@@ -85,6 +85,16 @@ _NOISE_PATTERNS = (
     re.compile(r"^©\s*\d{4}\s+IEEE\b", re.IGNORECASE),
     re.compile(r"^\d+$"),
 )
+_METHOD_DETAIL_PATTERN = re.compile(
+    r"\b(algorithm|method(?:ology)?|defined as|calculation is as follows|"
+    r"computed as follows|we formulate|算法|方法|定义为|计算如下|公式)\b",
+    re.IGNORECASE,
+)
+_FORMULA_DETAIL_PATTERN = re.compile(
+    r"\b(algorithm\s+\d+|defined as|calculation is as follows|computed as follows|"
+    r"we formulate|算法\s*\d+|定义为|计算如下|公式)\b",
+    re.IGNORECASE,
+)
 
 
 @dataclass(frozen=True)
@@ -123,6 +133,7 @@ class ChunkSearchResult:
     sparse_score: float = 0.0
     routing_rank: int = 0
     rerank_score: float | None = None
+    focus_rank: int = 0
 
 
 @dataclass(frozen=True)
@@ -133,6 +144,16 @@ class ChunkIndexSync:
     reused: int
     deleted: int
     rebuilt: bool
+
+
+def is_method_detail(result: ChunkSearchResult) -> bool:
+    """Return whether a chunk contains method or formula-level detail."""
+    return bool(_METHOD_DETAIL_PATTERN.search(f"{result.section}\n{result.text}"))
+
+
+def is_formula_detail(result: ChunkSearchResult) -> bool:
+    """Return whether a chunk contains algorithm or formula-level evidence."""
+    return bool(_FORMULA_DETAIL_PATTERN.search(f"{result.section}\n{result.text}"))
 
 
 def _clean_line(line: str) -> str:
@@ -205,6 +226,71 @@ def expand_chunk_query(query: str) -> str:
     """Append transparent English aliases for common Chinese research terms."""
     aliases = [alias for term, alias in _QUERY_ALIASES.items() if term in query]
     return f"{query}\nEnglish terminology: {'; '.join(aliases)}" if aliases else query
+
+
+def evidence_query_variants(query: str, *, max_variants: int = 4) -> tuple[str, ...]:
+    """Build focused query variants for multi-aspect method questions."""
+    if max_variants < 1:
+        raise ValueError("max_variants must be at least one")
+    variants = [query]
+    for term, alias in _QUERY_ALIASES.items():
+        if term not in query:
+            continue
+        variants.append(
+            f"{term} {alias}\nmethod details algorithm formula architecture process"
+        )
+        if len(variants) >= max_variants:
+            break
+    return tuple(dict.fromkeys(variants))
+
+
+def select_focused_evidence(
+    variant_rankings: list[list[ChunkSearchResult]],
+) -> tuple[ChunkSearchResult, ...]:
+    """Pick distinct method-heavy pages that represent focused subqueries."""
+    selected: list[ChunkSearchResult] = []
+    selected_ids: set[str] = set()
+    selected_pages: set[tuple[str, int]] = set()
+    focused_rankings = variant_rankings[1:]
+    target_count = len(focused_rankings)
+
+    def add_candidate(candidate: ChunkSearchResult) -> None:
+        selected.append(candidate)
+        selected_ids.add(candidate.chunk_id)
+        selected_pages.add((candidate.paper.paper_id, candidate.page_number))
+
+    for ranking in focused_rankings:
+        candidate = next(
+            (
+                result
+                for result in ranking
+                if is_formula_detail(result)
+                and result.chunk_id not in selected_ids
+                and (result.paper.paper_id, result.page_number) not in selected_pages
+            ),
+            None,
+        )
+        if candidate is not None:
+            add_candidate(candidate)
+
+    for predicate in (is_formula_detail, is_method_detail, lambda _result: True):
+        for rank in range(max((len(items) for items in focused_rankings), default=0)):
+            for ranking in focused_rankings:
+                if len(selected) >= target_count or rank >= len(ranking):
+                    continue
+                candidate = ranking[rank]
+                if (
+                    predicate(candidate)
+                    and candidate.chunk_id not in selected_ids
+                    and (candidate.paper.paper_id, candidate.page_number)
+                    not in selected_pages
+                ):
+                    add_candidate(candidate)
+            if len(selected) >= target_count:
+                break
+        if len(selected) >= target_count:
+            break
+    return tuple(selected)
 
 
 def apply_paper_routing_prior(
@@ -353,7 +439,7 @@ class PaperChunkRetriever:
             getattr(embedding, "model", embedding.__class__.__qualname__)
         )
         self.embedding_dimension = embedding.get_dimension()
-        self._last_query_embedding: tuple[str, list[float]] | None = None
+        self._query_embeddings: OrderedDict[str, list[float]] = OrderedDict()
         self.index_sync = self._sync_index()
         self._build_sparse_index()
 
@@ -534,29 +620,25 @@ class PaperChunkRetriever:
             rebuilt=rebuilt,
         )
 
-    def search(
+    def _search_single(
         self,
         query: str,
         *,
         top_k: int = 5,
         paper_ids: tuple[str, ...] = (),
     ) -> list[ChunkSearchResult]:
-        if not query or not query.strip():
-            raise ValueError("Query cannot be empty")
-        if top_k < 1:
-            raise ValueError("top_k must be at least one")
-        unknown = sorted(set(paper_ids) - {paper.paper_id for paper in self.catalog.profiles})
-        if unknown:
-            raise ValueError(f"Unknown paper_id values: {', '.join(unknown)}")
         expanded_query = expand_chunk_query(query)
-        if self._last_query_embedding and self._last_query_embedding[0] == expanded_query:
-            query_vector = self._last_query_embedding[1]
+        if expanded_query in self._query_embeddings:
+            query_vector = self._query_embeddings.pop(expanded_query)
+            self._query_embeddings[expanded_query] = query_vector
         else:
             vectors = self.embedding.embed([expanded_query], is_query=True)
             if len(vectors) != 1 or len(vectors[0]) != self.embedding_dimension:
                 raise ValueError("Embedding provider returned an invalid query vector")
             query_vector = vectors[0]
-            self._last_query_embedding = (expanded_query, query_vector)
+            self._query_embeddings[expanded_query] = query_vector
+            if len(self._query_embeddings) > 128:
+                self._query_embeddings.popitem(last=False)
         filters = None
         if len(paper_ids) == 1:
             filters = {"paper_id": paper_ids[0]}
@@ -612,3 +694,86 @@ class PaperChunkRetriever:
                 )
             )
         return results
+
+    def search(
+        self,
+        query: str,
+        *,
+        top_k: int = 5,
+        paper_ids: tuple[str, ...] = (),
+    ) -> list[ChunkSearchResult]:
+        """Retrieve and fuse evidence for the original and focused subqueries."""
+        if not query or not query.strip():
+            raise ValueError("Query cannot be empty")
+        if top_k < 1:
+            raise ValueError("top_k must be at least one")
+        unknown = sorted(
+            set(paper_ids) - {paper.paper_id for paper in self.catalog.profiles}
+        )
+        if unknown:
+            raise ValueError(f"Unknown paper_id values: {', '.join(unknown)}")
+
+        variants = evidence_query_variants(query)
+        per_variant_k = min(max(top_k * 2, 10), self.index_sync.chunks)
+        fused_scores: dict[str, float] = {}
+        best_results: dict[str, ChunkSearchResult] = {}
+        maximum_rrf = sum(1 / (60 + 1) for _ in variants)
+        variant_rankings: list[list[ChunkSearchResult]] = []
+        for variant_index, variant in enumerate(variants):
+            variant_weight = 1.25 if variant_index == 0 else 1.0
+            variant_results = self._search_single(
+                variant, top_k=per_variant_k, paper_ids=paper_ids
+            )
+            variant_rankings.append(variant_results)
+            for rank, result in enumerate(variant_results, start=1):
+                fused_scores[result.chunk_id] = fused_scores.get(result.chunk_id, 0.0) + (
+                    variant_weight / (60 + rank)
+                )
+                current = best_results.get(result.chunk_id)
+                if current is None or result.score > current.score:
+                    best_results[result.chunk_id] = result
+
+        focused_evidence = select_focused_evidence(variant_rankings)
+        focused_ranks = {
+            result.chunk_id: rank
+            for rank, result in enumerate(focused_evidence, start=1)
+        }
+        ranked = []
+        normalization = maximum_rrf + 0.25 / 61
+        for chunk_id, result in best_results.items():
+            normalized_rrf = fused_scores[chunk_id] / normalization
+            ranked.append(
+                replace(
+                    result,
+                    score=0.65 * result.score
+                    + 0.35 * normalized_rrf
+                    + (0.08 if chunk_id in focused_ranks else 0.0),
+                    focus_rank=focused_ranks.get(chunk_id, 0),
+                )
+            )
+        ranked.sort(key=lambda result: (-result.score, result.chunk_id))
+        selected = ranked[:top_k]
+        if focused_evidence:
+            selected_ids = {result.chunk_id for result in selected}
+            ranked_by_id = {result.chunk_id: result for result in ranked}
+            reserved_ids: set[str] = set()
+            for focused in focused_evidence[:top_k]:
+                detail = ranked_by_id[focused.chunk_id]
+                reserved_ids.add(detail.chunk_id)
+                if detail.chunk_id in selected_ids:
+                    continue
+                replace_index = next(
+                    (
+                        index
+                        for index in range(len(selected) - 1, -1, -1)
+                        if selected[index].chunk_id not in reserved_ids
+                    ),
+                    None,
+                )
+                if replace_index is None:
+                    break
+                selected_ids.remove(selected[replace_index].chunk_id)
+                selected[replace_index] = detail
+                selected_ids.add(detail.chunk_id)
+            selected.sort(key=lambda result: (-result.score, result.chunk_id))
+        return selected
