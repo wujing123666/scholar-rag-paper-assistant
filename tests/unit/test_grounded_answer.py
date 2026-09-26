@@ -78,6 +78,8 @@ def test_valid_claims_are_assembled_with_verified_source_metadata():
     assert answer.citations[0].chunk_id == "paper:4:0"
     messages, kwargs = llm.calls[0]
     assert "EVIDENCE_JSON" in messages[1].content
+    assert "全部子问题" in messages[0].content
+    assert "避免用多条 claim 重复同一概述" in messages[0].content
     assert '"citation_id": "C1"' in messages[1].content
     assert kwargs["temperature"] == 0.0
 

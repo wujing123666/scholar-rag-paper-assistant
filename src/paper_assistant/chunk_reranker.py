@@ -3,11 +3,17 @@
 from __future__ import annotations
 
 import math
+import re
 from dataclasses import replace
 from pathlib import Path
 from typing import Protocol
 
-from src.paper_assistant.chunk_retriever import ChunkSearchResult, expand_chunk_query
+from src.paper_assistant.chunk_retriever import (
+    ChunkSearchResult,
+    expand_chunk_query,
+    is_formula_detail,
+    is_method_detail,
+)
 
 
 class CrossEncoderModel(Protocol):
@@ -89,14 +95,110 @@ class FastEmbedChunkReranker:
             replace(
                 result,
                 score=(1 - self.weight) * result.score
-                + self.weight * normalized_score,
+                + self.weight * normalized_score
+                + _method_detail_bonus(result),
                 rerank_score=raw_score,
             )
             for result, raw_score, normalized_score in zip(
                 results, raw_scores, normalized
             )
         ]
-        return sorted(reranked, key=lambda item: (-item.score, item.chunk_id))[:top_k]
+        ranked = sorted(reranked, key=lambda item: (-item.score, item.chunk_id))
+        return select_diverse_chunks(ranked, top_k=top_k)
+
+
+_METHOD_SECTION = re.compile(
+    r"\b(method(?:ology)?|approach|algorithm|framework|model|方法|算法|模型)\b",
+    re.IGNORECASE,
+)
+
+
+def _method_detail_bonus(result: ChunkSearchResult) -> float:
+    if is_formula_detail(result):
+        return 0.06
+    if is_method_detail(result):
+        return 0.04
+    return 0.02 if _METHOD_SECTION.search(result.section) else 0.0
+
+
+def select_diverse_chunks(
+    results: list[ChunkSearchResult], *, top_k: int, max_per_page: int = 1
+) -> list[ChunkSearchResult]:
+    """Prefer distinct paper pages, then fill any remaining result slots."""
+    if top_k < 1:
+        raise ValueError("top_k must be at least one")
+    if max_per_page < 1:
+        raise ValueError("max_per_page must be at least one")
+    selected: list[ChunkSearchResult] = []
+    deferred: list[ChunkSearchResult] = []
+    page_counts: dict[tuple[str, int], int] = {}
+    focused = sorted(
+        (
+            result
+            for result in results
+            if result.focus_rank > 0 and result.routing_rank in (0, 1)
+        ),
+        key=lambda result: result.focus_rank,
+    )[:top_k]
+    focused_ids = {result.chunk_id for result in focused}
+    for result in focused:
+        selected.append(result)
+        page = (result.paper.paper_id, result.page_number)
+        page_counts[page] = page_counts.get(page, 0) + 1
+    for result in results:
+        if len(selected) == top_k:
+            break
+        if result.chunk_id in focused_ids:
+            continue
+        page = (result.paper.paper_id, result.page_number)
+        if page_counts.get(page, 0) >= max_per_page:
+            deferred.append(result)
+            continue
+        selected.append(result)
+        page_counts[page] = page_counts.get(page, 0) + 1
+        if len(selected) == top_k:
+            break
+    selected.extend(deferred[: top_k - len(selected)])
+    original_order = {result.chunk_id: index for index, result in enumerate(results)}
+    return sorted(selected, key=lambda result: original_order[result.chunk_id])
+
+
+def select_rerank_candidates(
+    results: list[ChunkSearchResult], *, top_k: int
+) -> list[ChunkSearchResult]:
+    """Keep top candidates while retaining focused evidence from the first paper."""
+    if top_k < 1:
+        raise ValueError("top_k must be at least one")
+    selected = list(results[:top_k])
+    selected_ids = {result.chunk_id for result in selected}
+    reserved_ids: set[str] = set()
+    focused = sorted(
+        (
+            result
+            for result in results
+            if result.focus_rank > 0 and result.routing_rank in (0, 1)
+        ),
+        key=lambda result: result.focus_rank,
+    )[:top_k]
+    for result in focused:
+        reserved_ids.add(result.chunk_id)
+        if result.chunk_id in selected_ids:
+            continue
+        replace_index = next(
+            (
+                index
+                for index in range(len(selected) - 1, -1, -1)
+                if selected[index].chunk_id not in reserved_ids
+            ),
+            None,
+        )
+        if replace_index is None:
+            break
+        selected_ids.remove(selected[replace_index].chunk_id)
+        selected[replace_index] = result
+        selected_ids.add(result.chunk_id)
+    original_order = {result.chunk_id: index for index, result in enumerate(results)}
+    return sorted(selected, key=lambda result: original_order[result.chunk_id])
 
 
 def rerank_with_fallback(
@@ -111,4 +213,4 @@ def rerank_with_fallback(
         return reranker.rerank(query, candidates, top_k=top_k), None
     except Exception as error:
         reason = f"{type(error).__name__}: {error}"
-        return candidates[:top_k], reason
+        return select_diverse_chunks(candidates, top_k=top_k), reason

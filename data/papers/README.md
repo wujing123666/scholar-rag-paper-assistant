@@ -145,11 +145,11 @@ python -m src.paper_assistant --model-cache data/models/fastembed search-chunks 
 python -m src.paper_assistant --retriever bm25 --model-cache data/models/fastembed --chunk-reranker fastembed --reranker-cache data/models/fastembed search-chunks "MapT-STC如何根据不确定性融合两路预测" --top-k 5
 ```
 
-默认使用 MIT 许可的 `BAAI/bge-reranker-base`，模型约 1.04 GB，第一次运行下载到本地模型缓存。重排默认关闭；开启后先完成论文路由、正文 Hybrid 检索和论文先验融合，再只对最终 Top-5 做统一重排。默认融合 35% Cross-Encoder 分数与 65% 原检索分数，因此不会改变 Top-5 成员，只调整其内部顺序。运行时推理失败会返回原排序，并在 JSON 的 `reranker_fallback` 中说明原因。
+默认使用 MIT 许可的 `BAAI/bge-reranker-base`，模型约 1.04 GB，第一次运行下载到本地模型缓存。重排默认关闭；开启后先完成论文路由，再用原问题和最多三个术语子查询召回正文，使用加权 RRF 融合，并从默认 14 个候选中统一重排。候选和最终证据都会限制同一论文页的重复，同时保留第一候选论文中代表不同子问题的方法或公式片段。默认融合 35% Cross-Encoder 分数与 65% 原检索分数；运行时推理失败会返回多样化后的原排序，并在 JSON 的 `reranker_fallback` 中说明原因。
 
 ## 基于证据回答问题
 
-`answer` 命令复用相同的“论文路由 → 正文检索 → 可选重排”链路，再把编号后的证据块交给已有的可插拔 LLM。自动路由首先经过论文级未知问题阈值，弱匹配不会进入生成阶段。模型必须返回结构化 Claim，每条 Claim 至少引用一个 `C1`、`C2` 等证据编号；程序会拒绝无引用结论、未知编号、非法 JSON 和模型主动报告的证据不足。最终引用由程序绑定到 `paper_id + pdf_file + page_number + section + chunk_id`，不会直接信任模型生成的来源信息。
+`answer` 命令复用相同的“论文路由 → 多查询正文检索 → 可选重排”链路，默认选择 7 个跨页证据块和最多 16000 字上下文，再交给已有的可插拔 LLM。自动路由首先经过论文级未知问题阈值，弱匹配不会进入生成阶段。模型先拆解问题并遍历全部证据，必须返回结构化 Claim，每条 Claim 至少引用一个 `C1`、`C2` 等证据编号；程序会拒绝无引用结论、未知编号、非法 JSON 和模型主动报告的证据不足。最终引用由程序绑定到 `paper_id + pdf_file + page_number + section + chunk_id`，不会直接信任模型生成的来源信息。
 
 先复制一份仅保存在本地的 LLM 配置：
 
@@ -196,6 +196,8 @@ python -m src.paper_assistant --retriever hybrid --model-cache data/models/faste
 ```
 
 评测器每完成一题就原子写入本地报告，可在相同命令末尾增加 `--resume` 从已有结果继续。报告包含论文 Top-1 正确率、候选论文召回率、回答成功率、必备事实覆盖率、标注页对齐率、延迟和 token 用量。必备事实覆盖率由同一 LLM 的独立严格判分调用给出，属于模型评审指标；标注页对齐率只衡量引用是否落在人工登记页，不能代替 Claim 与 Chunk 的语义蕴含检查。完整回答和评测报告默认写入被 Git 忽略的 `tmp/`。
+
+当前 15 条开发题使用 Hybrid 路由、BGE 重排、7 个证据块和 16000 字上下文的结果为：15/15 成功回答，论文 Top-1 与候选召回均为 100%，59 个必备事实覆盖 43 个（72.88%），标注页召回 85.29%，平均延迟 5.43 秒。改造前同集事实覆盖为 62.71%、标注页召回为 55.88%。这是一组系统看过语料后构造的开发集结果，不能当作用户盲测准确率。
 
 ## 评测正文证据检索
 

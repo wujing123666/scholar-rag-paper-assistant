@@ -2,12 +2,16 @@
 
 from __future__ import annotations
 
+from dataclasses import replace
+
 import pytest
 
 from src.paper_assistant.catalog import PaperProfile
 from src.paper_assistant.chunk_reranker import (
     FastEmbedChunkReranker,
     rerank_with_fallback,
+    select_diverse_chunks,
+    select_rerank_candidates,
 )
 from src.paper_assistant.chunk_retriever import ChunkSearchResult
 
@@ -30,14 +34,21 @@ def _profile() -> PaperProfile:
     )
 
 
-def _result(chunk_id: str, text: str, score: float) -> ChunkSearchResult:
+def _result(
+    chunk_id: str,
+    text: str,
+    score: float,
+    *,
+    page_number: int = 1,
+    section: str = "METHOD",
+) -> ChunkSearchResult:
     return ChunkSearchResult(
         chunk_id=chunk_id,
         paper=_profile(),
         pdf_file="paper.pdf",
-        page_number=1,
+        page_number=page_number,
         chunk_index=1,
-        section="METHOD",
+        section=section,
         text=text,
         score=score,
         dense_score=score,
@@ -112,6 +123,64 @@ def test_safe_rerank_falls_back_to_original_ranking_on_runtime_error():
 
     assert results == original[:1]
     assert reason == "RuntimeError: inference failed"
+
+
+def test_diverse_selection_prefers_distinct_pages_before_duplicates():
+    candidates = [
+        _result("p1-a", "first", 0.9, page_number=1),
+        _result("p1-b", "duplicate page", 0.8, page_number=1),
+        _result("p2", "second page", 0.7, page_number=2),
+    ]
+
+    results = select_diverse_chunks(candidates, top_k=2)
+
+    assert [result.chunk_id for result in results] == ["p1-a", "p2"]
+
+
+def test_diverse_selection_keeps_focused_subquery_evidence():
+    candidates = [
+        _result("high", "highest", 0.95, page_number=1),
+        _result("middle", "middle", 0.85, page_number=2),
+        replace(
+            _result("focused", "formula", 0.55, page_number=7), focus_rank=1
+        ),
+    ]
+
+    results = select_diverse_chunks(candidates, top_k=2)
+
+    assert [result.chunk_id for result in results] == ["high", "focused"]
+
+
+def test_rerank_pool_keeps_focused_evidence_below_initial_cutoff():
+    candidates = [
+        _result(f"high-{index}", "high", 1 - index / 100, page_number=index)
+        for index in range(1, 5)
+    ]
+    candidates.append(
+        replace(
+            _result("focused", "formula", 0.4, page_number=7),
+            focus_rank=1,
+            routing_rank=1,
+        )
+    )
+
+    results = select_rerank_candidates(candidates, top_k=3)
+
+    assert [result.chunk_id for result in results] == ["high-1", "high-2", "focused"]
+
+
+def test_method_section_receives_a_small_reranking_bonus():
+    reranker = FastEmbedChunkReranker(
+        "fake", weight=0.0, model=FakeCrossEncoder([1.0, 1.0])
+    )
+    candidates = [
+        _result("intro", "same", 0.7, section="1 Introduction"),
+        _result("method", "same", 0.68, section="4 Methodology"),
+    ]
+
+    results = reranker.rerank("query", candidates, top_k=2)
+
+    assert results[0].chunk_id == "method"
 
 
 @pytest.mark.parametrize("weight", [-0.1, 1.1])
