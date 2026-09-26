@@ -266,6 +266,41 @@ def test_summary_includes_runtime_claim_verification_cost_and_retention():
     assert summary["total_tokens"] == 36
 
 
+def test_summary_counts_service_degradation_events():
+    answer = _answer()
+    answer = GroundedAnswer(
+        answer.status,
+        answer.answer,
+        answer.claims,
+        answer.citations,
+        answer.reason,
+        answer.model,
+        answer.usage,
+        {"fallback_used": True, "fallback_provider": "qwen"},
+    )
+    result = build_answer_case_result(
+        _case(),
+        ("paper-a",),
+        answer,
+        FactJudgement(("F1",), "fact-judge", {"total_tokens": 7}),
+        ClaimSupportJudgement(("K1",), "claim-judge", {"total_tokens": 5}),
+        latency_seconds=1.0,
+    )
+    result["claim_verification"] = {
+        "status": "verification_unavailable",
+        "judge_tokens": 3,
+    }
+    result["paper_retriever_fallback"] = "dense_unavailable:ConnectionError"
+
+    summary = summarize_answer_results([result])
+
+    assert result["service_diagnostics"]["fallback_provider"] == "qwen"
+    assert summary["generation_fallback_cases"] == 1
+    assert summary["paper_retriever_fallback_cases"] == 1
+    assert summary["claim_verification_unavailable_cases"] == 1
+    assert summary["claim_verification_tokens"] == 3
+
+
 def test_loader_rejects_duplicate_ids(tmp_path):
     path = tmp_path / "cases.jsonl"
     line = json.dumps(_case(), ensure_ascii=False)

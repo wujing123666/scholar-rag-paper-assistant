@@ -3,10 +3,20 @@
 from __future__ import annotations
 
 import re
+from dataclasses import dataclass
 
 from src.paper_assistant.catalog import PaperCatalog
 from src.paper_assistant.dense_retriever import PaperDenseRetriever
 from src.paper_assistant.retriever import PaperBM25Retriever, PaperSearchResult
+
+
+@dataclass(frozen=True)
+class HybridSearchResult:
+    """Results plus the effective retriever used for this request."""
+
+    results: tuple[PaperSearchResult, ...]
+    effective_retriever: str
+    fallback_reason: str | None = None
 
 
 class PaperHybridRetriever:
@@ -32,15 +42,27 @@ class PaperHybridRetriever:
         self.rrf_k = rrf_k
 
     def search(self, query: str, top_k: int = 3) -> list[PaperSearchResult]:
+        return list(self.search_with_diagnostics(query, top_k=top_k).results)
+
+    def search_with_diagnostics(
+        self, query: str, top_k: int = 3
+    ) -> HybridSearchResult:
         if not query or not query.strip():
             raise ValueError("Query cannot be empty")
         if top_k < 1:
             raise ValueError("top_k must be at least one")
 
-        source_results = (
-            self.sparse.search(query, top_k=len(self.catalog)),
-            self.dense.search(query, top_k=len(self.catalog)),
-        )
+        sparse_results = self.sparse.search(query, top_k=len(self.catalog))
+        try:
+            dense_results = self.dense.search(query, top_k=len(self.catalog))
+        except Exception as error:
+            return HybridSearchResult(
+                results=tuple(sparse_results[: min(top_k, len(sparse_results))]),
+                effective_retriever=self.sparse.name,
+                fallback_reason=f"dense_unavailable:{type(error).__name__}",
+            )
+
+        source_results = (sparse_results, dense_results)
         scores: dict[str, float] = {}
         matches: dict[str, set[str]] = {}
         for results in source_results:
@@ -62,11 +84,14 @@ class PaperHybridRetriever:
                 matches.setdefault(profile.paper_id, set()).add(profile.paper_id)
 
         ranked_ids = sorted(scores, key=lambda paper_id: (-scores[paper_id], paper_id))
-        return [
-            PaperSearchResult(
-                paper=self.catalog.get(paper_id),
-                score=scores[paper_id],
-                matched_terms=tuple(sorted(matches.get(paper_id, ()))),
-            )
-            for paper_id in ranked_ids[: min(top_k, len(ranked_ids))]
-        ]
+        return HybridSearchResult(
+            results=tuple(
+                PaperSearchResult(
+                    paper=self.catalog.get(paper_id),
+                    score=scores[paper_id],
+                    matched_terms=tuple(sorted(matches.get(paper_id, ()))),
+                )
+                for paper_id in ranked_ids[: min(top_k, len(ranked_ids))]
+            ),
+            effective_retriever=self.name,
+        )

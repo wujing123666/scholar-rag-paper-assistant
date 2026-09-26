@@ -46,6 +46,7 @@ class GroundedAnswer:
     reason: str | None
     model: str | None
     usage: dict[str, int] | None
+    service_diagnostics: dict[str, Any] | None = None
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -56,10 +57,16 @@ class GroundedAnswer:
             "reason": self.reason,
             "model": self.model,
             "usage": self.usage,
+            "service_diagnostics": self.service_diagnostics,
         }
 
 
-def _refusal(reason: str, *, model: str | None = None) -> GroundedAnswer:
+def _refusal(
+    reason: str,
+    *,
+    model: str | None = None,
+    service_diagnostics: dict[str, Any] | None = None,
+) -> GroundedAnswer:
     return GroundedAnswer(
         status="insufficient_evidence",
         answer=REFUSAL_TEXT,
@@ -68,6 +75,7 @@ def _refusal(reason: str, *, model: str | None = None) -> GroundedAnswer:
         reason=reason,
         model=model,
         usage=None,
+        service_diagnostics=service_diagnostics,
     )
 
 
@@ -214,18 +222,30 @@ def answer_from_evidence(
             _messages(query.strip(), evidence),
             temperature=0.0,
         )
-    except Exception:
-        return _refusal("llm_generation_failed")
+    except Exception as error:
+        diagnostics = getattr(error, "diagnostics", None)
+        return _refusal(
+            "llm_generation_failed",
+            service_diagnostics=(diagnostics if isinstance(diagnostics, dict) else None),
+        )
 
     try:
         payload = _parse_json_object(response.content)
         if payload.get("status") == "insufficient_evidence":
-            return _refusal("model_reported_insufficient_evidence", model=response.model)
+            return _refusal(
+                "model_reported_insufficient_evidence",
+                model=response.model,
+                service_diagnostics=_response_diagnostics(response),
+            )
         if payload.get("status") != "answered":
             raise ValueError("model output contains an invalid status")
         claims = _validate_claims(payload, citation_map)
     except (json.JSONDecodeError, TypeError, ValueError):
-        return _refusal("invalid_model_output", model=response.model)
+        return _refusal(
+            "invalid_model_output",
+            model=response.model,
+            service_diagnostics=_response_diagnostics(response),
+        )
 
     used_ids = tuple(
         dict.fromkeys(citation_id for claim in claims for citation_id in claim.citations)
@@ -241,4 +261,13 @@ def answer_from_evidence(
         reason=None,
         model=response.model,
         usage=response.usage,
+        service_diagnostics=_response_diagnostics(response),
     )
+
+
+def _response_diagnostics(response: ChatResponse) -> dict[str, Any] | None:
+    raw = response.raw_response
+    if not isinstance(raw, dict):
+        return None
+    diagnostics = raw.get("resilience")
+    return diagnostics if isinstance(diagnostics, dict) else None

@@ -42,10 +42,11 @@ def _result(chunk_id: str = "paper:4:0") -> ChunkSearchResult:
 
 
 class FakeLLM:
-    def __init__(self, payload=None, *, content=None, error=None):
+    def __init__(self, payload=None, *, content=None, error=None, raw_response=None):
         self.payload = payload
         self.content = content
         self.error = error
+        self.raw_response = raw_response
         self.calls = []
 
     def chat(self, messages, **kwargs):
@@ -57,6 +58,7 @@ class FakeLLM:
             content=content,
             model="fake-model",
             usage={"prompt_tokens": 10, "completion_tokens": 5, "total_tokens": 15},
+            raw_response=self.raw_response,
         )
 
 
@@ -123,6 +125,27 @@ def test_model_can_report_insufficient_evidence():
     assert answer.status == "insufficient_evidence"
     assert answer.reason == "model_reported_insufficient_evidence"
     assert answer.model == "fake-model"
+
+
+def test_refusal_preserves_sanitized_fallback_diagnostics():
+    answer = answer_from_evidence(
+        FakeLLM(
+            {"status": "insufficient_evidence", "claims": []},
+            raw_response={
+                "resilience": {
+                    "fallback_used": True,
+                    "fallback_model": "qwen-plus",
+                }
+            },
+        ),
+        "问题",
+        [_result()],
+    )
+
+    assert answer.service_diagnostics == {
+        "fallback_used": True,
+        "fallback_model": "qwen-plus",
+    }
 
 
 def test_too_few_chunks_refuses_without_calling_the_model():

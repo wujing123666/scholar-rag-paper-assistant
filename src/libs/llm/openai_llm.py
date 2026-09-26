@@ -16,6 +16,19 @@ from src.libs.llm.base_llm import BaseLLM, ChatResponse, Message
 class OpenAILLMError(RuntimeError):
     """Raised when OpenAI API call fails."""
 
+    def __init__(
+        self,
+        message: str,
+        *,
+        status_code: int | None = None,
+        retryable: bool = False,
+        retry_after_seconds: float | None = None,
+    ) -> None:
+        super().__init__(message)
+        self.status_code = status_code
+        self.retryable = retryable
+        self.retry_after_seconds = retry_after_seconds
+
 
 class OpenAILLM(BaseLLM):
     """OpenAI LLM provider implementation.
@@ -212,18 +225,40 @@ class OpenAILLM(BaseLLM):
                 
                 if response.status_code != 200:
                     error_detail = self._parse_error_response(response)
+                    retryable = response.status_code in {
+                        408,
+                        409,
+                        425,
+                        429,
+                        500,
+                        502,
+                        503,
+                        504,
+                    }
+                    retry_after = response.headers.get("Retry-After")
+                    retry_after_seconds = (
+                        float(retry_after)
+                        if isinstance(retry_after, (int, float, str))
+                        and str(retry_after).replace(".", "", 1).isdigit()
+                        else None
+                    )
                     raise OpenAILLMError(
-                        f"[OpenAI] API error (HTTP {response.status_code}): {error_detail}"
+                        f"[OpenAI] API error (HTTP {response.status_code}): {error_detail}",
+                        status_code=response.status_code,
+                        retryable=retryable,
+                        retry_after_seconds=retry_after_seconds,
                     )
                 
                 return response.json()
         except httpx.TimeoutException as e:
             raise OpenAILLMError(
-                f"[OpenAI] Request timed out after 60 seconds"
+                f"[OpenAI] Request timed out after 60 seconds",
+                retryable=True,
             ) from e
         except httpx.RequestError as e:
             raise OpenAILLMError(
-                f"[OpenAI] Connection failed: {type(e).__name__}: {e}"
+                f"[OpenAI] Connection failed: {type(e).__name__}: {e}",
+                retryable=True,
             ) from e
     
     def _parse_error_response(self, response: Any) -> str:

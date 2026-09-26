@@ -16,7 +16,7 @@ from src.libs.embedding.fastembed_embedding import FastEmbedEmbedding
 from src.paper_assistant.catalog import PaperCatalog
 from src.paper_assistant.dense_retriever import PaperDenseRetriever
 from src.paper_assistant.hybrid_retriever import PaperHybridRetriever
-from src.paper_assistant.rejection import decide_retrieval, default_min_score
+from src.paper_assistant.rejection import decide_retrieval
 from src.paper_assistant.retriever import PaperBM25Retriever, PaperSearchResult
 
 if TYPE_CHECKING:
@@ -194,8 +194,20 @@ class FindPaperTool:
                 "retriever must be one of: bm25, dense, hybrid"
             )
 
-        paper_retriever = self._get_retriever(retriever)
-        threshold = self.min_scores.get(retriever, default_min_score(paper_retriever.name))
+        initialization_fallback = None
+        try:
+            paper_retriever = self._get_retriever(retriever)
+        except Exception as error:
+            if retriever != "hybrid":
+                raise
+            paper_retriever = self._get_retriever("bm25")
+            initialization_fallback = (
+                f"dense_initialization_unavailable:{type(error).__name__}"
+            )
+        threshold_key = (
+            "bm25" if paper_retriever.name == "paper_bm25" else retriever
+        )
+        threshold = self.min_scores.get(threshold_key)
         decision = decide_retrieval(
             paper_retriever,
             query.strip(),
@@ -203,9 +215,12 @@ class FindPaperTool:
             min_score=threshold,
         )
         matches = decision.results
+        fallback_reason = initialization_fallback or decision.fallback_reason
         return {
             "query": query.strip(),
             "retriever": retriever,
+            "effective_retriever": decision.effective_retriever,
+            "retriever_fallback": fallback_reason,
             "rejected": decision.rejected,
             "rejection_reason": decision.reason,
             "top_score": (

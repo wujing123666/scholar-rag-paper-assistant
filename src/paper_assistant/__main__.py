@@ -15,7 +15,7 @@ from src.paper_assistant.dense_retriever import PaperDenseRetriever
 from src.paper_assistant.evaluation import evaluate_retriever, load_evaluation_cases
 from src.paper_assistant.hybrid_retriever import PaperHybridRetriever
 from src.paper_assistant.inventory import build_paper_inventory, write_inventory_report
-from src.paper_assistant.rejection import decide_retrieval, default_min_score
+from src.paper_assistant.rejection import decide_retrieval
 from src.paper_assistant.retriever import PaperBM25Retriever
 
 DEFAULT_CATALOG = Path("data/papers/paper_catalog.csv")
@@ -39,6 +39,66 @@ def _configure_stdout_utf8() -> None:
         reconfigure(encoding="utf-8")
 
 
+def _build_resilient_llms(settings_path: Path, fallback_path: Path | None, args):
+    """Build retrying judge and generation clients without exposing credentials."""
+    from src.core.settings import load_settings
+    from src.libs.llm import LLMFactory
+    from src.libs.llm.resilient_llm import ResilientChatModel, RetryPolicy
+
+    settings = load_settings(settings_path)
+    primary = LLMFactory.create(settings)
+    policy = RetryPolicy(
+        max_attempts=args.llm_max_attempts,
+        base_delay_seconds=args.llm_retry_base_seconds,
+        max_delay_seconds=args.llm_retry_max_seconds,
+        circuit_failure_threshold=args.llm_circuit_failures,
+        circuit_cooldown_seconds=args.llm_circuit_cooldown_seconds,
+    )
+    judge_llm = ResilientChatModel(
+        primary,
+        primary_name=settings.llm.provider,
+        policy=policy,
+    )
+    fallback = None
+    fallback_name = None
+    fallback_model = None
+    if fallback_path is not None:
+        fallback_settings = load_settings(fallback_path)
+        fallback = LLMFactory.create(fallback_settings)
+        fallback_name = fallback_settings.llm.provider
+        fallback_model = fallback_settings.llm.model
+    generation_llm = ResilientChatModel(
+        primary,
+        primary_name=settings.llm.provider,
+        fallback=fallback,
+        fallback_name=fallback_name,
+        fallback_model=fallback_model,
+        policy=policy,
+    )
+    return settings, generation_llm, judge_llm, fallback_name, fallback_model
+
+
+def _add_resilience_arguments(command_parser: argparse.ArgumentParser) -> None:
+    command_parser.add_argument(
+        "--fallback-settings",
+        type=Path,
+        help="Private settings for a generation-only fallback provider",
+    )
+    command_parser.add_argument("--llm-max-attempts", type=int, default=2)
+    command_parser.add_argument("--llm-retry-base-seconds", type=float, default=0.25)
+    command_parser.add_argument("--llm-retry-max-seconds", type=float, default=2.0)
+    command_parser.add_argument("--llm-circuit-failures", type=int, default=3)
+    command_parser.add_argument(
+        "--llm-circuit-cooldown-seconds", type=float, default=30.0
+    )
+    command_parser.add_argument(
+        "--verification-failure-policy",
+        choices=("strict", "evidence_only"),
+        default="strict",
+        help="Refuse or return citations only when the claim judge is unavailable",
+    )
+
+
 def _build_retriever(
     catalog_path: Path,
     retriever_name: str,
@@ -50,25 +110,36 @@ def _build_retriever(
     chroma_host: str,
     chroma_port: int,
     chroma_ssl: bool,
-) -> PaperBM25Retriever | PaperDenseRetriever | PaperHybridRetriever:
+) -> tuple[
+    PaperBM25Retriever | PaperDenseRetriever | PaperHybridRetriever,
+    str | None,
+]:
     catalog = PaperCatalog.from_csv(catalog_path)
     if retriever_name == "bm25":
-        return PaperBM25Retriever(catalog)
+        return PaperBM25Retriever(catalog), None
     from src.libs.vector_store.chroma_store import ChromaStore
 
-    embedding = FastEmbedEmbedding(model=model, cache_dir=model_cache)
-    vector_store = ChromaStore(
-        persist_directory=chroma_path,
-        collection_name=DEFAULT_PAPER_COLLECTION,
-        mode=chroma_mode,
-        host=chroma_host,
-        port=chroma_port,
-        ssl=chroma_ssl,
-    )
-    dense = PaperDenseRetriever(catalog, embedding, vector_store)
+    try:
+        embedding = FastEmbedEmbedding(model=model, cache_dir=model_cache)
+        vector_store = ChromaStore(
+            persist_directory=chroma_path,
+            collection_name=DEFAULT_PAPER_COLLECTION,
+            mode=chroma_mode,
+            host=chroma_host,
+            port=chroma_port,
+            ssl=chroma_ssl,
+        )
+        dense = PaperDenseRetriever(catalog, embedding, vector_store)
+    except Exception as error:
+        if retriever_name != "hybrid":
+            raise
+        return (
+            PaperBM25Retriever(catalog),
+            f"dense_initialization_unavailable:{type(error).__name__}",
+        )
     if retriever_name == "dense":
-        return dense
-    return PaperHybridRetriever(catalog, PaperBM25Retriever(catalog), dense)
+        return dense, None
+    return PaperHybridRetriever(catalog, PaperBM25Retriever(catalog), dense), None
 
 
 def main() -> int:
@@ -184,6 +255,7 @@ def main() -> int:
         help="Model used by runtime claim verification; repeat for consensus mode",
     )
     answer_parser.add_argument("--claim-retry-k", type=int, default=3)
+    _add_resilience_arguments(answer_parser)
 
     chunk_evaluate_parser = subparsers.add_parser(
         "evaluate-chunks", help="Evaluate page-level evidence retrieval"
@@ -231,6 +303,7 @@ def main() -> int:
         "--claim-judge-model", action="append", default=[]
     )
     answer_evaluate_parser.add_argument("--claim-retry-k", type=int, default=3)
+    _add_resilience_arguments(answer_evaluate_parser)
     answer_evaluate_parser.add_argument(
         "--output", type=Path, default=Path("tmp/answer_evaluation_report.json")
     )
@@ -472,11 +545,23 @@ def main() -> int:
                 parser.error("--min-evidence-chunks must be at least one")
         if args.command in {"answer", "evaluate-answers"} and args.claim_retry_k < 1:
             parser.error("--claim-retry-k must be at least one")
+        if args.command in {"answer", "evaluate-answers"}:
+            if args.llm_max_attempts < 1:
+                parser.error("--llm-max-attempts must be at least one")
+            if args.llm_retry_base_seconds < 0 or args.llm_retry_max_seconds < 0:
+                parser.error("LLM retry delays cannot be negative")
+            if args.llm_retry_max_seconds < args.llm_retry_base_seconds:
+                parser.error("LLM retry max must be at least the base delay")
+            if args.llm_circuit_failures < 1:
+                parser.error("--llm-circuit-failures must be at least one")
+            if args.llm_circuit_cooldown_seconds < 0:
+                parser.error("LLM circuit cooldown cannot be negative")
         if args.command == "evaluate-answers" and args.limit is not None and args.limit < 1:
             parser.error("--limit must be at least one")
         catalog = PaperCatalog.from_csv(args.catalog)
         embedding = FastEmbedEmbedding(model=args.model, cache_dir=args.model_cache)
         paper_retriever = None
+        paper_router_fallback = None
         needs_paper_router = args.command == "evaluate-chunks" and not args.oracle_paper
         if args.command == "evaluate-answers":
             needs_paper_router = True
@@ -486,31 +571,55 @@ def main() -> int:
             if args.retriever == "bm25":
                 paper_retriever = PaperBM25Retriever(catalog)
             else:
-                profile_store = ChromaStore(
-                    persist_directory=args.chroma_path,
-                    collection_name=DEFAULT_PAPER_COLLECTION,
-                    mode=args.chroma_mode,
-                    host=args.chroma_host,
-                    port=args.chroma_port,
-                    ssl=args.chroma_ssl,
-                )
-                dense = PaperDenseRetriever(catalog, embedding, profile_store)
-                paper_retriever = (
-                    dense
-                    if args.retriever == "dense"
-                    else PaperHybridRetriever(
-                        catalog, PaperBM25Retriever(catalog), dense
+                try:
+                    profile_store = ChromaStore(
+                        persist_directory=args.chroma_path,
+                        collection_name=DEFAULT_PAPER_COLLECTION,
+                        mode=args.chroma_mode,
+                        host=args.chroma_host,
+                        port=args.chroma_port,
+                        ssl=args.chroma_ssl,
                     )
-                )
+                    dense = PaperDenseRetriever(catalog, embedding, profile_store)
+                    paper_retriever = (
+                        dense
+                        if args.retriever == "dense"
+                        else PaperHybridRetriever(
+                            catalog, PaperBM25Retriever(catalog), dense
+                        )
+                    )
+                except Exception as error:
+                    if args.retriever != "hybrid":
+                        raise
+                    paper_retriever = PaperBM25Retriever(catalog)
+                    paper_router_fallback = (
+                        f"dense_initialization_unavailable:{type(error).__name__}"
+                    )
 
-        def resolve_candidates(query: str) -> tuple[str, ...]:
+        def resolve_candidates(query: str) -> tuple[tuple[str, ...], str | None]:
             if paper_retriever is None:
-                return ()
-            return tuple(
-                result.paper.paper_id
-                for result in paper_retriever.search(
+                return (), paper_router_fallback
+            search_with_diagnostics = getattr(
+                paper_retriever, "search_with_diagnostics", None
+            )
+            if callable(search_with_diagnostics):
+                search_result = search_with_diagnostics(
                     query, top_k=min(args.candidate_papers, len(catalog))
                 )
+                return (
+                    tuple(
+                        result.paper.paper_id for result in search_result.results
+                    ),
+                    paper_router_fallback or search_result.fallback_reason,
+                )
+            return (
+                tuple(
+                    result.paper.paper_id
+                    for result in paper_retriever.search(
+                        query, top_k=min(args.candidate_papers, len(catalog))
+                    )
+                ),
+                paper_router_fallback,
             )
 
         if args.command in {"search-chunks", "answer"}:
@@ -521,20 +630,22 @@ def main() -> int:
                     if paper_retriever is None:
                         candidate_ids = ()
                     else:
-                        threshold = args.min_score
-                        if threshold is None:
-                            threshold = default_min_score(paper_retriever.name)
                         decision = decide_retrieval(
                             paper_retriever,
                             args.query,
                             top_k=min(args.candidate_papers, len(catalog)),
-                            min_score=threshold,
+                            min_score=args.min_score,
+                        )
+                        paper_router_fallback = (
+                            paper_router_fallback or decision.fallback_reason
                         )
                         candidate_ids = tuple(
                             result.paper.paper_id for result in decision.results
                         )
                 else:
-                    candidate_ids = resolve_candidates(args.query)
+                    candidate_ids, paper_router_fallback = resolve_candidates(
+                        args.query
+                    )
         else:
             candidate_ids = ()
             automatic_routing = False
@@ -553,6 +664,7 @@ def main() -> int:
                             "citations": [],
                             "reason": "no_candidate_papers",
                             "candidate_papers": [],
+                            "paper_retriever_fallback": paper_router_fallback,
                         },
                         ensure_ascii=False,
                         indent=2,
@@ -564,6 +676,7 @@ def main() -> int:
                     {
                         "query": args.query,
                         "candidate_papers": [],
+                        "paper_retriever_fallback": paper_router_fallback,
                         "results": [],
                         "message": "No candidate papers matched the query.",
                     },
@@ -600,8 +713,6 @@ def main() -> int:
                 weight=args.rerank_weight,
             )
         if args.command == "evaluate-answers":
-            from src.core.settings import load_settings
-            from src.libs.llm import LLMFactory
             from src.paper_assistant.answer_evaluation import (
                 ClaimSupportJudgement,
                 FactJudgement,
@@ -622,8 +733,15 @@ def main() -> int:
             cases = load_answer_evaluation_cases(args.queries)
             if args.limit is not None:
                 cases = cases[: args.limit]
-            llm_settings = load_settings(args.settings)
-            llm = LLMFactory.create(llm_settings)
+            (
+                llm_settings,
+                generation_llm,
+                judge_llm,
+                fallback_provider,
+                fallback_model,
+            ) = _build_resilient_llms(
+                args.settings, args.fallback_settings, args
+            )
             disable_judge_thinking = bool(
                 args.judge_model and llm_settings.llm.provider == "deepseek"
             )
@@ -657,6 +775,16 @@ def main() -> int:
                 "claim_verification": args.verify_claims,
                 "claim_judge_models": claim_judge_models,
                 "claim_retry_k": args.claim_retry_k,
+                "verification_failure_policy": args.verification_failure_policy,
+                "fallback_provider": fallback_provider,
+                "fallback_model": fallback_model,
+                "llm_retry": {
+                    "max_attempts": args.llm_max_attempts,
+                    "base_delay_seconds": args.llm_retry_base_seconds,
+                    "max_delay_seconds": args.llm_retry_max_seconds,
+                    "circuit_failure_threshold": args.llm_circuit_failures,
+                    "circuit_cooldown_seconds": args.llm_circuit_cooldown_seconds,
+                },
                 "judge_model": args.judge_model,
                 "judge_thinking": (
                     "disabled" if disable_judge_thinking else None
@@ -678,10 +806,6 @@ def main() -> int:
                 if chunk_reranker
                 else args.top_k
             )
-            threshold = args.min_score
-            if threshold is None and not args.disable_rejection:
-                threshold = default_min_score(paper_retriever.name)
-
             for index, case in enumerate(cases, start=1):
                 if case["id"] in completed:
                     previous_result = completed[case["id"]]
@@ -701,17 +825,23 @@ def main() -> int:
                     results.append(previous_result)
                     continue
                 started = time.perf_counter()
-                if threshold is None:
-                    candidate_ids = resolve_candidates(case["question"])
+                case_paper_fallback = paper_router_fallback
+                if args.disable_rejection:
+                    candidate_ids, case_paper_fallback = resolve_candidates(
+                        case["question"]
+                    )
                 else:
                     decision = decide_retrieval(
                         paper_retriever,
                         case["question"],
                         top_k=min(args.candidate_papers, len(catalog)),
-                        min_score=threshold,
+                        min_score=args.min_score,
                     )
                     candidate_ids = tuple(
                         result.paper.paper_id for result in decision.results
+                    )
+                    case_paper_fallback = (
+                        case_paper_fallback or decision.fallback_reason
                     )
                 matches = []
                 for paper_id in candidate_ids:
@@ -737,7 +867,7 @@ def main() -> int:
                 else:
                     matches = matches[: args.top_k]
                 answer = answer_from_evidence(
-                    llm,
+                    generation_llm,
                     case["question"],
                     matches,
                     max_context_chars=args.max_context_chars,
@@ -781,13 +911,14 @@ def main() -> int:
                         return supplement[:top_k]
 
                     safety = verify_and_filter_claims(
-                        llm,
+                        judge_llm,
                         answer,
                         matches,
                         judge_models=claim_judge_models,
                         retrieve_more=retrieve_evaluation_claim_evidence,
                         retry_k=args.claim_retry_k,
                         disable_thinking=llm_settings.llm.provider == "deepseek",
+                        failure_policy=args.verification_failure_policy,
                     )
                     answer = safety.answer
                     matches = list(safety.evidence_results)
@@ -797,7 +928,7 @@ def main() -> int:
                     verification["reason"] = "answer_not_generated"
                 judgement = (
                     judge_required_facts(
-                        llm,
+                        judge_llm,
                         answer.answer,
                         case["required_facts"],
                         model=args.judge_model,
@@ -808,7 +939,7 @@ def main() -> int:
                 )
                 claim_judgement = (
                     judge_claim_support(
-                        llm,
+                        judge_llm,
                         answer,
                         matches,
                         model=args.judge_model,
@@ -830,6 +961,7 @@ def main() -> int:
                     evidence_results=matches,
                 )
                 result["claim_verification"] = verification
+                result["paper_retriever_fallback"] = case_paper_fallback
                 results.append(result)
                 report = {
                     "config": run_config,
@@ -925,19 +1057,19 @@ def main() -> int:
             ),
             "reranker_fallback": reranker_fallback,
             "candidate_papers": list(candidate_ids),
+            "paper_retriever_fallback": paper_router_fallback,
             "index_sync": asdict(index_sync),
         }
         if args.command == "answer":
-            from src.core.settings import load_settings
-            from src.libs.llm import LLMFactory
             from src.paper_assistant.claim_safety import verify_and_filter_claims
             from src.paper_assistant.grounded_answer import answer_from_evidence
 
             try:
-                settings = load_settings(args.settings)
-                llm = LLMFactory.create(settings)
+                settings, generation_llm, judge_llm, _, _ = _build_resilient_llms(
+                    args.settings, args.fallback_settings, args
+                )
                 answer = answer_from_evidence(
-                    llm,
+                    generation_llm,
                     args.query,
                     results,
                     max_context_chars=args.max_context_chars,
@@ -1000,13 +1132,14 @@ def main() -> int:
                         return supplement[:top_k]
 
                     safety = verify_and_filter_claims(
-                        llm,
+                        judge_llm,
                         answer,
                         results,
                         judge_models=judge_models,
                         retrieve_more=retrieve_claim_evidence,
                         retry_k=args.claim_retry_k,
                         disable_thinking=settings.llm.provider == "deepseek",
+                        failure_policy=args.verification_failure_policy,
                     )
                     answer = safety.answer
                     results = list(safety.evidence_results)
@@ -1076,7 +1209,7 @@ def main() -> int:
         )
         return 0
 
-    retriever = _build_retriever(
+    retriever, retriever_initialization_fallback = _build_retriever(
         args.catalog,
         args.retriever,
         args.model,
@@ -1089,23 +1222,30 @@ def main() -> int:
     )
 
     if args.command == "search":
-        threshold = args.min_score
-        if threshold is None and not args.disable_rejection:
-            threshold = default_min_score(retriever.name)
-        if threshold is None:
+        decision = None
+        if args.disable_rejection:
             results = retriever.search(args.query, top_k=args.top_k)
             rejected = not results
             top_score = results[0].score if results else None
+            threshold = None
         else:
             decision = decide_retrieval(
-                retriever, args.query, top_k=args.top_k, min_score=threshold
+                retriever, args.query, top_k=args.top_k, min_score=args.min_score
             )
             results = list(decision.results)
             rejected = decision.rejected
             top_score = decision.top_score
+            threshold = decision.min_score
         output = {
             "query": args.query,
             "retriever": args.retriever,
+            "effective_retriever": (
+                decision.effective_retriever if decision else retriever.name
+            ),
+            "retriever_fallback": (
+                retriever_initialization_fallback
+                or (decision.fallback_reason if decision else None)
+            ),
             "rejected": rejected,
             "top_score": round(top_score, 6) if top_score is not None else None,
             "min_score": threshold,
@@ -1122,15 +1262,15 @@ def main() -> int:
             ],
         }
     else:
-        threshold = args.min_score
-        if threshold is None and not args.disable_rejection:
-            threshold = default_min_score(retriever.name)
         output = evaluate_retriever(
             retriever,
             load_evaluation_cases(args.queries),
             split=args.split,
-            min_score=threshold,
+            min_score=args.min_score,
+            use_default_threshold=not args.disable_rejection,
         )
+        output["requested_retriever"] = args.retriever
+        output["retriever_initialization_fallback"] = retriever_initialization_fallback
     print(json.dumps(output, ensure_ascii=False, indent=2))
     return 0
 

@@ -34,6 +34,8 @@ class EvaluationCaseResult:
     rejected: bool
     top_score: float | None
     min_score: float | None
+    effective_retriever: str
+    fallback_reason: str | None
 
 
 def load_evaluation_cases(path: str | Path) -> list[dict[str, Any]]:
@@ -89,16 +91,15 @@ def evaluate_retriever(
     *,
     split: str | None = None,
     min_score: float | None = None,
+    use_default_threshold: bool = False,
 ) -> dict[str, Any]:
     selected_cases = [case for case in cases if split is None or case.get("split") == split]
     results: list[EvaluationCaseResult] = []
     for case in selected_cases:
         decision = None
-        if min_score is None:
-            matches = retriever.search(
-                case["description"], top_k=len(retriever.catalog)
-            )
-        else:
+        effective_retriever = retriever.name
+        fallback_reason = None
+        if min_score is not None or use_default_threshold:
             decision = decide_retrieval(
                 retriever,
                 case["description"],
@@ -106,6 +107,23 @@ def evaluate_retriever(
                 min_score=min_score,
             )
             matches = list(decision.results)
+            effective_retriever = decision.effective_retriever
+            fallback_reason = decision.fallback_reason
+        else:
+            search_with_diagnostics = getattr(
+                retriever, "search_with_diagnostics", None
+            )
+            if callable(search_with_diagnostics):
+                search_result = search_with_diagnostics(
+                    case["description"], top_k=len(retriever.catalog)
+                )
+                matches = list(search_result.results)
+                effective_retriever = search_result.effective_retriever
+                fallback_reason = search_result.fallback_reason
+            else:
+                matches = retriever.search(
+                    case["description"], top_k=len(retriever.catalog)
+                )
         returned_ids = tuple(match.paper.paper_id for match in matches)
         expected_paper_id = case["expected_paper_id"]
         if expected_paper_id is None:
@@ -130,6 +148,8 @@ def evaluate_retriever(
                     else (matches[0].score if matches else None)
                 ),
                 min_score=decision.min_score if decision else None,
+                effective_retriever=effective_retriever,
+                fallback_reason=fallback_reason,
             )
         )
 
@@ -158,6 +178,9 @@ def evaluate_retriever(
             "correct": correct_open_set,
             "accuracy": correct_open_set / total if total else None,
         },
+        "retriever_fallback_cases": sum(
+            bool(result.fallback_reason) for result in results
+        ),
         "by_difficulty": {
             difficulty: _metrics(group) for difficulty, group in sorted(groups.items())
         },

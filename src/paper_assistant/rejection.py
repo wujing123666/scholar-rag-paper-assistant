@@ -38,6 +38,8 @@ class PaperRetrievalDecision:
     reason: str
     top_score: float | None
     min_score: float
+    effective_retriever: str
+    fallback_reason: str | None = None
 
 
 def default_min_score(retriever_name: str) -> float:
@@ -58,11 +60,22 @@ def decide_retrieval(
     min_score: float | None = None,
 ) -> PaperRetrievalDecision:
     """Apply a retriever-specific score threshold to ranked candidates."""
-    threshold = default_min_score(retriever.name) if min_score is None else min_score
+    search_with_diagnostics = getattr(retriever, "search_with_diagnostics", None)
+    if callable(search_with_diagnostics):
+        search_result = search_with_diagnostics(query, top_k=top_k)
+        candidates = tuple(search_result.results)
+        effective_retriever = str(search_result.effective_retriever)
+        fallback_reason = search_result.fallback_reason
+    else:
+        candidates = tuple(retriever.search(query, top_k=top_k))
+        effective_retriever = retriever.name
+        fallback_reason = None
+    threshold = (
+        default_min_score(effective_retriever) if min_score is None else min_score
+    )
     if threshold < 0:
         raise ValueError("min_score must be zero or greater")
 
-    candidates = tuple(retriever.search(query, top_k=top_k))
     if not candidates:
         return PaperRetrievalDecision(
             results=(),
@@ -71,6 +84,8 @@ def decide_retrieval(
             reason="no_candidates",
             top_score=None,
             min_score=threshold,
+            effective_retriever=effective_retriever,
+            fallback_reason=fallback_reason,
         )
 
     top_score = candidates[0].score
@@ -82,6 +97,8 @@ def decide_retrieval(
             reason="below_threshold",
             top_score=top_score,
             min_score=threshold,
+            effective_retriever=effective_retriever,
+            fallback_reason=fallback_reason,
         )
     return PaperRetrievalDecision(
         results=candidates,
@@ -90,4 +107,6 @@ def decide_retrieval(
         reason="accepted",
         top_score=top_score,
         min_score=threshold,
+        effective_retriever=effective_retriever,
+        fallback_reason=fallback_reason,
     )

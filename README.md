@@ -2,9 +2,9 @@
 
 > **ScholarRAG 论文助手开发版**
 >
-> 本仓库正在将通用 RAG 框架改造成团队论文检索助手：目标支持约 20 名用户共享约 500 篇论文，并根据模糊记忆找回目标论文。当前已完成 Windows 运行兼容性修复、论文级 Paper Profile、版本去重、加权 BM25、本地中文 Dense 检索、论文向量与正文分块的 Chroma 持久化、未知论文阈值拒答、RRF 混合排序、两级“论文路由 → 页级正文检索”、多子问题证据召回、跨页面多样化、本地 ONNX Cross-Encoder 重排、逐结论绑定来源的证据问答、页码对齐、事实覆盖与 Claim-Evidence 语义支撑评测、`find_paper` MCP 工具、本地论文目录盘点、带原文证据的候选档案生成和人工确认后的受控增量入库，并建立首批 10 篇独立论文（11 个本地 PDF）、30 条已知论文种子问题、9 条开发用未知论文问题、10 条正文证据题和 15 条生成式问答题。论文 PDF、文件哈希和本地评测报告不进入公开仓库。
+> 本仓库正在将通用 RAG 框架改造成团队论文检索助手：目标支持约 20 名用户共享约 500 篇论文，并根据模糊记忆找回目标论文。当前已完成 Windows 运行兼容性修复、论文级 Paper Profile、版本去重、加权 BM25、本地中文 Dense 检索、论文向量与正文分块的 Chroma 持久化、未知论文阈值拒答、RRF 混合排序、两级“论文路由 → 页级正文检索”、多子问题证据召回、跨页面多样化、本地 ONNX Cross-Encoder 重排、逐结论绑定来源的证据问答、页码对齐、事实覆盖与 Claim-Evidence 语义支撑评测、`find_paper` MCP 工具、本地论文目录盘点、带原文证据的候选档案生成和人工确认后的受控增量入库，并建立首批 10 篇独立论文（11 个本地 PDF）、30 条已知论文种子问题、9 条开发用未知论文问题、10 条正文证据题和 15 条生成式问答题。运行时还支持 Dense/Chroma 故障退回 BM25、LLM 限次重试与熔断、生成模型跨 Provider 备用，以及 Claim 评审不可用时的严格拒答或仅返回证据模式。论文 PDF、文件哈希和本地评测报告不进入公开仓库。
 >
-> 本项目基于 [jerry-ai-dev/MODULAR-RAG-MCP-SERVER](https://github.com/jerry-ai-dev/MODULAR-RAG-MCP-SERVER) 二次开发。下一阶段将扩展个人论文库、加入更可靠的拒答校准和更大规模的独立评测。
+> 本项目基于 [jerry-ai-dev/MODULAR-RAG-MCP-SERVER](https://github.com/jerry-ai-dev/MODULAR-RAG-MCP-SERVER) 二次开发。下一阶段将扩展个人论文库、降低严格Claim核验成本，并补充服务API、鉴权和多人部署压测。
 
 > 一个可插拔、可观测的模块化 RAG（检索增强生成）服务框架，通过 MCP（Model Context Protocol）协议对外暴露工具接口，支持 Copilot / Claude 等 AI 助手直接调用。同时也是一份专为**大模型相关岗位学习与面试求职**设计的实战项目与配套教学资源。
 
@@ -127,6 +127,35 @@ setup
 Agent 会自动引导你完成全部配置流程。
 
 > 💡 如果不熟悉 Skill 的使用方式，请观看配套笔记中的 **Setup Skill 使用讲解视频**。
+
+### ScholarRAG 的运行时降级
+
+`answer` 和 `evaluate-answers` 对外部依赖采用分层降级，避免把服务故障伪装成正常答案：
+
+| 故障 | 处理 | 输出诊断 |
+|------|------|----------|
+| Dense Embedding 或 Chroma 在 Hybrid 论文路由中不可用 | 保留 BM25 结果，并按 BM25 阈值重新判断是否应拒答 | `effective_retriever`、`paper_retriever_fallback` |
+| Cross-Encoder 重排不可用 | 使用原始混合检索排序与多样化选择 | `reranker_fallback` |
+| LLM 超时、连接失败、HTTP 429/5xx | 按 `Retry-After` 或指数退避限次重试 | `service_diagnostics.failures`、`retry_delays_seconds` |
+| 主生成模型连续失败 | 熔断主 Provider；配置备用私有设置时切换备用生成模型 | `circuit_state`、`fallback_used`、`fallback_provider`、`fallback_model` |
+| Claim 评审服务不可用 | `strict` 返回安全拒答；`evidence_only` 仅返回原文证据，不输出未经核验的 Claim | `claim_verification.status=verification_unavailable` |
+| 生成内容无法解析、引用不存在或证据不足 | 返回安全拒答 | `status`、`reason` |
+
+备用模型只负责答案生成。Claim 评审失败时不自动换另一个 Provider 给出“通过”结论，因为服务故障不等于 Claim 获得支持。
+
+下面的示例使用两个本地私有配置文件；不要把 API Key 提交到仓库：
+
+```powershell
+python -m src.paper_assistant answer "这篇论文的方法解决了什么问题？" `
+  --settings config/settings.primary.local.yaml `
+  --fallback-settings config/settings.fallback.local.yaml `
+  --verify-claims consensus `
+  --claim-judge-model judge-model-a `
+  --claim-judge-model judge-model-b `
+  --verification-failure-policy strict
+```
+
+重试与熔断参数可通过 `--llm-max-attempts`、`--llm-retry-base-seconds`、`--llm-retry-max-seconds`、`--llm-circuit-failures` 和 `--llm-circuit-cooldown-seconds` 调整。默认每个 Provider 最多调用 2 次；主 Provider 连续 3 次请求失败后熔断 30 秒。`evaluate-answers` 的汇总结果会额外统计生成模型降级次数、论文检索降级次数和 Claim 核验不可用次数。
 
 ---
 

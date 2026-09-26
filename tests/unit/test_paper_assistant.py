@@ -420,6 +420,46 @@ def test_hybrid_retriever_combines_sparse_and_dense_ranks(tmp_path):
         )["retriever"] == "paper_hybrid_rrf"
 
 
+def test_hybrid_retriever_falls_back_to_bm25_when_dense_search_fails(tmp_path):
+    catalog = PaperCatalog.from_csv(_write_catalog(tmp_path))
+    sparse = PaperBM25Retriever(catalog)
+
+    class BrokenDense:
+        def __init__(self):
+            self.catalog = catalog
+
+        def search(self, query, top_k=3):
+            raise ConnectionError("vector service unavailable")
+
+    retriever = PaperHybridRetriever(catalog, sparse, BrokenDense())
+    decision = decide_retrieval(
+        retriever,
+        "强化学习用户招募",
+        top_k=1,
+        min_score=0.0,
+    )
+
+    assert decision.results[0].paper.paper_id == "recruitment"
+    assert decision.effective_retriever == "paper_bm25"
+    assert decision.fallback_reason == "dense_unavailable:ConnectionError"
+
+    report = evaluate_retriever(
+        retriever,
+        [
+            {
+                "id": "unknown",
+                "description": "强化学习用户招募",
+                "expected_paper_id": None,
+            }
+        ],
+        use_default_threshold=True,
+    )
+    assert report["cases"][0]["effective_retriever"] == "paper_bm25"
+    assert report["cases"][0]["min_score"] == 8.0
+    assert report["cases"][0]["fallback_reason"].startswith("dense_unavailable")
+    assert report["retriever_fallback_cases"] == 1
+
+
 def test_hybrid_retriever_requires_shared_catalog(tmp_path):
     catalog = PaperCatalog.from_csv(_write_catalog(tmp_path))
     other_catalog = PaperCatalog.from_csv(_write_catalog(tmp_path))

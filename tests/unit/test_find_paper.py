@@ -142,6 +142,26 @@ def test_rejection_threshold_can_be_configured(catalog_path):
     assert payload["results"][0]["paper_id"] == "recruitment"
 
 
+def test_hybrid_initialization_failure_falls_back_to_bm25(catalog_path):
+    tool = FindPaperTool(catalog_path, min_scores={"bm25": 0.0})
+    original = tool._get_retriever
+
+    def get_retriever(name):
+        if name == "hybrid":
+            raise ConnectionError("chroma unavailable")
+        return original(name)
+
+    tool._get_retriever = get_retriever
+    payload = tool.find_papers("强化学习用户招募", retriever="hybrid")
+
+    assert payload["retriever"] == "hybrid"
+    assert payload["effective_retriever"] == "paper_bm25"
+    assert payload["retriever_fallback"] == (
+        "dense_initialization_unavailable:ConnectionError"
+    )
+    assert payload["results"][0]["paper_id"] == "recruitment"
+
+
 @pytest.mark.parametrize(
     ("query", "top_k", "retriever", "message"),
     [
