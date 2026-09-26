@@ -4,11 +4,22 @@ from __future__ import annotations
 
 import json
 import random
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
 from src.paper_assistant.answer_evaluation import judge_frozen_claim_support
 from src.paper_assistant.grounded_answer import ChatModel
+
+
+@dataclass(frozen=True)
+class JudgeSpec:
+    """One named judge backed by its own provider configuration."""
+
+    label: str
+    llm: ChatModel
+    model: str
+    disable_thinking: bool = False
 
 
 def load_frozen_report(path: str | Path) -> dict[str, Any]:
@@ -39,17 +50,41 @@ def compare_frozen_judges(
     if len(models) < 2:
         raise ValueError("At least two distinct judge models are required")
 
+    return compare_frozen_judge_specs(
+        report,
+        [
+            JudgeSpec(
+                label=model,
+                llm=llm,
+                model=model,
+                disable_thinking=disable_thinking,
+            )
+            for model in models
+        ],
+    )
+
+
+def compare_frozen_judge_specs(
+    report: dict[str, Any], judge_specs: list[JudgeSpec]
+) -> dict[str, Any]:
+    """Judge frozen claims with independently configured providers and models."""
+    specs = [spec for spec in judge_specs if spec.label.strip()]
+    labels = [spec.label.strip() for spec in specs]
+    if len(specs) < 2 or len(set(labels)) != len(labels):
+        raise ValueError("At least two judges with distinct labels are required")
+
     case_judgements: dict[str, dict[str, Any]] = {}
     model_summaries = {
-        model: {
-            "requested_model": model,
+        spec.label: {
+            "judge_label": spec.label,
+            "requested_model": spec.model,
             "actual_models": set(),
             "supported_claims": 0,
             "unsupported_claims": 0,
             "judge_failures": 0,
             "total_tokens": 0,
         }
-        for model in models
+        for spec in specs
     }
     for result in report["results"]:
         case_id = result["id"]
@@ -57,21 +92,21 @@ def compare_frozen_judges(
         if result.get("status") != "answered":
             continue
         claim_count = len(result.get("claims", []))
-        for model in models:
+        for spec in specs:
             judgement = judge_frozen_claim_support(
-                llm,
+                spec.llm,
                 result,
-                model=model,
-                disable_thinking=disable_thinking,
+                model=spec.model,
+                disable_thinking=spec.disable_thinking,
             )
             supported = set(judgement.supported_claim_ids)
-            case_judgements[case_id][model] = {
+            case_judgements[case_id][spec.label] = {
                 "supported_claim_ids": list(judgement.supported_claim_ids),
                 "model": judgement.model,
                 "usage": judgement.usage,
                 "error": judgement.error,
             }
-            summary = model_summaries[model]
+            summary = model_summaries[spec.label]
             if judgement.model:
                 summary["actual_models"].add(judgement.model)
             if judgement.error:
@@ -95,14 +130,14 @@ def compare_frozen_judges(
             claim_id = f"K{index}"
             decisions: dict[str, bool | None] = {}
             actual_models: dict[str, str | None] = {}
-            for model in models:
-                model_judgement = judgements.get(model, {})
-                decisions[model] = (
+            for spec in specs:
+                model_judgement = judgements.get(spec.label, {})
+                decisions[spec.label] = (
                     claim_id in model_judgement.get("supported_claim_ids", [])
                     if not model_judgement.get("error")
                     else None
                 )
-                actual_models[model] = model_judgement.get("model")
+                actual_models[spec.label] = model_judgement.get("model")
             comparable = all(value is not None for value in decisions.values())
             decision_values = set(decisions.values())
             claim_rows.append(
@@ -137,8 +172,8 @@ def compare_frozen_judges(
         if all(value is False for value in row["decisions"].values())
     ]
     summaries = []
-    for model in models:
-        item = model_summaries[model]
+    for spec in specs:
+        item = model_summaries[spec.label]
         summaries.append(
             {
                 **item,
@@ -153,7 +188,7 @@ def compare_frozen_judges(
         )
     return {
         "source_config": report.get("config"),
-        "judge_models": models,
+        "judge_models": labels,
         "summary": {
             "cases": len(report["results"]),
             "answered_cases": sum(

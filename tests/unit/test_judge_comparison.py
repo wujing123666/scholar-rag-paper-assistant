@@ -8,6 +8,8 @@ import pytest
 
 from src.libs.llm.base_llm import ChatResponse
 from src.paper_assistant.judge_comparison import (
+    JudgeSpec,
+    compare_frozen_judge_specs,
     compare_frozen_judges,
     load_audit_labels,
     load_frozen_report,
@@ -25,6 +27,18 @@ class ModelAwareLLM:
             content=json.dumps({"support": support}),
             model=model,
             usage={"total_tokens": 10},
+        )
+
+
+class FixedJudgeLLM:
+    def __init__(self, supported):
+        self.supported = supported
+
+    def chat(self, messages, **kwargs):
+        return ChatResponse(
+            content=json.dumps({"support": self.supported}),
+            model=kwargs["model"],
+            usage={"total_tokens": 7},
         )
 
 
@@ -74,6 +88,32 @@ def test_compare_frozen_judges_finds_claim_level_disagreement():
         "judge-a": True,
         "judge-b": False,
     }
+
+
+def test_compare_frozen_judges_supports_independent_provider_clients():
+    comparison = compare_frozen_judge_specs(
+        _report(),
+        [
+            JudgeSpec(
+                label="deepseek-pro",
+                llm=FixedJudgeLLM({"K1": True, "K2": True}),
+                model="deepseek-v4-pro",
+                disable_thinking=True,
+            ),
+            JudgeSpec(
+                label="qwen-plus",
+                llm=FixedJudgeLLM({"K1": True, "K2": False}),
+                model="qwen-plus",
+            ),
+        ],
+    )
+
+    assert comparison["judge_models"] == ["deepseek-pro", "qwen-plus"]
+    assert comparison["claims"][1]["decisions"] == {
+        "deepseek-pro": True,
+        "qwen-plus": False,
+    }
+    assert comparison["summary"]["models"][1]["requested_model"] == "qwen-plus"
 
 
 def test_audit_selection_includes_disagreements_and_supported_sample(tmp_path):

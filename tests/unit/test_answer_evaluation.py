@@ -239,6 +239,33 @@ def test_unanswered_case_marks_judges_skipped_instead_of_failed():
     assert summary["claim_judge_skipped"] == 1
 
 
+def test_summary_includes_runtime_claim_verification_cost_and_retention():
+    result = build_answer_case_result(
+        _case(),
+        ("paper-a",),
+        _answer(),
+        FactJudgement(("F1",), "fact-judge", {"total_tokens": 7}),
+        ClaimSupportJudgement(("K1",), "claim-judge", {"total_tokens": 5}),
+        latency_seconds=1.0,
+    )
+    result["claim_verification"] = {
+        "status": "verified",
+        "original_claims": 2,
+        "accepted_claims": 1,
+        "judge_tokens": 13,
+    }
+
+    summary = summarize_answer_results([result])
+
+    assert summary["claim_verification_original_claims"] == 2
+    assert summary["claim_verification_accepted_claims"] == 1
+    assert summary["claim_verification_removed_claims"] == 1
+    assert summary["claim_verification_retention_rate"] == 0.5
+    assert summary["claim_verification_all_removed_cases"] == 0
+    assert summary["claim_verification_tokens"] == 13
+    assert summary["total_tokens"] == 36
+
+
 def test_loader_rejects_duplicate_ids(tmp_path):
     path = tmp_path / "cases.jsonl"
     line = json.dumps(_case(), ensure_ascii=False)

@@ -166,7 +166,17 @@ python -m src.paper_assistant --retriever hybrid --model-cache data/models/faste
 
 返回 JSON 包含 `answer`、逐条 `claims`、实际使用的 `citations`、模型名和 token 用量。没有候选论文、正文 Chunk 数量不足、LLM 调用失败或输出未通过引用校验时，系统不会拼凑答案，而是返回 `status=insufficient_evidence` 或明确的配置错误。
 
-当前约束能保证每条输出 Claim 都绑定到真实返回的 Chunk，但“该 Chunk 是否在语义上完全蕴含该 Claim”仍主要依靠生成提示。后续需要用人工标注问答集评测引用正确率和忠实度，必要时增加独立的 Claim-Evidence 判别器。
+默认模式能保证每条输出Claim绑定到真实返回的Chunk。需要更保守的实时回答时，可开启双模型Claim–Evidence门控：
+
+```powershell
+python -m src.paper_assistant --retriever hybrid --model-cache data/models/fastembed --chunk-reranker fastembed --reranker-cache data/models/fastembed answer "MapT-STC如何根据不确定性融合两路预测？" --settings config/settings.deepseek.local.yaml --verify-claims consensus --claim-judge-model deepseek-chat --claim-judge-model deepseek-v4-pro
+```
+
+程序先检查Claim、Citation ID、Chunk和来源元数据是否真实对应，再让两个模型分别判断每条Claim能否由它声明的完整引用直接推出。只有两个模型都支持的Claim才进入最终答案；不一致或共同拒绝的Claim会在原候选论文中按Claim文本补检一次，复判仍未共同通过就删除。全部Claim被删除时返回证据不足。`single`模式只使用第一个`--claim-judge-model`，`off`关闭语义门控。输出中的`claim_verification`记录原始/保留/删除数量、补检结果、实际评审模型、错误和额外token。
+
+MapT-STC真实烟雾测试中，候选答案有10条Claim；关于“卡尔曼融合泛化模型与专用模型输出”的Claim最初被Flash和Pro共同拒绝。系统在同一论文内补检到第6、14、15页的明确证据后，两模型复判均支持，最终保留10条Claim并追加对应引用；双模型检查额外使用7,922 token。该案例证明“检查→补检→复判→保留”的闭环可运行，不代表所有问题都能通过安全门控。
+
+15题开发集完整运行中，14题回答、1题因证据不足拒答，共生成169条Claim；两位评审在首轮就共同支持全部169条，因此本轮没有触发删除或补检，Claim保留率为100%。论文Top-1、候选召回和59项必备事实覆盖仍分别为100%、100%和72.88%。实时双审额外使用82,148 token，使总token从同类冻结基线的106,891增至189,721，平均延迟从约7.68秒增至10.69秒。该结果验证安全链路没有破坏本轮答案完整性，但也显示把双审设为每次回答的默认流程成本较高；当前保留为可选严格模式。
 
 ## 生成式问答开发集
 
@@ -218,6 +228,14 @@ python -m src.paper_assistant compare-judges --input tmp/frozen_answer_evaluatio
 ```
 
 命令会报告逐Claim判断、一致率和实际响应模型，并把全部分歧项、全部共同拒绝项及固定随机种子抽取的共同支持项写入审查Markdown。审查标签可再通过`score-judge-audit`计算各模型相对审查结果的准确率、错误放行和错误拒绝；标签文件必须记录审查者、审查类型、限制、结论与理由，避免把AI代理复核写成人类专家金标准。
+
+需要比较不同API服务商时，为每个评审准备一份本地忽略的设置文件，并使用不同标签：
+
+```powershell
+python -m src.paper_assistant compare-judges --input tmp/frozen_answer_evaluation.json --judge-config deepseek-pro=config/settings.deepseek-pro.local.yaml --judge-config qwen-plus=config/settings.qwen.local.yaml --output tmp/cross_vendor_judge_comparison.json --audit-output tmp/cross_vendor_claim_audit.md --agreement-sample 20 --seed 20260927
+```
+
+`--judge-config`读取各自配置中的provider、model、API Key和base URL；私有设置文件由`config/settings.*.local.yaml`忽略。一次DeepSeek V4 Pro与Qwen Plus的真实冻结复判中，170条Claim全部成功判分，169条一致、1条分歧，一致率99.41%。唯一分歧项的引用原文直接描述了“保留部分观测项作为目标、其余作为输入并训练模型重构目标”，Codex代理核验标记为有证据支持，因此这一次是Qwen误拒。该核验仅覆盖模型分歧触发的1条，不是随机样本，也不是人类金标准。
 
 一次冻结运行得到14个回答和170条Claim。Flash与Pro对167条判断一致，对3条存在分歧，一致率98.24%；Flash支持167条，Pro支持170条。Codex随后核验全部3条分歧项和随机抽取的20条共同支持项：23条中22条有直接证据、1条引用不足。在这组有意偏向风险项的审查样本上，Flash与审查结果一致21/23，包含2次错误拒绝和0次错误放行；Pro一致22/23，包含0次错误拒绝和1次错误放行。该样本不是随机无偏的人类标注集，因此这些比例用于定位评审差异，不能宣称为模型总体准确率。
 
