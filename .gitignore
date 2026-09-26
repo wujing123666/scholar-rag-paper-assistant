@@ -100,6 +100,7 @@ data/papers/*
 !data/papers/paper_catalog.csv
 !data/papers/eval_queries.jsonl
 !data/papers/chunk_eval_queries.jsonl
+!data/papers/answer_eval_queries.jsonl
 !data/papers/inbox/
 cache/
 logs/
