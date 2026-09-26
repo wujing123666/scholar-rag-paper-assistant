@@ -195,9 +195,11 @@ python -m src.paper_assistant --retriever hybrid --model-cache data/models/faste
 python -m src.paper_assistant --retriever hybrid --model-cache data/models/fastembed --chunk-reranker fastembed --reranker-cache data/models/fastembed evaluate-answers --settings config/settings.deepseek.local.yaml --output tmp/answer_evaluation_deepseek.json
 ```
 
-评测器每完成一题就原子写入本地报告，可在相同命令末尾增加 `--resume` 从已有结果继续。报告包含论文 Top-1 正确率、候选论文召回率、回答成功率、必备事实覆盖率、标注页对齐率、延迟和 token 用量。必备事实覆盖率由同一 LLM 的独立严格判分调用给出，属于模型评审指标；标注页对齐率只衡量引用是否落在人工登记页，不能代替 Claim 与 Chunk 的语义蕴含检查。完整回答和评测报告默认写入被 Git 忽略的 `tmp/`。
+评测器每完成一题就原子写入本地报告，可在相同命令末尾增加 `--resume` 从已有结果继续。报告包含论文 Top-1 正确率、候选论文召回率、回答成功率、必备事实覆盖率、标注页对齐率、Claim 语义支撑率、延迟和 token 用量。生成完成后会有两次独立判分：一次检查答案是否覆盖必备事实；另一次把每条 Claim 与它实际引用的完整 Chunk 对照，只有全部实质性内容能由引用直接推出才算支撑。页码对齐率只衡量引用是否落在人工登记页，Claim 支撑率才衡量引用内容是否支持结论。两个指标均由同一 LLM 严格判分，仍存在模型偏差，不能替代人工抽检。完整回答、逐 Claim 结果和评测报告默认写入被 Git 忽略的 `tmp/`。
 
 当前 15 条开发题使用 Hybrid 路由、BGE 重排、7 个证据块和 16000 字上下文的结果为：15/15 成功回答，论文 Top-1 与候选召回均为 100%，59 个必备事实覆盖 43 个（72.88%），标注页召回 85.29%，平均延迟 5.43 秒。改造前同集事实覆盖为 62.71%、标注页召回为 55.88%。这是一组系统看过语料后构造的开发集结果，不能当作用户盲测准确率。
+
+加入 Claim-Evidence 判分后的一次独立运行中，14/15 题成功回答，成功答案共有 168 条 Claim，其中 167 条被其引用原文直接支撑，Claim 支撑率为 99.40%；13/14 个成功答案的全部 Claim 均获支撑。唯一未支撑项来自 CoFILL 的 Q/K/V 关系，另有一题由生成模型主动返回证据不足。该次判分额外使用 39,252 token；高支撑率来自带强引用约束的生成协议和同一模型评审，仍需用异构模型或人工抽检验证。
 
 ## 评测正文证据检索
 

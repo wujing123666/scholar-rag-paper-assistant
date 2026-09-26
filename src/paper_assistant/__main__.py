@@ -444,8 +444,10 @@ def main() -> int:
             from src.core.settings import load_settings
             from src.libs.llm import LLMFactory
             from src.paper_assistant.answer_evaluation import (
+                ClaimSupportJudgement,
                 FactJudgement,
                 build_answer_case_result,
+                judge_claim_support,
                 judge_required_facts,
                 load_answer_evaluation_cases,
                 summarize_answer_results,
@@ -471,6 +473,7 @@ def main() -> int:
                 "candidate_papers": args.candidate_papers,
                 "top_k": args.top_k,
                 "queries": str(args.queries),
+                "claim_support_judge": True,
             }
             completed: dict[str, dict[str, object]] = {}
             if args.resume and args.output.exists():
@@ -558,11 +561,19 @@ def main() -> int:
                     if answer.status == "answered"
                     else FactJudgement((), None, None, "answer_not_generated")
                 )
+                claim_judgement = (
+                    judge_claim_support(llm, answer, matches)
+                    if answer.status == "answered"
+                    else ClaimSupportJudgement(
+                        (), None, None, "answer_not_generated"
+                    )
+                )
                 result = build_answer_case_result(
                     case,
                     candidate_ids,
                     answer,
                     judgement,
+                    claim_judgement,
                     latency_seconds=time.perf_counter() - started,
                     reranker_fallback=reranker_fallback,
                 )
