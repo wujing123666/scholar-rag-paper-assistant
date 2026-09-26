@@ -11,7 +11,9 @@ from src.paper_assistant.answer_evaluation import (
     ClaimSupportJudgement,
     FactJudgement,
     build_answer_case_result,
+    freeze_cited_evidence,
     judge_claim_support,
+    judge_frozen_claim_support,
     judge_required_facts,
     load_answer_evaluation_cases,
     summarize_answer_results,
@@ -157,6 +159,30 @@ def test_claim_judge_rejects_missing_chunk_and_invalid_ids():
 
     assert missing.error == "claim_judge_missing_chunk"
     assert invalid.error == "claim_judge_failed"
+
+
+def test_frozen_evidence_can_be_rejudged_without_retrieval():
+    frozen = freeze_cited_evidence(_answer(), [_evidence_result()])
+    result = {
+        "claims": [{"text": "答案", "citations": ["C1"]}],
+        "evidence": frozen,
+    }
+
+    judgement = judge_frozen_claim_support(
+        FakeLLM({"support": {"K1": True}}), result, model="second-judge"
+    )
+
+    assert frozen[0]["text"] == "支持答案的完整证据"
+    assert judgement.supported_claim_ids == ("K1",)
+
+
+def test_frozen_rejudge_rejects_missing_full_evidence():
+    judgement = judge_frozen_claim_support(
+        FakeLLM({"support": {"K1": True}}),
+        {"claims": [{"text": "答案", "citations": ["C1"]}], "evidence": []},
+    )
+
+    assert judgement.error == "frozen_evidence_missing"
 
 
 def test_case_and_summary_metrics_are_computed():

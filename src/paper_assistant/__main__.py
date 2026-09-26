@@ -215,7 +215,99 @@ def main() -> int:
     answer_evaluate_parser.add_argument("--limit", type=int)
     answer_evaluate_parser.add_argument("--resume", action="store_true")
 
+    compare_judges_parser = subparsers.add_parser(
+        "compare-judges",
+        help="Replay multiple judges over identical frozen answers and evidence",
+    )
+    compare_judges_parser.add_argument("--input", type=Path, required=True)
+    compare_judges_parser.add_argument(
+        "--settings", type=Path, default=Path("config/settings.yaml")
+    )
+    compare_judges_parser.add_argument(
+        "--judge-model",
+        action="append",
+        required=True,
+        help="Judge model to run; provide this option at least twice",
+    )
+    compare_judges_parser.add_argument(
+        "--output", type=Path, default=Path("tmp/judge_comparison.json")
+    )
+    compare_judges_parser.add_argument(
+        "--audit-output", type=Path, default=Path("tmp/claim_audit.md")
+    )
+    compare_judges_parser.add_argument("--agreement-sample", type=int, default=20)
+    compare_judges_parser.add_argument("--seed", type=int, default=20260926)
+
+    score_audit_parser = subparsers.add_parser(
+        "score-judge-audit",
+        help="Score frozen-answer judges against attributed audit labels",
+    )
+    score_audit_parser.add_argument("--comparison", type=Path, required=True)
+    score_audit_parser.add_argument("--labels", type=Path, required=True)
+    score_audit_parser.add_argument(
+        "--output", type=Path, default=Path("tmp/judge_audit_score.json")
+    )
+
     args = parser.parse_args()
+    if args.command == "score-judge-audit":
+        from src.paper_assistant.judge_comparison import (
+            load_audit_labels,
+            score_audit_labels,
+            write_comparison,
+        )
+
+        comparison = json.loads(args.comparison.read_text(encoding="utf-8"))
+        score = score_audit_labels(comparison, load_audit_labels(args.labels))
+        write_comparison(args.output, score)
+        print(
+            json.dumps(
+                {"output": str(args.output), **score["summary"]},
+                ensure_ascii=False,
+                indent=2,
+            )
+        )
+        return 0
+    if args.command == "compare-judges":
+        from src.core.settings import load_settings
+        from src.libs.llm import LLMFactory
+        from src.paper_assistant.judge_comparison import (
+            compare_frozen_judges,
+            load_frozen_report,
+            select_audit_claims,
+            write_audit_markdown,
+            write_comparison,
+        )
+
+        if args.agreement_sample < 0:
+            parser.error("--agreement-sample cannot be negative")
+        settings = load_settings(args.settings)
+        report = load_frozen_report(args.input)
+        comparison = compare_frozen_judges(
+            LLMFactory.create(settings),
+            report,
+            args.judge_model,
+            disable_thinking=settings.llm.provider == "deepseek",
+        )
+        audit_claims = select_audit_claims(
+            comparison,
+            agreement_sample=args.agreement_sample,
+            seed=args.seed,
+        )
+        write_comparison(args.output, comparison)
+        write_audit_markdown(args.audit_output, audit_claims)
+        print(
+            json.dumps(
+                {
+                    "output": str(args.output),
+                    "audit_output": str(args.audit_output),
+                    "audit_claims": len(audit_claims),
+                    **comparison["summary"],
+                },
+                ensure_ascii=False,
+                indent=2,
+            )
+        )
+        return 0
     if args.command == "inventory":
         report = build_paper_inventory(args.inbox, args.catalog)
         if args.output:
@@ -482,6 +574,7 @@ def main() -> int:
                 "top_k": args.top_k,
                 "queries": str(args.queries),
                 "claim_support_judge": True,
+                "frozen_evidence_schema": 1,
                 "judge_model": args.judge_model,
                 "judge_thinking": (
                     "disabled" if disable_judge_thinking else None
@@ -600,6 +693,7 @@ def main() -> int:
                     claim_judgement,
                     latency_seconds=time.perf_counter() - started,
                     reranker_fallback=reranker_fallback,
+                    evidence_results=matches,
                 )
                 results.append(result)
                 report = {
