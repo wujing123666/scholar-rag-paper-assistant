@@ -171,6 +171,19 @@ def main() -> int:
     )
     answer_parser.add_argument("--max-context-chars", type=int, default=16000)
     answer_parser.add_argument("--min-evidence-chunks", type=int, default=1)
+    answer_parser.add_argument(
+        "--verify-claims",
+        choices=("off", "single", "consensus"),
+        default="off",
+        help="Filter claims with no judge, one judge, or multi-model consensus",
+    )
+    answer_parser.add_argument(
+        "--claim-judge-model",
+        action="append",
+        default=[],
+        help="Model used by runtime claim verification; repeat for consensus mode",
+    )
+    answer_parser.add_argument("--claim-retry-k", type=int, default=3)
 
     chunk_evaluate_parser = subparsers.add_parser(
         "evaluate-chunks", help="Evaluate page-level evidence retrieval"
@@ -210,6 +223,15 @@ def main() -> int:
     answer_evaluate_parser.add_argument("--max-context-chars", type=int, default=16000)
     answer_evaluate_parser.add_argument("--min-evidence-chunks", type=int, default=1)
     answer_evaluate_parser.add_argument(
+        "--verify-claims",
+        choices=("off", "single", "consensus"),
+        default="off",
+    )
+    answer_evaluate_parser.add_argument(
+        "--claim-judge-model", action="append", default=[]
+    )
+    answer_evaluate_parser.add_argument("--claim-retry-k", type=int, default=3)
+    answer_evaluate_parser.add_argument(
         "--output", type=Path, default=Path("tmp/answer_evaluation_report.json")
     )
     answer_evaluate_parser.add_argument("--limit", type=int)
@@ -226,8 +248,17 @@ def main() -> int:
     compare_judges_parser.add_argument(
         "--judge-model",
         action="append",
-        required=True,
         help="Judge model to run; provide this option at least twice",
+    )
+    compare_judges_parser.add_argument(
+        "--judge-config",
+        action="append",
+        default=[],
+        metavar="LABEL=PATH",
+        help=(
+            "Judge backed by a separate settings file; repeat with distinct labels "
+            "for cross-provider comparison"
+        ),
     )
     compare_judges_parser.add_argument(
         "--output", type=Path, default=Path("tmp/judge_comparison.json")
@@ -271,6 +302,8 @@ def main() -> int:
         from src.core.settings import load_settings
         from src.libs.llm import LLMFactory
         from src.paper_assistant.judge_comparison import (
+            JudgeSpec,
+            compare_frozen_judge_specs,
             compare_frozen_judges,
             load_frozen_report,
             select_audit_claims,
@@ -280,14 +313,42 @@ def main() -> int:
 
         if args.agreement_sample < 0:
             parser.error("--agreement-sample cannot be negative")
-        settings = load_settings(args.settings)
         report = load_frozen_report(args.input)
-        comparison = compare_frozen_judges(
-            LLMFactory.create(settings),
-            report,
-            args.judge_model,
-            disable_thinking=settings.llm.provider == "deepseek",
-        )
+        if args.judge_config and args.judge_model:
+            parser.error("use either --judge-config or --judge-model, not both")
+        if args.judge_config:
+            if len(args.judge_config) < 2:
+                parser.error("provide at least two --judge-config values")
+            judge_specs = []
+            judge_labels = set()
+            for value in args.judge_config:
+                label, separator, path_text = value.partition("=")
+                if not separator or not label.strip() or not path_text.strip():
+                    parser.error("--judge-config must use LABEL=PATH")
+                label = label.strip()
+                if label in judge_labels:
+                    parser.error("--judge-config labels must be distinct")
+                judge_labels.add(label)
+                judge_settings = load_settings(Path(path_text.strip()))
+                judge_specs.append(
+                    JudgeSpec(
+                        label=label,
+                        llm=LLMFactory.create(judge_settings),
+                        model=judge_settings.llm.model,
+                        disable_thinking=judge_settings.llm.provider == "deepseek",
+                    )
+                )
+            comparison = compare_frozen_judge_specs(report, judge_specs)
+        else:
+            if len(set(args.judge_model or [])) < 2:
+                parser.error("provide at least two distinct --judge-model values")
+            settings = load_settings(args.settings)
+            comparison = compare_frozen_judges(
+                LLMFactory.create(settings),
+                report,
+                args.judge_model or [],
+                disable_thinking=settings.llm.provider == "deepseek",
+            )
         audit_claims = select_audit_claims(
             comparison,
             agreement_sample=args.agreement_sample,
@@ -409,6 +470,8 @@ def main() -> int:
                 parser.error("--max-context-chars must be at least 1000")
             if args.min_evidence_chunks < 1:
                 parser.error("--min-evidence-chunks must be at least one")
+        if args.command in {"answer", "evaluate-answers"} and args.claim_retry_k < 1:
+            parser.error("--claim-retry-k must be at least one")
         if args.command == "evaluate-answers" and args.limit is not None and args.limit < 1:
             parser.error("--limit must be at least one")
         catalog = PaperCatalog.from_csv(args.catalog)
@@ -553,6 +616,7 @@ def main() -> int:
                 rerank_with_fallback,
                 select_rerank_candidates,
             )
+            from src.paper_assistant.claim_safety import verify_and_filter_claims
             from src.paper_assistant.grounded_answer import answer_from_evidence
 
             cases = load_answer_evaluation_cases(args.queries)
@@ -563,6 +627,21 @@ def main() -> int:
             disable_judge_thinking = bool(
                 args.judge_model and llm_settings.llm.provider == "deepseek"
             )
+            claim_judge_models = list(dict.fromkeys(args.claim_judge_model))
+            if args.verify_claims != "off" and not claim_judge_models:
+                claim_judge_models = [llm_settings.llm.model]
+                if (
+                    args.verify_claims == "consensus"
+                    and llm_settings.llm.provider == "deepseek"
+                ):
+                    claim_judge_models.append("deepseek-v4-pro")
+            if args.verify_claims == "single":
+                claim_judge_models = claim_judge_models[:1]
+            elif args.verify_claims == "consensus" and len(claim_judge_models) < 2:
+                parser.error(
+                    "consensus verification requires at least two distinct "
+                    "--claim-judge-model values"
+                )
             run_config = {
                 "paper_retriever": args.retriever,
                 "chunk_reranker": args.chunk_reranker,
@@ -575,6 +654,9 @@ def main() -> int:
                 "queries": str(args.queries),
                 "claim_support_judge": True,
                 "frozen_evidence_schema": 1,
+                "claim_verification": args.verify_claims,
+                "claim_judge_models": claim_judge_models,
+                "claim_retry_k": args.claim_retry_k,
                 "judge_model": args.judge_model,
                 "judge_thinking": (
                     "disabled" if disable_judge_thinking else None
@@ -661,6 +743,58 @@ def main() -> int:
                     max_context_chars=args.max_context_chars,
                     min_evidence_chunks=args.min_evidence_chunks,
                 )
+                verification: dict[str, object] = {"mode": args.verify_claims}
+                if args.verify_claims != "off" and answer.status == "answered":
+                    original_chunk_ids = {match.chunk_id for match in matches}
+
+                    def retrieve_evaluation_claim_evidence(
+                        claim_text: str, paper_ids: tuple[str, ...], top_k: int
+                    ) -> list:
+                        supplement = []
+                        candidate_k = max(
+                            args.rerank_candidates, top_k + len(matches)
+                        )
+                        for paper_id in paper_ids:
+                            supplement.extend(
+                                chunk_retriever.search(
+                                    claim_text,
+                                    top_k=candidate_k,
+                                    paper_ids=(paper_id,),
+                                )
+                            )
+                        supplement = [
+                            item
+                            for item in supplement
+                            if item.chunk_id not in original_chunk_ids
+                        ]
+                        supplement = apply_paper_routing_prior(supplement, paper_ids)
+                        if chunk_reranker and supplement:
+                            candidates = select_rerank_candidates(
+                                supplement, top_k=candidate_k
+                            )
+                            supplement, _ = rerank_with_fallback(
+                                chunk_reranker,
+                                claim_text,
+                                candidates,
+                                top_k=top_k,
+                            )
+                        return supplement[:top_k]
+
+                    safety = verify_and_filter_claims(
+                        llm,
+                        answer,
+                        matches,
+                        judge_models=claim_judge_models,
+                        retrieve_more=retrieve_evaluation_claim_evidence,
+                        retry_k=args.claim_retry_k,
+                        disable_thinking=llm_settings.llm.provider == "deepseek",
+                    )
+                    answer = safety.answer
+                    matches = list(safety.evidence_results)
+                    verification = {"mode": args.verify_claims, **safety.report}
+                elif args.verify_claims != "off":
+                    verification["status"] = "skipped"
+                    verification["reason"] = "answer_not_generated"
                 judgement = (
                     judge_required_facts(
                         llm,
@@ -695,6 +829,7 @@ def main() -> int:
                     reranker_fallback=reranker_fallback,
                     evidence_results=matches,
                 )
+                result["claim_verification"] = verification
                 results.append(result)
                 report = {
                     "config": run_config,
@@ -795,10 +930,12 @@ def main() -> int:
         if args.command == "answer":
             from src.core.settings import load_settings
             from src.libs.llm import LLMFactory
+            from src.paper_assistant.claim_safety import verify_and_filter_claims
             from src.paper_assistant.grounded_answer import answer_from_evidence
 
             try:
-                llm = LLMFactory.create(load_settings(args.settings))
+                settings = load_settings(args.settings)
+                llm = LLMFactory.create(settings)
                 answer = answer_from_evidence(
                     llm,
                     args.query,
@@ -806,6 +943,77 @@ def main() -> int:
                     max_context_chars=args.max_context_chars,
                     min_evidence_chunks=args.min_evidence_chunks,
                 )
+                verification: dict[str, object] = {"mode": args.verify_claims}
+                if args.verify_claims != "off" and answer.status == "answered":
+                    judge_models = list(dict.fromkeys(args.claim_judge_model))
+                    if not judge_models:
+                        judge_models = [settings.llm.model]
+                        if (
+                            args.verify_claims == "consensus"
+                            and settings.llm.provider == "deepseek"
+                        ):
+                            judge_models.append("deepseek-v4-pro")
+                    if args.verify_claims == "single":
+                        judge_models = judge_models[:1]
+                    elif len(judge_models) < 2:
+                        parser.error(
+                            "consensus verification requires at least two distinct "
+                            "--claim-judge-model values"
+                        )
+
+                    original_chunk_ids = {result.chunk_id for result in results}
+
+                    def retrieve_claim_evidence(
+                        claim_text: str, paper_ids: tuple[str, ...], top_k: int
+                    ) -> list:
+                        supplement = []
+                        candidate_k = max(args.rerank_candidates, top_k + len(results))
+                        for paper_id in paper_ids:
+                            supplement.extend(
+                                chunk_retriever.search(
+                                    claim_text,
+                                    top_k=candidate_k,
+                                    paper_ids=(paper_id,),
+                                )
+                            )
+                        supplement = [
+                            result
+                            for result in supplement
+                            if result.chunk_id not in original_chunk_ids
+                        ]
+                        supplement = apply_paper_routing_prior(supplement, paper_ids)
+                        if chunk_reranker and supplement:
+                            from src.paper_assistant.chunk_reranker import (
+                                rerank_with_fallback,
+                                select_rerank_candidates,
+                            )
+
+                            candidates = select_rerank_candidates(
+                                supplement, top_k=candidate_k
+                            )
+                            supplement, _ = rerank_with_fallback(
+                                chunk_reranker,
+                                claim_text,
+                                candidates,
+                                top_k=top_k,
+                            )
+                        return supplement[:top_k]
+
+                    safety = verify_and_filter_claims(
+                        llm,
+                        answer,
+                        results,
+                        judge_models=judge_models,
+                        retrieve_more=retrieve_claim_evidence,
+                        retry_k=args.claim_retry_k,
+                        disable_thinking=settings.llm.provider == "deepseek",
+                    )
+                    answer = safety.answer
+                    results = list(safety.evidence_results)
+                    verification = {"mode": args.verify_claims, **safety.report}
+                elif args.verify_claims != "off":
+                    verification["status"] = "skipped"
+                    verification["reason"] = "answer_not_generated"
             except (OSError, RuntimeError, ValueError):
                 print(
                     json.dumps(
@@ -824,7 +1032,11 @@ def main() -> int:
                 return 1
             print(
                 json.dumps(
-                    {**retrieval_payload, **answer.to_dict()},
+                    {
+                        **retrieval_payload,
+                        **answer.to_dict(),
+                        "claim_verification": verification,
+                    },
                     ensure_ascii=False,
                     indent=2,
                 )

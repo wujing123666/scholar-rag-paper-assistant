@@ -442,6 +442,22 @@ def summarize_answer_results(results: list[dict[str, Any]]) -> dict[str, Any]:
             int((result.get(field) or {}).get("total_tokens", 0)) for result in results
         )
 
+    verification_reports = [
+        result.get("claim_verification") or {} for result in results
+    ]
+    verified_reports = [
+        report for report in verification_reports if report.get("status") == "verified"
+    ]
+    original_verified_claims = sum(
+        int(report.get("original_claims", 0)) for report in verified_reports
+    )
+    accepted_verified_claims = sum(
+        int(report.get("accepted_claims", 0)) for report in verified_reports
+    )
+    verification_tokens = sum(
+        int(report.get("judge_tokens", 0)) for report in verified_reports
+    )
+
     return {
         "cases": count,
         "answered": len(answered),
@@ -496,9 +512,27 @@ def summarize_answer_results(results: list[dict[str, Any]]) -> dict[str, Any]:
         "generation_tokens": token_total("generation_usage"),
         "judge_tokens": token_total("judge_usage"),
         "claim_judge_tokens": token_total("claim_judge_usage"),
+        "claim_verification_original_claims": original_verified_claims,
+        "claim_verification_accepted_claims": accepted_verified_claims,
+        "claim_verification_removed_claims": (
+            original_verified_claims - accepted_verified_claims
+        ),
+        "claim_verification_retention_rate": (
+            accepted_verified_claims / original_verified_claims
+            if original_verified_claims
+            else 0.0
+        ),
+        "claim_verification_all_removed_cases": sum(
+            report.get("status") == "verified"
+            and int(report.get("original_claims", 0)) > 0
+            and int(report.get("accepted_claims", 0)) == 0
+            for report in verification_reports
+        ),
+        "claim_verification_tokens": verification_tokens,
         "total_tokens": token_total("generation_usage")
         + token_total("judge_usage")
-        + token_total("claim_judge_usage"),
+        + token_total("claim_judge_usage")
+        + verification_tokens,
     }
 
 
