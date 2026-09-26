@@ -203,6 +203,10 @@ def main() -> int:
     answer_evaluate_parser.add_argument(
         "--settings", type=Path, default=Path("config/settings.yaml")
     )
+    answer_evaluate_parser.add_argument(
+        "--judge-model",
+        help="Use a different model from the same configured provider for judging",
+    )
     answer_evaluate_parser.add_argument("--max-context-chars", type=int, default=16000)
     answer_evaluate_parser.add_argument("--min-evidence-chunks", type=int, default=1)
     answer_evaluate_parser.add_argument(
@@ -462,7 +466,11 @@ def main() -> int:
             cases = load_answer_evaluation_cases(args.queries)
             if args.limit is not None:
                 cases = cases[: args.limit]
-            llm = LLMFactory.create(load_settings(args.settings))
+            llm_settings = load_settings(args.settings)
+            llm = LLMFactory.create(llm_settings)
+            disable_judge_thinking = bool(
+                args.judge_model and llm_settings.llm.provider == "deepseek"
+            )
             run_config = {
                 "paper_retriever": args.retriever,
                 "chunk_reranker": args.chunk_reranker,
@@ -474,6 +482,10 @@ def main() -> int:
                 "top_k": args.top_k,
                 "queries": str(args.queries),
                 "claim_support_judge": True,
+                "judge_model": args.judge_model,
+                "judge_thinking": (
+                    "disabled" if disable_judge_thinking else None
+                ),
             }
             completed: dict[str, dict[str, object]] = {}
             if args.resume and args.output.exists():
@@ -557,12 +569,24 @@ def main() -> int:
                     min_evidence_chunks=args.min_evidence_chunks,
                 )
                 judgement = (
-                    judge_required_facts(llm, answer.answer, case["required_facts"])
+                    judge_required_facts(
+                        llm,
+                        answer.answer,
+                        case["required_facts"],
+                        model=args.judge_model,
+                        disable_thinking=disable_judge_thinking,
+                    )
                     if answer.status == "answered"
                     else FactJudgement((), None, None, "answer_not_generated")
                 )
                 claim_judgement = (
-                    judge_claim_support(llm, answer, matches)
+                    judge_claim_support(
+                        llm,
+                        answer,
+                        matches,
+                        model=args.judge_model,
+                        disable_thinking=disable_judge_thinking,
+                    )
                     if answer.status == "answered"
                     else ClaimSupportJudgement(
                         (), None, None, "answer_not_generated"

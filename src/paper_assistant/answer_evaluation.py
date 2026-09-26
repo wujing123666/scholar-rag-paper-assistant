@@ -82,7 +82,12 @@ def load_answer_evaluation_cases(path: str | Path) -> list[dict[str, Any]]:
 
 
 def judge_required_facts(
-    llm: ChatModel, answer: str, required_facts: list[str]
+    llm: ChatModel,
+    answer: str,
+    required_facts: list[str],
+    *,
+    model: str | None = None,
+    disable_thinking: bool = False,
 ) -> FactJudgement:
     """Use a strict post-hoc judge to identify facts entailed by an answer."""
     fact_map = {f"F{index}": fact for index, fact in enumerate(required_facts, start=1)}
@@ -106,7 +111,12 @@ def judge_required_facts(
         ),
     ]
     try:
-        response = llm.chat(messages, temperature=0.0)
+        chat_options: dict[str, Any] = {"temperature": 0.0}
+        if model:
+            chat_options["model"] = model
+        if disable_thinking:
+            chat_options["thinking"] = {"type": "disabled"}
+        response = llm.chat(messages, **chat_options)
         payload = _parse_json_object(response.content)
         coverage = payload.get("coverage")
         if not isinstance(coverage, dict) or set(coverage) != set(fact_map):
@@ -123,6 +133,9 @@ def judge_claim_support(
     llm: ChatModel,
     answer: GroundedAnswer,
     evidence_results: list[ChunkSearchResult],
+    *,
+    model: str | None = None,
+    disable_thinking: bool = False,
 ) -> ClaimSupportJudgement:
     """Judge whether each generated claim follows from its cited full chunks."""
     claim_map = {
@@ -178,7 +191,12 @@ def judge_claim_support(
         ),
     ]
     try:
-        response = llm.chat(messages, temperature=0.0)
+        chat_options: dict[str, Any] = {"temperature": 0.0}
+        if model:
+            chat_options["model"] = model
+        if disable_thinking:
+            chat_options["thinking"] = {"type": "disabled"}
+        response = llm.chat(messages, **chat_options)
         payload = _parse_json_object(response.content)
         support = payload.get("support")
         if not isinstance(support, dict) or set(support) != set(claim_map):
