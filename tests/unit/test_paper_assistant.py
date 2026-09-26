@@ -16,7 +16,7 @@ from src.paper_assistant.dense_retriever import PaperDenseRetriever, profile_tex
 from src.paper_assistant.evaluation import evaluate_retriever, load_evaluation_cases
 from src.paper_assistant.hybrid_retriever import PaperHybridRetriever
 from src.paper_assistant.rejection import decide_retrieval
-from src.paper_assistant.retriever import PaperBM25Retriever
+from src.paper_assistant.retriever import PaperBM25Retriever, PaperSearchResult
 
 CATALOG_FIELDS = [
     "paper_id",
@@ -437,3 +437,29 @@ def test_hybrid_retriever_requires_shared_catalog(tmp_path):
             assert "same paper catalog" in str(error)
         else:
             raise AssertionError("Expected mismatched catalogs to be rejected")
+
+
+def test_hybrid_retriever_promotes_an_explicit_paper_identifier(tmp_path):
+    catalog = PaperCatalog.from_csv(_write_catalog(tmp_path))
+
+    class StubRetriever:
+        def __init__(self, shared_catalog, paper_ids):
+            self.catalog = shared_catalog
+            self.paper_ids = paper_ids
+
+        def search(self, query, top_k=3):
+            return [
+                PaperSearchResult(catalog.get(paper_id), 1.0, ())
+                for paper_id in self.paper_ids[:top_k]
+            ]
+
+    retriever = PaperHybridRetriever(
+        catalog,
+        StubRetriever(catalog, ["recruitment", "diffusion"]),
+        StubRetriever(catalog, ["recruitment", "diffusion"]),
+    )
+
+    results = retriever.search("请解释 diffusion 如何利用拓扑", top_k=2)
+
+    assert results[0].paper.paper_id == "diffusion"
+    assert results[0].score == 2 / 61 + 1 / 61**2
