@@ -8,6 +8,7 @@
 - `paper_catalog.csv`：论文级档案，作为 Paper Profile 的人工可读输入。
 - `eval_queries.jsonl`：模糊找论文的种子评测问题。
 - `chunk_eval_queries.jsonl`：正文检索开发集，标注目标论文、相关 PDF 页码和证据词。
+- `answer_eval_queries.jsonl`：生成式问答开发集，标注参考答案、必备事实和证据页码。
 
 ## 当前语料概况
 
@@ -134,7 +135,7 @@ python -m src.paper_assistant --model-cache data/models/fastembed search-chunks 
 
 每篇逻辑论文当前只选择第一个实际存在的登记 PDF 建立正文索引，避免同一论文的多个修订版本重复召回。首次运行会构建全部正文向量；后续运行根据 PDF 哈希、分块参数、分块规则版本和 Embedding 模型复用未变化的块。本地实测 10 篇论文得到 506 个正文块，第二个进程全部复用。
 
-当前命令返回可供生成模型使用的证据上下文，包括论文标题、PDF、页码、章节、原文和检索分数。基于这些证据生成中文答案并逐条绑定引用仍是下一阶段，当前不会把检索到的正文误称为已经完成的生成式回答。
+`search-chunks` 只返回可供生成模型使用的证据上下文，包括论文标题、PDF、页码、章节、原文和检索分数。需要生成中文答案并逐条绑定引用时，使用下文的 `answer` 命令。
 
 需要改善前几条证据的顺序时，可以显式启用本地 ONNX Cross-Encoder：
 
@@ -164,6 +165,27 @@ python -m src.paper_assistant --retriever hybrid --model-cache data/models/faste
 返回 JSON 包含 `answer`、逐条 `claims`、实际使用的 `citations`、模型名和 token 用量。没有候选论文、正文 Chunk 数量不足、LLM 调用失败或输出未通过引用校验时，系统不会拼凑答案，而是返回 `status=insufficient_evidence` 或明确的配置错误。
 
 当前约束能保证每条输出 Claim 都绑定到真实返回的 Chunk，但“该 Chunk 是否在语义上完全蕴含该 Claim”仍主要依靠生成提示。后续需要用人工标注问答集评测引用正确率和忠实度，必要时增加独立的 Claim-Evidence 判别器。
+
+## 生成式问答开发集
+
+`answer_eval_queries.jsonl` 当前包含 15 条可回答问题，覆盖全部 10 篇逻辑论文，其中 10 条用于检查各论文的核心方法，5 条进一步检查容易混淆的方法细节。每行是一条独立 JSON：
+
+```json
+{"id":"rdpi_answer_01","question":"RDPI为什么把初始确定性插补与真实缺失值之间的残差作为扩散目标？","expected_paper_id":"rdpi_2025","relevant_pages":[1,3,4],"reference_answer":"……","required_facts":["……"],"split":"dev","source":"system_labeled_from_pdf","reviewed_by_user":false}
+```
+
+字段含义：
+
+- `question`：交给 RAG 系统回答的自然语言问题。
+- `expected_paper_id`：应当提供答案证据的论文；用于检查论文路由是否正确。
+- `relevant_pages`：人工从本地 PDF 核对过的相关 PDF 页码；页码从 1 开始。
+- `reference_answer`：严格依据这些页面写成的参考答案，用于人工评审和后续答案相似度评测。
+- `required_facts`：合格答案至少应覆盖的原子事实，可用于计算事实覆盖率。
+- `split=dev`：允许在开发时反复运行和分析，不能作为最终未见测试集报告。
+- `source=system_labeled_from_pdf`：问题和答案由系统根据 PDF 构造，并非作者发布的数据集，也不是用户亲自撰写的盲测题。
+- `reviewed_by_user=false`：用户尚未逐条确认；确认后才能改成 `true`。
+
+这 15 条数据适合评估论文路由、正文召回、回答完整度和引用页码是否正确。它们不适合单独证明系统对真实用户问题的泛化能力，因为编写时已经看过论文和当前检索结构。最终简历指标应另留一批不参与调参的本人盲测问题，并补充库外问题来评估拒答能力。
 
 ## 评测正文证据检索
 
