@@ -195,11 +195,21 @@ python -m src.paper_assistant --retriever hybrid --model-cache data/models/faste
 python -m src.paper_assistant --retriever hybrid --model-cache data/models/fastembed --chunk-reranker fastembed --reranker-cache data/models/fastembed evaluate-answers --settings config/settings.deepseek.local.yaml --output tmp/answer_evaluation_deepseek.json
 ```
 
+使用同一个 DeepSeek API 配置、但让另一个模型独立评审：
+
+```powershell
+python -m src.paper_assistant --retriever hybrid --model-cache data/models/fastembed --chunk-reranker fastembed --reranker-cache data/models/fastembed evaluate-answers --settings config/settings.deepseek.local.yaml --judge-model deepseek-v4-pro --output tmp/answer_evaluation_cross_model.json
+```
+
+此时生成仍使用私有配置中的模型（当前请求别名为`deepseek-chat`，接口实际返回`deepseek-flash`），事实覆盖和Claim支撑均由`deepseek-v4-pro`判定。DeepSeek V4模型默认开启高强度思考；程序对结构化评审调用明确传入`thinking.type=disabled`，避免长推理内容增加延迟或破坏JSON协议。API Key和Base URL继续复用同一份被Git忽略的私有配置。
+
 评测器每完成一题就原子写入本地报告，可在相同命令末尾增加 `--resume` 从已有结果继续。报告包含论文 Top-1 正确率、候选论文召回率、回答成功率、必备事实覆盖率、标注页对齐率、Claim 语义支撑率、延迟和 token 用量。生成完成后会有两次独立判分：一次检查答案是否覆盖必备事实；另一次把每条 Claim 与它实际引用的完整 Chunk 对照，只有全部实质性内容能由引用直接推出才算支撑。页码对齐率只衡量引用是否落在人工登记页，Claim 支撑率才衡量引用内容是否支持结论。两个指标均由同一 LLM 严格判分，仍存在模型偏差，不能替代人工抽检。完整回答、逐 Claim 结果和评测报告默认写入被 Git 忽略的 `tmp/`。
 
 当前 15 条开发题使用 Hybrid 路由、BGE 重排、7 个证据块和 16000 字上下文的结果为：15/15 成功回答，论文 Top-1 与候选召回均为 100%，59 个必备事实覆盖 43 个（72.88%），标注页召回 85.29%，平均延迟 5.43 秒。改造前同集事实覆盖为 62.71%、标注页召回为 55.88%。这是一组系统看过语料后构造的开发集结果，不能当作用户盲测准确率。
 
 加入 Claim-Evidence 判分后的一次独立运行中，14/15 题成功回答，成功答案共有 168 条 Claim，其中 167 条被其引用原文直接支撑，Claim 支撑率为 99.40%；13/14 个成功答案的全部 Claim 均获支撑。唯一未支撑项来自 CoFILL 的 Q/K/V 关系，另有一题由生成模型主动返回证据不足。该次判分额外使用 39,252 token；高支撑率来自带强引用约束的生成协议和同一模型评审，仍需用异构模型或人工抽检验证。
+
+改用`deepseek-v4-pro`作为不同模型评审的一次运行中，14/15题成功回答，59个必备事实覆盖43个（72.88%）；175条Claim全部被Pro判为有证据支撑，判分失败0次、拒答后跳过1次，平均总延迟7.65秒。Pro与Flash虽是不同模型，但仍属于同一DeepSeek模型家族，因此100%只能作为交叉模型开发指标，不能替代人工抽检或不同供应商评审。
 
 ## 评测正文证据检索
 

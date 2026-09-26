@@ -28,8 +28,10 @@ from src.paper_assistant.grounded_answer import (
 class FakeLLM:
     def __init__(self, payload):
         self.payload = payload
+        self.last_kwargs = None
 
     def chat(self, messages, **kwargs):
+        self.last_kwargs = kwargs
         return ChatResponse(
             content=json.dumps(self.payload),
             model="judge",
@@ -108,12 +110,41 @@ def test_fact_judge_accepts_only_known_fact_ids():
 
 
 def test_claim_judge_checks_every_claim_against_full_cited_chunk():
+    llm = FakeLLM({"support": {"K1": True}})
     judgement = judge_claim_support(
-        FakeLLM({"support": {"K1": True}}), _answer(), [_evidence_result()]
+        llm,
+        _answer(),
+        [_evidence_result()],
+        model="deepseek-v4-pro",
+        disable_thinking=True,
     )
 
     assert judgement.supported_claim_ids == ("K1",)
     assert judgement.usage == {"total_tokens": 7}
+    assert llm.last_kwargs == {
+        "temperature": 0.0,
+        "model": "deepseek-v4-pro",
+        "thinking": {"type": "disabled"},
+    }
+
+
+def test_fact_judge_can_override_the_generation_model():
+    llm = FakeLLM({"coverage": {"F1": True}})
+
+    judgement = judge_required_facts(
+        llm,
+        "答案",
+        ["事实"],
+        model="deepseek-v4-pro",
+        disable_thinking=True,
+    )
+
+    assert judgement.covered_fact_ids == ("F1",)
+    assert llm.last_kwargs == {
+        "temperature": 0.0,
+        "model": "deepseek-v4-pro",
+        "thinking": {"type": "disabled"},
+    }
 
 
 def test_claim_judge_rejects_missing_chunk_and_invalid_ids():

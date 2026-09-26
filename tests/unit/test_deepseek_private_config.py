@@ -3,8 +3,9 @@
 from __future__ import annotations
 
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
+from src.libs.llm.base_llm import Message
 from src.libs.llm.deepseek_llm import DeepSeekLLM
 
 
@@ -49,3 +50,25 @@ def test_environment_remains_a_fallback():
 
     assert llm.api_key == "env-key"
     assert llm.base_url == DeepSeekLLM.DEFAULT_BASE_URL
+
+
+def test_chat_forwards_thinking_mode_to_api_payload():
+    llm = DeepSeekLLM(_settings(api_key="settings-key"))
+    api_response = MagicMock()
+    api_response.status_code = 200
+    api_response.json.return_value = {
+        "choices": [{"message": {"content": "ok"}}],
+        "model": "deepseek-v4-pro",
+    }
+    with patch("httpx.Client") as client:
+        client.return_value.__enter__.return_value.post.return_value = api_response
+        response = llm.chat(
+            [Message(role="user", content="judge")],
+            model="deepseek-v4-pro",
+            thinking={"type": "disabled"},
+        )
+
+    assert response.model == "deepseek-v4-pro"
+    payload = client.return_value.__enter__.return_value.post.call_args.kwargs["json"]
+    assert payload["model"] == "deepseek-v4-pro"
+    assert payload["thinking"] == {"type": "disabled"}

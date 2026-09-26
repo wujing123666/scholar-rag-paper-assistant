@@ -110,6 +110,7 @@ class DeepSeekLLM(BaseLLM):
         temperature = kwargs.get("temperature", self.default_temperature)
         max_tokens = kwargs.get("max_tokens", self.default_max_tokens)
         model = kwargs.get("model", self.model)
+        thinking = kwargs.get("thinking")
         
         # Convert messages to API format
         api_messages = [{"role": m.role, "content": m.content} for m in messages]
@@ -121,6 +122,7 @@ class DeepSeekLLM(BaseLLM):
                 model=model,
                 temperature=temperature,
                 max_tokens=max_tokens,
+                thinking=thinking,
             )
             
             # Parse response
@@ -150,6 +152,7 @@ class DeepSeekLLM(BaseLLM):
         model: str,
         temperature: float,
         max_tokens: int,
+        thinking: Optional[Dict[str, str]] = None,
     ) -> Dict[str, Any]:
         """Make the actual API call to DeepSeek.
         
@@ -180,6 +183,8 @@ class DeepSeekLLM(BaseLLM):
             "temperature": temperature,
             "max_tokens": max_tokens,
         }
+        if thinking is not None:
+            payload["thinking"] = thinking
         
         try:
             with httpx.Client(timeout=60.0) as client:
