@@ -97,6 +97,23 @@ def _add_resilience_arguments(command_parser: argparse.ArgumentParser) -> None:
         default="strict",
         help="Refuse or return citations only when the claim judge is unavailable",
     )
+    command_parser.add_argument(
+        "--claim-second-judge-policy",
+        choices=("all", "risk_based"),
+        default="all",
+        help="Send every claim or only deterministic high-risk claims to later judges",
+    )
+    command_parser.add_argument(
+        "--claim-cache",
+        type=Path,
+        default=Path("data/cache/claim_judgements.sqlite3"),
+        help="Content-addressed SQLite cache for successful claim verdicts",
+    )
+    command_parser.add_argument(
+        "--disable-claim-cache",
+        action="store_true",
+        help="Call claim judges even when an identical cached verdict exists",
+    )
 
 
 def _build_retriever(
@@ -727,6 +744,10 @@ def main() -> int:
                 rerank_with_fallback,
                 select_rerank_candidates,
             )
+            from src.paper_assistant.claim_judgement_cache import (
+                CLAIM_JUDGE_PROMPT_VERSION,
+                open_claim_judgement_cache,
+            )
             from src.paper_assistant.claim_safety import verify_and_filter_claims
             from src.paper_assistant.grounded_answer import answer_from_evidence
 
@@ -760,6 +781,12 @@ def main() -> int:
                     "consensus verification requires at least two distinct "
                     "--claim-judge-model values"
                 )
+            claim_cache = None
+            claim_cache_fallback = None
+            if args.verify_claims != "off" and not args.disable_claim_cache:
+                claim_cache, claim_cache_fallback = open_claim_judgement_cache(
+                    args.claim_cache
+                )
             run_config = {
                 "paper_retriever": args.retriever,
                 "chunk_reranker": args.chunk_reranker,
@@ -775,6 +802,10 @@ def main() -> int:
                 "claim_verification": args.verify_claims,
                 "claim_judge_models": claim_judge_models,
                 "claim_retry_k": args.claim_retry_k,
+                "claim_second_judge_policy": args.claim_second_judge_policy,
+                "claim_cache_enabled": claim_cache is not None,
+                "claim_cache_fallback": claim_cache_fallback,
+                "claim_cache_prompt_version": CLAIM_JUDGE_PROMPT_VERSION,
                 "verification_failure_policy": args.verification_failure_policy,
                 "fallback_provider": fallback_provider,
                 "fallback_model": fallback_model,
@@ -919,10 +950,19 @@ def main() -> int:
                         retry_k=args.claim_retry_k,
                         disable_thinking=llm_settings.llm.provider == "deepseek",
                         failure_policy=args.verification_failure_policy,
+                        cache=claim_cache,
+                        cache_namespace=(
+                            f"{llm_settings.llm.provider}|"
+                            f"{llm_settings.llm.base_url or ''}"
+                        ),
+                        second_judge_policy=args.claim_second_judge_policy,
                     )
                     answer = safety.answer
                     matches = list(safety.evidence_results)
                     verification = {"mode": args.verify_claims, **safety.report}
+                    verification["cache_initialization_fallback"] = (
+                        claim_cache_fallback
+                    )
                 elif args.verify_claims != "off":
                     verification["status"] = "skipped"
                     verification["reason"] = "answer_not_generated"
@@ -1061,6 +1101,9 @@ def main() -> int:
             "index_sync": asdict(index_sync),
         }
         if args.command == "answer":
+            from src.paper_assistant.claim_judgement_cache import (
+                open_claim_judgement_cache,
+            )
             from src.paper_assistant.claim_safety import verify_and_filter_claims
             from src.paper_assistant.grounded_answer import answer_from_evidence
 
@@ -1091,6 +1134,12 @@ def main() -> int:
                         parser.error(
                             "consensus verification requires at least two distinct "
                             "--claim-judge-model values"
+                        )
+                    claim_cache = None
+                    claim_cache_fallback = None
+                    if not args.disable_claim_cache:
+                        claim_cache, claim_cache_fallback = (
+                            open_claim_judgement_cache(args.claim_cache)
                         )
 
                     original_chunk_ids = {result.chunk_id for result in results}
@@ -1140,10 +1189,19 @@ def main() -> int:
                         retry_k=args.claim_retry_k,
                         disable_thinking=settings.llm.provider == "deepseek",
                         failure_policy=args.verification_failure_policy,
+                        cache=claim_cache,
+                        cache_namespace=(
+                            f"{settings.llm.provider}|"
+                            f"{settings.llm.base_url or ''}"
+                        ),
+                        second_judge_policy=args.claim_second_judge_policy,
                     )
                     answer = safety.answer
                     results = list(safety.evidence_results)
                     verification = {"mode": args.verify_claims, **safety.report}
+                    verification["cache_initialization_fallback"] = (
+                        claim_cache_fallback
+                    )
                 elif args.verify_claims != "off":
                     verification["status"] = "skipped"
                     verification["reason"] = "answer_not_generated"

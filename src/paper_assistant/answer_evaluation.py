@@ -462,6 +462,21 @@ def summarize_answer_results(results: list[dict[str, Any]]) -> dict[str, Any]:
         report.get("status") == "verification_unavailable"
         for report in verification_reports
     )
+    verification_cache_hits = sum(
+        int(report.get("cache_hits", 0)) for report in verification_reports
+    )
+    verification_cache_misses = sum(
+        int(report.get("cache_misses", 0)) for report in verification_reports
+    )
+    verification_cache_errors = sum(
+        int(report.get("cache_errors", 0)) for report in verification_reports
+    )
+    high_risk_claims = sum(
+        int(report.get("high_risk_claims", 0)) for report in verified_reports
+    )
+    second_judge_claims = sum(
+        int(report.get("second_judge_claims", 0)) for report in verified_reports
+    )
     generation_fallbacks = sum(
         bool((result.get("service_diagnostics") or {}).get("fallback_used"))
         for result in results
@@ -542,6 +557,22 @@ def summarize_answer_results(results: list[dict[str, Any]]) -> dict[str, Any]:
         ),
         "claim_verification_unavailable_cases": verification_unavailable,
         "claim_verification_tokens": verification_tokens,
+        "claim_verification_cache_hits": verification_cache_hits,
+        "claim_verification_cache_misses": verification_cache_misses,
+        "claim_verification_cache_errors": verification_cache_errors,
+        "claim_verification_cache_hit_rate": (
+            verification_cache_hits
+            / (verification_cache_hits + verification_cache_misses)
+            if verification_cache_hits + verification_cache_misses
+            else 0.0
+        ),
+        "claim_verification_high_risk_claims": high_risk_claims,
+        "claim_verification_second_judge_claims": second_judge_claims,
+        "claim_verification_second_judge_rate": (
+            second_judge_claims / original_verified_claims
+            if original_verified_claims
+            else 0.0
+        ),
         "generation_fallback_cases": generation_fallbacks,
         "paper_retriever_fallback_cases": paper_retriever_fallbacks,
         "total_tokens": token_total("generation_usage")
