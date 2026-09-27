@@ -11,11 +11,15 @@ from __future__ import annotations
 
 import streamlit as st
 
-
 # ── Page definitions ─────────────────────────────────────────────────
 
 def _page_overview() -> None:
     from src.observability.dashboard.pages.overview import render
+    render()
+
+
+def _page_paper_assistant() -> None:
+    from src.observability.dashboard.pages.paper_assistant import render
     render()
 
 
@@ -47,7 +51,8 @@ def _page_evaluation_panel() -> None:
 # ── Navigation ───────────────────────────────────────────────────────
 
 pages = [
-    st.Page(_page_overview, title="Overview", icon="📊", default=True),
+    st.Page(_page_paper_assistant, title="ScholarRAG", icon="📚", default=True),
+    st.Page(_page_overview, title="Overview", icon="📊"),
     st.Page(_page_data_browser, title="Data Browser", icon="🔍"),
     st.Page(_page_ingestion_manager, title="Ingestion Manager", icon="📥"),
     st.Page(_page_ingestion_traces, title="Ingestion Traces", icon="🔬"),

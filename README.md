@@ -48,7 +48,7 @@
 | **Ingestion Pipeline** | PDF → Markdown → Chunk → Transform → Embedding → Upsert | 全链路数据摄取，支持多模态图片描述（Image Captioning） |
 | **Hybrid Search** | Dense (向量) + Sparse (BM25) + RRF Fusion + Rerank | 粗排召回 + 精排重排的两段式检索架构 |
 | **MCP Server** | 标准 MCP 协议暴露 Tools | `query_knowledge_hub`、`list_collections`、`get_document_summary` |
-| **Dashboard** | Streamlit 六页面管理平台 | 系统总览 / 数据浏览 / Ingestion 管理 / 摄取追踪 / 查询追踪 / 评估面板 |
+| **Dashboard** | Streamlit 论文助手与管理平台 | 找论文 / 论文问答 / 系统总览 / 数据浏览 / Ingestion 管理 / 链路追踪 / 评估面板 |
 | **Evaluation** | Ragas + Custom 评估体系 | 支持 golden test set 回归测试，拒绝"凭感觉"调优 |
 | **Observability** | 全链路白盒化追踪 | Ingestion 与 Query 两条链路的每一个中间状态透明可见 |
 | **Skill 驱动全流程** | 从编写到测试、打包、配置一键完成 | auto-coder / qa-tester / package / setup 等 Skill 覆盖完整开发生命周期（笔记中每个 Skill 的使用和设计思路均有讲解，请参考配套视频） |
@@ -127,6 +127,23 @@ setup
 Agent 会自动引导你完成全部配置流程。
 
 > 💡 如果不熟悉 Skill 的使用方式，请观看配套笔记中的 **Setup Skill 使用讲解视频**。
+
+### 3. 打开 ScholarRAG 论文助手
+
+Dashboard 的默认页提供两个面向使用者的入口：
+
+- **找论文**：输入方法、任务、数据集或模糊记忆，返回候选论文及匹配分数。
+- **论文问答**：先路由到候选论文，再检索正文 Chunk，生成逐条绑定论文、页码、章节和原文片段的回答。
+
+API Key 仍保存在本地私有 YAML 中。可以通过环境变量指定配置路径，再启动现有 Streamlit 应用：
+
+```powershell
+$env:SCHOLARRAG_SETTINGS = "config/settings.primary.local.yaml"
+$env:SCHOLARRAG_FALLBACK_SETTINGS = "config/settings.fallback.local.yaml" # 可选
+streamlit run src/observability/dashboard/app.py
+```
+
+页面中的“运行配置”可以切换论文检索器、正文重排和 Claim 验证方式。论文级路由未找到可信候选时会直接拒答，此时不会初始化完整 Chunk 索引或调用 LLM。
 
 ### ScholarRAG 的运行时降级
 
