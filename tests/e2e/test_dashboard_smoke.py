@@ -17,8 +17,7 @@ Usage::
 from __future__ import annotations
 
 import logging
-from pathlib import Path
-from typing import Any, List
+from typing import Any
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -73,7 +72,7 @@ def _mock_settings() -> MagicMock:
 
 def _collect_text(at: Any) -> str:
     """Collect all rendered text from an AppTest run for assertion."""
-    parts: List[str] = []
+    parts: list[str] = []
     for attr in ("markdown", "header", "subheader", "info", "error", "title", "text", "success", "warning"):
         for el in getattr(at, attr, []):
             parts.append(str(getattr(el, "value", "")))
@@ -87,7 +86,32 @@ class TestDashboardSmoke:
     """Smoke tests: each page renders without uncaught exceptions."""
 
     # ------------------------------------------------------------------
-    # 1. Overview page
+    # 1. ScholarRAG page
+    # ------------------------------------------------------------------
+
+    @pytest.mark.e2e
+    def test_paper_assistant_page_renders(self) -> None:
+        """ScholarRAG page exposes paper search and grounded Q&A forms."""
+        from streamlit.testing.v1 import AppTest
+
+        def page_script():
+            from src.observability.dashboard.pages.paper_assistant import render
+
+            render()
+
+        at = AppTest.from_function(page_script, default_timeout=10)
+        at.run()
+
+        assert not at.exception, (
+            f"ScholarRAG page raised an exception: {at.exception}"
+        )
+        text = _collect_text(at)
+        assert "ScholarRAG" in text
+        assert len(at.tabs) == 2
+        assert len(at.text_area) == 2
+
+    # ------------------------------------------------------------------
+    # 2. Overview page
     # ------------------------------------------------------------------
 
     @pytest.mark.e2e
@@ -114,7 +138,7 @@ class TestDashboardSmoke:
         assert "overview" in text.lower() or "system" in text.lower()
 
     # ------------------------------------------------------------------
-    # 2. Data Browser page
+    # 3. Data Browser page
     # ------------------------------------------------------------------
 
     @pytest.mark.e2e
@@ -144,7 +168,7 @@ class TestDashboardSmoke:
         assert "data" in text.lower() or "browser" in text.lower() or "document" in text.lower()
 
     # ------------------------------------------------------------------
-    # 3. Ingestion Manager page
+    # 4. Ingestion Manager page
     # ------------------------------------------------------------------
 
     @pytest.mark.e2e
@@ -172,7 +196,7 @@ class TestDashboardSmoke:
         )
 
     # ------------------------------------------------------------------
-    # 4. Ingestion Traces page
+    # 5. Ingestion Traces page
     # ------------------------------------------------------------------
 
     @pytest.mark.e2e
@@ -202,7 +226,7 @@ class TestDashboardSmoke:
         assert "trace" in text.lower() or "ingestion" in text.lower()
 
     # ------------------------------------------------------------------
-    # 5. Query Traces page
+    # 6. Query Traces page
     # ------------------------------------------------------------------
 
     @pytest.mark.e2e
@@ -232,7 +256,7 @@ class TestDashboardSmoke:
         assert "query" in text.lower() or "trace" in text.lower()
 
     # ------------------------------------------------------------------
-    # 6. Evaluation Panel page
+    # 7. Evaluation Panel page
     # ------------------------------------------------------------------
 
     @pytest.mark.e2e

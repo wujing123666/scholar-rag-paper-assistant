@@ -537,9 +537,81 @@ def main() -> int:
             )
             return 1
 
+    if args.command == "answer":
+        from src.libs.llm.resilient_llm import RetryPolicy
+        from src.paper_assistant.service import (
+            PaperAssistantConfig,
+            build_paper_assistant_service,
+        )
+
+        try:
+            service = build_paper_assistant_service(
+                PaperAssistantConfig(
+                    catalog_path=args.catalog,
+                    inbox_path=args.inbox,
+                    settings_path=args.settings,
+                    fallback_settings_path=args.fallback_settings,
+                    retriever=args.retriever,
+                    embedding_model=args.model,
+                    embedding_cache=args.model_cache,
+                    chroma_mode=args.chroma_mode,
+                    chroma_path=args.chroma_path,
+                    chroma_host=args.chroma_host,
+                    chroma_port=args.chroma_port,
+                    chroma_ssl=args.chroma_ssl,
+                    chunk_reranker=args.chunk_reranker,
+                    reranker_model=args.reranker_model,
+                    reranker_cache=args.reranker_cache,
+                    rerank_candidates=args.rerank_candidates,
+                    rerank_weight=args.rerank_weight,
+                    candidate_papers=args.candidate_papers,
+                    top_k=args.top_k,
+                    chunk_size=args.chunk_size,
+                    chunk_overlap=args.chunk_overlap,
+                    min_score=args.min_score,
+                    disable_rejection=args.disable_rejection,
+                    max_context_chars=args.max_context_chars,
+                    min_evidence_chunks=args.min_evidence_chunks,
+                    verify_claims=args.verify_claims,
+                    claim_judge_models=tuple(args.claim_judge_model),
+                    claim_retry_k=args.claim_retry_k,
+                    verification_failure_policy=args.verification_failure_policy,
+                    claim_second_judge_policy=args.claim_second_judge_policy,
+                    claim_cache_path=args.claim_cache,
+                    disable_claim_cache=args.disable_claim_cache,
+                    retry_policy=RetryPolicy(
+                        max_attempts=args.llm_max_attempts,
+                        base_delay_seconds=args.llm_retry_base_seconds,
+                        max_delay_seconds=args.llm_retry_max_seconds,
+                        circuit_failure_threshold=args.llm_circuit_failures,
+                        circuit_cooldown_seconds=args.llm_circuit_cooldown_seconds,
+                    ),
+                )
+            )
+            response = service.answer_question(
+                args.query, paper_ids=tuple(args.paper_id)
+            )
+        except (OSError, RuntimeError, ValueError):
+            print(
+                json.dumps(
+                    {
+                        "query": args.query,
+                        "status": "error",
+                        "message": (
+                            "LLM 配置或服务不可用，请检查 --settings 指向的私有配置"
+                            "以及对应服务端日志。"
+                        ),
+                    },
+                    ensure_ascii=False,
+                    indent=2,
+                )
+            )
+            return 1
+        print(json.dumps(response.to_dict(), ensure_ascii=False, indent=2))
+        return 0
+
     if args.command in {
         "search-chunks",
-        "answer",
         "evaluate-chunks",
         "evaluate-answers",
     }:
@@ -555,14 +627,14 @@ def main() -> int:
             parser.error("--rerank-candidates must be at least one")
         if not 0 <= args.rerank_weight <= 1:
             parser.error("--rerank-weight must be between zero and one")
-        if args.command in {"answer", "evaluate-answers"}:
+        if args.command == "evaluate-answers":
             if args.max_context_chars < 1000:
                 parser.error("--max-context-chars must be at least 1000")
             if args.min_evidence_chunks < 1:
                 parser.error("--min-evidence-chunks must be at least one")
-        if args.command in {"answer", "evaluate-answers"} and args.claim_retry_k < 1:
+        if args.command == "evaluate-answers" and args.claim_retry_k < 1:
             parser.error("--claim-retry-k must be at least one")
-        if args.command in {"answer", "evaluate-answers"}:
+        if args.command == "evaluate-answers":
             if args.llm_max_attempts < 1:
                 parser.error("--llm-max-attempts must be at least one")
             if args.llm_retry_base_seconds < 0 or args.llm_retry_max_seconds < 0:
@@ -582,7 +654,7 @@ def main() -> int:
         needs_paper_router = args.command == "evaluate-chunks" and not args.oracle_paper
         if args.command == "evaluate-answers":
             needs_paper_router = True
-        if args.command in {"search-chunks", "answer"}:
+        if args.command == "search-chunks":
             needs_paper_router = not args.paper_id
         if needs_paper_router:
             if args.retriever == "bm25":
@@ -639,55 +711,16 @@ def main() -> int:
                 paper_router_fallback,
             )
 
-        if args.command in {"search-chunks", "answer"}:
+        if args.command == "search-chunks":
             candidate_ids = tuple(dict.fromkeys(args.paper_id))
             automatic_routing = not candidate_ids
             if automatic_routing:
-                if args.command == "answer" and not args.disable_rejection:
-                    if paper_retriever is None:
-                        candidate_ids = ()
-                    else:
-                        decision = decide_retrieval(
-                            paper_retriever,
-                            args.query,
-                            top_k=min(args.candidate_papers, len(catalog)),
-                            min_score=args.min_score,
-                        )
-                        paper_router_fallback = (
-                            paper_router_fallback or decision.fallback_reason
-                        )
-                        candidate_ids = tuple(
-                            result.paper.paper_id for result in decision.results
-                        )
-                else:
-                    candidate_ids, paper_router_fallback = resolve_candidates(
-                        args.query
-                    )
+                candidate_ids, paper_router_fallback = resolve_candidates(args.query)
         else:
             candidate_ids = ()
             automatic_routing = False
 
-        if args.command in {"search-chunks", "answer"} and not candidate_ids:
-            if args.command == "answer":
-                from src.paper_assistant.grounded_answer import REFUSAL_TEXT
-
-                print(
-                    json.dumps(
-                        {
-                            "query": args.query,
-                            "status": "insufficient_evidence",
-                            "answer": REFUSAL_TEXT,
-                            "claims": [],
-                            "citations": [],
-                            "reason": "no_candidate_papers",
-                            "candidate_papers": [],
-                            "paper_retriever_fallback": paper_router_fallback,
-                        },
-                        ensure_ascii=False,
-                        indent=2,
-                    )
-                )
-                return 0
+        if args.command == "search-chunks" and not candidate_ids:
             print(
                 json.dumps(
                     {
@@ -1100,140 +1133,6 @@ def main() -> int:
             "paper_retriever_fallback": paper_router_fallback,
             "index_sync": asdict(index_sync),
         }
-        if args.command == "answer":
-            from src.paper_assistant.claim_judgement_cache import (
-                open_claim_judgement_cache,
-            )
-            from src.paper_assistant.claim_safety import verify_and_filter_claims
-            from src.paper_assistant.grounded_answer import answer_from_evidence
-
-            try:
-                settings, generation_llm, judge_llm, _, _ = _build_resilient_llms(
-                    args.settings, args.fallback_settings, args
-                )
-                answer = answer_from_evidence(
-                    generation_llm,
-                    args.query,
-                    results,
-                    max_context_chars=args.max_context_chars,
-                    min_evidence_chunks=args.min_evidence_chunks,
-                )
-                verification: dict[str, object] = {"mode": args.verify_claims}
-                if args.verify_claims != "off" and answer.status == "answered":
-                    judge_models = list(dict.fromkeys(args.claim_judge_model))
-                    if not judge_models:
-                        judge_models = [settings.llm.model]
-                        if (
-                            args.verify_claims == "consensus"
-                            and settings.llm.provider == "deepseek"
-                        ):
-                            judge_models.append("deepseek-v4-pro")
-                    if args.verify_claims == "single":
-                        judge_models = judge_models[:1]
-                    elif len(judge_models) < 2:
-                        parser.error(
-                            "consensus verification requires at least two distinct "
-                            "--claim-judge-model values"
-                        )
-                    claim_cache = None
-                    claim_cache_fallback = None
-                    if not args.disable_claim_cache:
-                        claim_cache, claim_cache_fallback = (
-                            open_claim_judgement_cache(args.claim_cache)
-                        )
-
-                    original_chunk_ids = {result.chunk_id for result in results}
-
-                    def retrieve_claim_evidence(
-                        claim_text: str, paper_ids: tuple[str, ...], top_k: int
-                    ) -> list:
-                        supplement = []
-                        candidate_k = max(args.rerank_candidates, top_k + len(results))
-                        for paper_id in paper_ids:
-                            supplement.extend(
-                                chunk_retriever.search(
-                                    claim_text,
-                                    top_k=candidate_k,
-                                    paper_ids=(paper_id,),
-                                )
-                            )
-                        supplement = [
-                            result
-                            for result in supplement
-                            if result.chunk_id not in original_chunk_ids
-                        ]
-                        supplement = apply_paper_routing_prior(supplement, paper_ids)
-                        if chunk_reranker and supplement:
-                            from src.paper_assistant.chunk_reranker import (
-                                rerank_with_fallback,
-                                select_rerank_candidates,
-                            )
-
-                            candidates = select_rerank_candidates(
-                                supplement, top_k=candidate_k
-                            )
-                            supplement, _ = rerank_with_fallback(
-                                chunk_reranker,
-                                claim_text,
-                                candidates,
-                                top_k=top_k,
-                            )
-                        return supplement[:top_k]
-
-                    safety = verify_and_filter_claims(
-                        judge_llm,
-                        answer,
-                        results,
-                        judge_models=judge_models,
-                        retrieve_more=retrieve_claim_evidence,
-                        retry_k=args.claim_retry_k,
-                        disable_thinking=settings.llm.provider == "deepseek",
-                        failure_policy=args.verification_failure_policy,
-                        cache=claim_cache,
-                        cache_namespace=(
-                            f"{settings.llm.provider}|"
-                            f"{settings.llm.base_url or ''}"
-                        ),
-                        second_judge_policy=args.claim_second_judge_policy,
-                    )
-                    answer = safety.answer
-                    results = list(safety.evidence_results)
-                    verification = {"mode": args.verify_claims, **safety.report}
-                    verification["cache_initialization_fallback"] = (
-                        claim_cache_fallback
-                    )
-                elif args.verify_claims != "off":
-                    verification["status"] = "skipped"
-                    verification["reason"] = "answer_not_generated"
-            except (OSError, RuntimeError, ValueError):
-                print(
-                    json.dumps(
-                        {
-                            **retrieval_payload,
-                            "status": "error",
-                            "message": (
-                                "LLM 配置或服务不可用，请检查 --settings 指向的私有配置"
-                                "以及对应服务端日志。"
-                            ),
-                        },
-                        ensure_ascii=False,
-                        indent=2,
-                    )
-                )
-                return 1
-            print(
-                json.dumps(
-                    {
-                        **retrieval_payload,
-                        **answer.to_dict(),
-                        "claim_verification": verification,
-                    },
-                    ensure_ascii=False,
-                    indent=2,
-                )
-            )
-            return 0
-
         print(
             json.dumps(
                 {
