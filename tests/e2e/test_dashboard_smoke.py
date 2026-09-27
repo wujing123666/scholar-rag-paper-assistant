@@ -73,7 +73,18 @@ def _mock_settings() -> MagicMock:
 def _collect_text(at: Any) -> str:
     """Collect all rendered text from an AppTest run for assertion."""
     parts: list[str] = []
-    for attr in ("markdown", "header", "subheader", "info", "error", "title", "text", "success", "warning"):
+    for attr in (
+        "markdown",
+        "header",
+        "subheader",
+        "info",
+        "error",
+        "title",
+        "text",
+        "success",
+        "warning",
+        "caption",
+    ):
         for el in getattr(at, attr, []):
             parts.append(str(getattr(el, "value", "")))
     return "\n".join(parts)
@@ -107,6 +118,7 @@ class TestDashboardSmoke:
         )
         text = _collect_text(at)
         assert "ScholarRAG" in text
+        assert "论文问答最多 3 个并发" in text
         assert len(at.tabs) == 2
         assert len(at.text_area) == 2
 
