@@ -253,6 +253,10 @@ def test_summary_includes_runtime_claim_verification_cost_and_retention():
         "original_claims": 2,
         "accepted_claims": 1,
         "judge_tokens": 13,
+        "cache_hits": 3,
+        "cache_misses": 1,
+        "high_risk_claims": 1,
+        "second_judge_claims": 1,
     }
 
     summary = summarize_answer_results([result])
@@ -263,6 +267,11 @@ def test_summary_includes_runtime_claim_verification_cost_and_retention():
     assert summary["claim_verification_retention_rate"] == 0.5
     assert summary["claim_verification_all_removed_cases"] == 0
     assert summary["claim_verification_tokens"] == 13
+    assert summary["claim_verification_cache_hits"] == 3
+    assert summary["claim_verification_cache_errors"] == 0
+    assert summary["claim_verification_cache_hit_rate"] == 0.75
+    assert summary["claim_verification_high_risk_claims"] == 1
+    assert summary["claim_verification_second_judge_rate"] == 0.5
     assert summary["total_tokens"] == 36
 
 

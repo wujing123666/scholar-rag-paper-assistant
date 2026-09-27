@@ -4,7 +4,7 @@
 >
 > 本仓库正在将通用 RAG 框架改造成团队论文检索助手：目标支持约 20 名用户共享约 500 篇论文，并根据模糊记忆找回目标论文。当前已完成 Windows 运行兼容性修复、论文级 Paper Profile、版本去重、加权 BM25、本地中文 Dense 检索、论文向量与正文分块的 Chroma 持久化、未知论文阈值拒答、RRF 混合排序、两级“论文路由 → 页级正文检索”、多子问题证据召回、跨页面多样化、本地 ONNX Cross-Encoder 重排、逐结论绑定来源的证据问答、页码对齐、事实覆盖与 Claim-Evidence 语义支撑评测、`find_paper` MCP 工具、本地论文目录盘点、带原文证据的候选档案生成和人工确认后的受控增量入库，并建立首批 10 篇独立论文（11 个本地 PDF）、30 条已知论文种子问题、9 条开发用未知论文问题、10 条正文证据题和 15 条生成式问答题。运行时还支持 Dense/Chroma 故障退回 BM25、LLM 限次重试与熔断、生成模型跨 Provider 备用，以及 Claim 评审不可用时的严格拒答或仅返回证据模式。论文 PDF、文件哈希和本地评测报告不进入公开仓库。
 >
-> 本项目基于 [jerry-ai-dev/MODULAR-RAG-MCP-SERVER](https://github.com/jerry-ai-dev/MODULAR-RAG-MCP-SERVER) 二次开发。下一阶段将扩展个人论文库、降低严格Claim核验成本，并补充服务API、鉴权和多人部署压测。
+> 本项目基于 [jerry-ai-dev/MODULAR-RAG-MCP-SERVER](https://github.com/jerry-ai-dev/MODULAR-RAG-MCP-SERVER) 二次开发。下一阶段将扩展个人论文库，并补充服务API、鉴权、Chroma Server和多人部署压测。
 
 > 一个可插拔、可观测的模块化 RAG（检索增强生成）服务框架，通过 MCP（Model Context Protocol）协议对外暴露工具接口，支持 Copilot / Claude 等 AI 助手直接调用。同时也是一份专为**大模型相关岗位学习与面试求职**设计的实战项目与配套教学资源。
 
@@ -156,6 +156,23 @@ python -m src.paper_assistant answer "这篇论文的方法解决了什么问题
 ```
 
 重试与熔断参数可通过 `--llm-max-attempts`、`--llm-retry-base-seconds`、`--llm-retry-max-seconds`、`--llm-circuit-failures` 和 `--llm-circuit-cooldown-seconds` 调整。默认每个 Provider 最多调用 2 次；主 Provider 连续 3 次请求失败后熔断 30 秒。`evaluate-answers` 的汇总结果会额外统计生成模型降级次数、论文检索降级次数和 Claim 核验不可用次数。
+
+### Claim 评审成本优化
+
+严格共识模式默认仍让所有评审检查全部 Claim。需要降低成本时，可以启用确定性的风险分流：第一评审检查全部 Claim，后续评审只检查包含数字、比较、因果、模块输入输出关系、多引用或长复合表述的高风险 Claim。
+
+```powershell
+python -m src.paper_assistant answer "这篇论文的方法解决了什么问题？" `
+  --settings config/settings.primary.local.yaml `
+  --verify-claims consensus `
+  --claim-judge-model judge-model-a `
+  --claim-judge-model judge-model-b `
+  --claim-second-judge-policy risk_based
+```
+
+Claim 判分默认写入`data/cache/claim_judgements.sqlite3`。缓存键由规范化Claim、所引Chunk内容哈希、请求模型、模型服务来源、思考模式和评审提示版本共同生成；论文原文、Claim正文和服务地址不会写入SQLite。Chunk内容、模型、服务来源、思考模式或提示版本变化时不会复用旧结果，评审调用失败也不会写入缓存。缓存文件损坏或不可写时自动退回实时模型评审。可以用`--claim-cache`修改位置，或用`--disable-claim-cache`做无缓存对照实验。
+
+在同一批冻结的169条Claim上，规则将96条（56.80%）送入第二评审。相较全部Claim双审的82,148 token，冷缓存风险分流使用72,081 token，减少12.25%，169条Claim全部保留且没有评审失败；紧接着用完全相同输入复跑时，265个模型-Claim判分全部命中缓存，评审token为0，评审阶段耗时从37.945秒降至0.060秒。这是固定开发数据上的成本回放，不代表线上缓存命中率；生产环境仍需持续监控Claim保留率、错误放行、缓存命中率和P95延迟。
 
 ---
 

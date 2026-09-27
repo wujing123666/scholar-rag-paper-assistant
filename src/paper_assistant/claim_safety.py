@@ -2,12 +2,15 @@
 
 from __future__ import annotations
 
+import re
+import sqlite3
 from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Any
 
 from src.paper_assistant.answer_evaluation import judge_claim_support
 from src.paper_assistant.chunk_retriever import ChunkSearchResult
+from src.paper_assistant.claim_judgement_cache import ClaimJudgementCache
 from src.paper_assistant.grounded_answer import (
     REFUSAL_TEXT,
     ChatModel,
@@ -25,6 +28,58 @@ class ClaimSafetyResult:
     answer: GroundedAnswer
     report: dict[str, Any]
     evidence_results: tuple[ChunkSearchResult, ...]
+
+
+@dataclass(frozen=True)
+class ClaimRisk:
+    high_risk: bool
+    reasons: tuple[str, ...]
+
+
+@dataclass(frozen=True)
+class _JudgeBatchResult:
+    supported_claim_ids: frozenset[str]
+    actual_model: str | None
+    usage_tokens: int
+    error: str | None
+    cache_hits: int
+    cache_misses: int
+    cache_writes: int
+    cache_errors: int
+
+
+_QUANTITATIVE = re.compile(r"\d|%|％|百分之|倍|百分点")
+_COMPARATIVE = re.compile(
+    r"优于|高于|低于|多于|少于|提升|提高|降低|减少|显著|更(?:高|低|快|慢|好|差)"
+    r"|outperform|higher|lower|increase|decrease|significant",
+    re.IGNORECASE,
+)
+_CAUSAL = re.compile(
+    r"导致|因此|因而|使得|从而|原因|归因于|caus(?:e|es|ed|al)|therefore|result in",
+    re.IGNORECASE,
+)
+_RELATION = re.compile(
+    r"输入|输出|融合|初始化|依赖|驱动|传递|先.+再|由.+组成|input|output|fuse|initialize|depend",
+    re.IGNORECASE,
+)
+
+
+def assess_claim_risk(claim: GroundedClaim) -> ClaimRisk:
+    """Flag claims whose semantics make a second judge more valuable."""
+    reasons = []
+    if len(set(claim.citations)) > 1:
+        reasons.append("multiple_citations")
+    if _QUANTITATIVE.search(claim.text):
+        reasons.append("quantitative")
+    if _COMPARATIVE.search(claim.text):
+        reasons.append("comparative")
+    if _CAUSAL.search(claim.text):
+        reasons.append("causal")
+    if _RELATION.search(claim.text):
+        reasons.append("component_relation")
+    if len(claim.text) > 100:
+        reasons.append("long_claim")
+    return ClaimRisk(bool(reasons), tuple(reasons))
 
 
 def _citation_from_result(
@@ -115,6 +170,116 @@ def _validate_claim_structure(
     return valid, invalid
 
 
+def _judge_claim_pairs(
+    llm: ChatModel,
+    source: GroundedAnswer,
+    pairs: list[tuple[str, GroundedClaim]],
+    citations_by_id: dict[str, GroundedCitation],
+    evidence_by_chunk: dict[str, ChunkSearchResult],
+    *,
+    model: str,
+    cache_namespace: str,
+    disable_thinking: bool,
+    cache: ClaimJudgementCache | None,
+) -> _JudgeBatchResult:
+    cached_supported: set[str] = set()
+    cached_models: list[str] = []
+    misses: list[tuple[str, GroundedClaim, str | None]] = []
+    cache_hits = 0
+    cache_errors = 0
+    for claim_id, claim in pairs:
+        cache_key = None
+        cached = None
+        if cache is not None:
+            try:
+                cache_key = cache.build_key(
+                    claim,
+                    citations_by_id,
+                    evidence_by_chunk,
+                    requested_model=model,
+                    service_namespace=cache_namespace,
+                    disable_thinking=disable_thinking,
+                )
+                cached = cache.get(cache_key)
+            except (OSError, ValueError, sqlite3.Error):
+                cache_key = None
+                cache_errors += 1
+        if cached is None:
+            misses.append((claim_id, claim, cache_key))
+            continue
+        cache_hits += 1
+        if cached.supported:
+            cached_supported.add(claim_id)
+        if cached.actual_model:
+            cached_models.append(cached.actual_model)
+
+    if not misses:
+        return _JudgeBatchResult(
+            frozenset(cached_supported),
+            cached_models[0] if cached_models else model,
+            0,
+            None,
+            cache_hits,
+            0,
+            0,
+            cache_errors,
+        )
+
+    missing_answer = _answer_with_claims(
+        source,
+        [claim for _, claim, _ in misses],
+        citations_by_id,
+    )
+    judgement = judge_claim_support(
+        llm,
+        missing_answer,
+        list(evidence_by_chunk.values()),
+        model=model,
+        disable_thinking=disable_thinking,
+    )
+    tokens = int((judgement.usage or {}).get("total_tokens", 0))
+    if judgement.error:
+        return _JudgeBatchResult(
+            frozenset(cached_supported),
+            judgement.model,
+            tokens,
+            judgement.error,
+            cache_hits,
+            len(misses),
+            0,
+            cache_errors,
+        )
+
+    supported = set(cached_supported)
+    writes = 0
+    supported_local_ids = set(judgement.supported_claim_ids)
+    for index, (claim_id, _, cache_key) in enumerate(misses, start=1):
+        is_supported = f"K{index}" in supported_local_ids
+        if is_supported:
+            supported.add(claim_id)
+        if cache is not None and cache_key is not None:
+            try:
+                cache.put(
+                    cache_key,
+                    requested_model=model,
+                    actual_model=judgement.model,
+                    supported=is_supported,
+                )
+                writes += 1
+            except (OSError, ValueError, sqlite3.Error):
+                cache_errors += 1
+    return _JudgeBatchResult(
+        frozenset(supported),
+        judgement.model,
+        tokens,
+        None,
+        cache_hits,
+        len(misses),
+        writes,
+        cache_errors,
+    )
+
+
 def verify_and_filter_claims(
     llm: ChatModel,
     answer: GroundedAnswer,
@@ -125,6 +290,9 @@ def verify_and_filter_claims(
     retry_k: int = 3,
     disable_thinking: bool = False,
     failure_policy: str = "strict",
+    cache: ClaimJudgementCache | None = None,
+    cache_namespace: str = "default",
+    second_judge_policy: str = "all",
 ) -> ClaimSafetyResult:
     """Keep only claims supported by every judge, with one retrieval retry."""
     models = list(dict.fromkeys(model.strip() for model in judge_models if model.strip()))
@@ -134,6 +302,8 @@ def verify_and_filter_claims(
         raise ValueError("retry_k must be at least one")
     if failure_policy not in {"strict", "evidence_only"}:
         raise ValueError("failure_policy must be strict or evidence_only")
+    if second_judge_policy not in {"all", "risk_based"}:
+        raise ValueError("second_judge_policy must be all or risk_based")
     if answer.status != "answered":
         return ClaimSafetyResult(
             answer,
@@ -167,46 +337,96 @@ def verify_and_filter_claims(
                 "status": "verified",
                 "failure_policy": failure_policy,
                 "judge_models": models,
+                "second_judge_policy": second_judge_policy,
+                "high_risk_claims": 0,
+                "second_judge_claims": 0,
+                "claim_risks": {},
                 "original_claims": len(answer.claims),
                 "accepted_claims": 0,
                 "removed_claims": invalid,
                 "retrieval_retries": [],
                 "judge_runs": [],
                 "judge_tokens": 0,
+                "cache_hits": 0,
+                "cache_misses": 0,
+                "cache_writes": 0,
+                "cache_errors": 0,
             },
             tuple(evidence_by_chunk.values()),
         )
-    valid_claims = [claim for _, claim in valid_pairs]
-    valid_answer = _answer_with_claims(answer, valid_claims, citations_by_id)
-
     support_by_model: dict[str, set[str]] = {}
     judge_runs: list[dict[str, Any]] = []
     total_judge_tokens = 0
-    for model in models:
-        judgement = judge_claim_support(
-            llm,
-            valid_answer,
-            evidence_results,
-            model=model,
-            disable_thinking=disable_thinking,
+    cache_hits = 0
+    cache_misses = 0
+    cache_writes = 0
+    cache_errors = 0
+    risk_by_claim = {
+        claim_id: assess_claim_risk(claim) for claim_id, claim in valid_pairs
+    }
+    high_risk_ids = {
+        claim_id for claim_id, risk in risk_by_claim.items() if risk.high_risk
+    }
+    selected_by_model: dict[str, set[str]] = {}
+    for model_index, model in enumerate(models):
+        selected_pairs = (
+            valid_pairs
+            if model_index == 0 or second_judge_policy == "all"
+            else [pair for pair in valid_pairs if pair[0] in high_risk_ids]
         )
-        supported_original_ids = {
-            valid_pairs[index - 1][0]
-            for claim_id in judgement.supported_claim_ids
-            if claim_id.startswith("K")
-            and (index := int(claim_id[1:])) <= len(valid_pairs)
-        }
-        support_by_model[model] = supported_original_ids if not judgement.error else set()
-        tokens = int((judgement.usage or {}).get("total_tokens", 0))
-        total_judge_tokens += tokens
+        selected_by_model[model] = {claim_id for claim_id, _ in selected_pairs}
+        if not selected_pairs:
+            support_by_model[model] = set()
+            judge_runs.append(
+                {
+                    "stage": "initial",
+                    "requested_model": model,
+                    "actual_model": None,
+                    "selected_claim_ids": [],
+                    "supported_claim_ids": [],
+                    "error": None,
+                    "skipped": "no_high_risk_claims",
+                    "total_tokens": 0,
+                    "cache_hits": 0,
+                    "cache_misses": 0,
+                    "cache_writes": 0,
+                    "cache_errors": 0,
+                }
+            )
+            continue
+        judgement = _judge_claim_pairs(
+            llm,
+            answer,
+            selected_pairs,
+            citations_by_id,
+            evidence_by_chunk,
+            model=model,
+            cache_namespace=cache_namespace,
+            disable_thinking=disable_thinking,
+            cache=cache,
+        )
+        supported_original_ids = set(judgement.supported_claim_ids)
+        support_by_model[model] = (
+            supported_original_ids if not judgement.error else set()
+        )
+        total_judge_tokens += judgement.usage_tokens
+        cache_hits += judgement.cache_hits
+        cache_misses += judgement.cache_misses
+        cache_writes += judgement.cache_writes
+        cache_errors += judgement.cache_errors
         judge_runs.append(
             {
                 "stage": "initial",
                 "requested_model": model,
-                "actual_model": judgement.model,
+                "actual_model": judgement.actual_model,
+                "selected_claim_ids": sorted(selected_by_model[model]),
                 "supported_claim_ids": sorted(supported_original_ids),
                 "error": judgement.error,
-                "total_tokens": tokens,
+                "total_tokens": judgement.usage_tokens,
+                "cache_hits": judgement.cache_hits,
+                "cache_misses": judgement.cache_misses,
+                "cache_writes": judgement.cache_writes,
+                "cache_errors": judgement.cache_errors,
             }
         )
 
@@ -234,6 +454,13 @@ def verify_and_filter_claims(
                 "status": "verification_unavailable",
                 "failure_policy": failure_policy,
                 "judge_models": models,
+                "second_judge_policy": second_judge_policy,
+                "high_risk_claims": len(high_risk_ids),
+                "second_judge_claims": (
+                    len(valid_pairs)
+                    if len(models) > 1 and second_judge_policy == "all"
+                    else len(high_risk_ids) if len(models) > 1 else 0
+                ),
                 "unavailable_models": unavailable_models,
                 "original_claims": len(answer.claims),
                 "accepted_claims": 0,
@@ -241,11 +468,23 @@ def verify_and_filter_claims(
                 "retrieval_retries": [],
                 "judge_runs": judge_runs,
                 "judge_tokens": total_judge_tokens,
+                "cache_hits": cache_hits,
+                "cache_misses": cache_misses,
+                "cache_writes": cache_writes,
+                "cache_errors": cache_errors,
             },
             tuple(evidence_by_chunk.values()),
         )
 
-    accepted_ids = set.intersection(*support_by_model.values()) if support_by_model else set()
+    accepted_ids = set()
+    for claim_id, _ in valid_pairs:
+        required_models = [
+            model for model in models if claim_id in selected_by_model[model]
+        ]
+        if required_models and all(
+            claim_id in support_by_model[model] for model in required_models
+        ):
+            accepted_ids.add(claim_id)
     accepted: dict[str, GroundedClaim] = {
         claim_id: claim for claim_id, claim in valid_pairs if claim_id in accepted_ids
     }
@@ -297,30 +536,46 @@ def verify_and_filter_claims(
         retried_claim = GroundedClaim(
             claim.text, tuple(dict.fromkeys((*claim.citations, *added_ids)))
         )
-        retry_answer = _answer_with_claims(answer, [retried_claim], citations_by_id)
+        retry_risk = assess_claim_risk(retried_claim)
+        retry_required_models = [models[0]]
+        if second_judge_policy == "all" or retry_risk.high_risk:
+            retry_required_models.extend(models[1:])
         retry_supported = True
         retry_models = []
-        retry_evidence = list(evidence_by_chunk.values())
-        for model in models:
-            judgement = judge_claim_support(
+        for model in retry_required_models:
+            judgement = _judge_claim_pairs(
                 llm,
-                retry_answer,
-                retry_evidence,
+                answer,
+                [(claim_id, retried_claim)],
+                citations_by_id,
+                evidence_by_chunk,
                 model=model,
+                cache_namespace=cache_namespace,
                 disable_thinking=disable_thinking,
+                cache=cache,
             )
-            model_supported = not judgement.error and "K1" in judgement.supported_claim_ids
+            model_supported = (
+                not judgement.error
+                and claim_id in judgement.supported_claim_ids
+            )
             retry_judge_unavailable = retry_judge_unavailable or bool(judgement.error)
             retry_supported = retry_supported and model_supported
-            tokens = int((judgement.usage or {}).get("total_tokens", 0))
-            total_judge_tokens += tokens
+            total_judge_tokens += judgement.usage_tokens
+            cache_hits += judgement.cache_hits
+            cache_misses += judgement.cache_misses
+            cache_writes += judgement.cache_writes
+            cache_errors += judgement.cache_errors
             retry_models.append(
                 {
                     "requested_model": model,
-                    "actual_model": judgement.model,
+                    "actual_model": judgement.actual_model,
                     "supported": model_supported,
                     "error": judgement.error,
-                    "total_tokens": tokens,
+                    "total_tokens": judgement.usage_tokens,
+                    "cache_hits": judgement.cache_hits,
+                    "cache_misses": judgement.cache_misses,
+                    "cache_writes": judgement.cache_writes,
+                    "cache_errors": judgement.cache_errors,
                 }
             )
         if retry_supported:
@@ -331,6 +586,10 @@ def verify_and_filter_claims(
                 "attempted": True,
                 "added_citation_ids": added_ids,
                 "accepted": retry_supported,
+                "risk": {
+                    "high_risk": retry_risk.high_risk,
+                    "reasons": list(retry_risk.reasons),
+                },
                 "judges": retry_models,
             }
         )
@@ -342,6 +601,13 @@ def verify_and_filter_claims(
                 "status": "verification_unavailable",
                 "failure_policy": failure_policy,
                 "judge_models": models,
+                "second_judge_policy": second_judge_policy,
+                "high_risk_claims": len(high_risk_ids),
+                "second_judge_claims": (
+                    len(valid_pairs)
+                    if len(models) > 1 and second_judge_policy == "all"
+                    else len(high_risk_ids) if len(models) > 1 else 0
+                ),
                 "unavailable_models": sorted(
                     {
                         judge["requested_model"]
@@ -356,6 +622,10 @@ def verify_and_filter_claims(
                 "retrieval_retries": retry_records,
                 "judge_runs": judge_runs,
                 "judge_tokens": total_judge_tokens,
+                "cache_hits": cache_hits,
+                "cache_misses": cache_misses,
+                "cache_writes": cache_writes,
+                "cache_errors": cache_errors,
             },
             tuple(evidence_by_chunk.values()),
         )
@@ -391,12 +661,30 @@ def verify_and_filter_claims(
             "status": "verified",
             "failure_policy": failure_policy,
             "judge_models": models,
+            "second_judge_policy": second_judge_policy,
+            "high_risk_claims": len(high_risk_ids),
+            "second_judge_claims": (
+                len(valid_pairs)
+                if len(models) > 1 and second_judge_policy == "all"
+                else len(high_risk_ids) if len(models) > 1 else 0
+            ),
+            "claim_risks": {
+                claim_id: {
+                    "high_risk": risk.high_risk,
+                    "reasons": list(risk.reasons),
+                }
+                for claim_id, risk in risk_by_claim.items()
+            },
             "original_claims": len(answer.claims),
             "accepted_claims": len(kept_claims),
             "removed_claims": removed,
             "retrieval_retries": retry_records,
             "judge_runs": judge_runs,
             "judge_tokens": total_judge_tokens,
+            "cache_hits": cache_hits,
+            "cache_misses": cache_misses,
+            "cache_writes": cache_writes,
+            "cache_errors": cache_errors,
         },
         tuple(evidence_by_chunk.values()),
     )
