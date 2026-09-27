@@ -81,7 +81,8 @@ def test_valid_claims_are_assembled_with_verified_source_metadata():
     messages, kwargs = llm.calls[0]
     assert "EVIDENCE_JSON" in messages[1].content
     assert "全部子问题" in messages[0].content
-    assert "避免用多条 claim 重复同一概述" in messages[0].content
+    assert "最终最多输出 10 条 claims" in messages[0].content
+    assert "合并相近表述" in messages[0].content
     assert '"citation_id": "C1"' in messages[1].content
     assert kwargs["temperature"] == 0.0
 
@@ -125,6 +126,25 @@ def test_model_can_report_insufficient_evidence():
     assert answer.status == "insufficient_evidence"
     assert answer.reason == "model_reported_insufficient_evidence"
     assert answer.model == "fake-model"
+
+
+def test_claim_budget_keeps_priority_order_and_reports_truncation():
+    claims = [
+        {"text": f"优先级结论{index}", "citations": ["C1"]}
+        for index in range(1, 5)
+    ]
+
+    answer = answer_from_evidence(
+        FakeLLM({"status": "answered", "claims": claims}),
+        "问题",
+        [_result()],
+        max_claims=2,
+    )
+
+    assert [claim.text for claim in answer.claims] == ["优先级结论1", "优先级结论2"]
+    assert answer.service_diagnostics == {
+        "claim_limit": {"configured_max": 2, "generated": 4, "returned": 2}
+    }
 
 
 def test_refusal_preserves_sanitized_fallback_diagnostics():
@@ -172,6 +192,8 @@ def test_llm_failure_returns_safe_refusal_without_internal_error_text():
         ({"query": ""}, "query"),
         ({"max_context_chars": 999}, "max_context_chars"),
         ({"min_evidence_chunks": 0}, "min_evidence_chunks"),
+        ({"max_claims": 0}, "max_claims"),
+        ({"max_claims": 51}, "max_claims"),
     ],
 )
 def test_answer_validates_inputs(kwargs, message):

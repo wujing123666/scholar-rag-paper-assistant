@@ -101,8 +101,16 @@ def _build_config() -> PaperAssistantConfig:
                 "Claim验证", ("consensus", "single", "off"), index=0
             )
             second_policy = st.selectbox(
-                "第二评审策略", ("all", "risk_based"), index=0
+                "第二评审策略", ("risk_based", "all"), index=0
             )
+        max_answer_claims = st.number_input(
+            "每次回答最多Claim数",
+            min_value=1,
+            max_value=50,
+            value=10,
+            step=1,
+            help="限制细碎结论和后续评审成本；模型超出上限时只保留优先级最高的Claim。",
+        )
         if st.button("重新加载模型与索引", key="paper_assistant_reload"):
             _cached_search_service.clear()
             _cached_answer_service.clear()
@@ -114,6 +122,7 @@ def _build_config() -> PaperAssistantConfig:
         chunk_reranker=reranker,
         verify_claims=verification,
         claim_second_judge_policy=second_policy,
+        max_answer_claims=int(max_answer_claims),
     )
 
 

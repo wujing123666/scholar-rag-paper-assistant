@@ -121,6 +121,10 @@ class TestDashboardSmoke:
         assert "论文问答最多 3 个并发" in text
         assert len(at.tabs) == 2
         assert len(at.text_area) == 2
+        assert any(
+            item.label == "每次回答最多Claim数" and item.value == 10
+            for item in at.number_input
+        )
 
     # ------------------------------------------------------------------
     # 2. Overview page
