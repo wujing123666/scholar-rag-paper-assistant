@@ -86,14 +86,14 @@ python -m src.paper_assistant search "我记得它先粗补，再用扩散模型
 Dense 与 Hybrid 模式使用本地中文向量模型。首次运行前安装可选依赖：
 
 ```powershell
-pip install -e ".[local]"
+pip install -e ".[rerank]"
 ```
 
-首次运行会下载约 90 MB 的 `BAAI/bge-small-zh-v1.5` ONNX 模型，后续从本地缓存加载：
+Dense 检索统一调用 Qwen `text-embedding-v4`。请先在私有 `config/settings.qwen.local.yaml` 中配置 `embedding.api_key`，正式向量维度为 1024：
 
 ```powershell
-python -m src.paper_assistant --retriever dense --model-cache data/models/fastembed search "使用扩散模型做插补的论文" --top-k 3
-python -m src.paper_assistant --retriever hybrid --model-cache data/models/fastembed search "使用强化学习招募用户的论文" --top-k 3
+python -m src.paper_assistant --retriever dense --embedding-settings config/settings.qwen.local.yaml search "使用扩散模型做插补的论文" --top-k 3
+python -m src.paper_assistant --retriever hybrid --embedding-settings config/settings.qwen.local.yaml search "使用强化学习招募用户的论文" --top-k 3
 ```
 
 搜索默认启用未知论文拒答。不同检索器使用各自的开发阈值；返回 JSON 中的 `rejected`、`top_score` 和 `min_score` 说明本次判定。可以临时覆盖阈值或查看未经过滤的原始排序：
@@ -107,7 +107,7 @@ python -m src.paper_assistant --retriever bm25 --disable-rejection search "使�
 
 如果查询明确写出档案中的 `paper_id` 简称，例如 `TCDI`、`DEMI` 或 `MapT-STC`，Hybrid 检索会把对应论文提升到首位并越过开放集阈值。这条确定性规则用于处理用户已经记得论文简称、只是继续追问方法细节的场景。
 
-论文级 Dense 向量存储在本地 Chroma collection `paper_profiles_v1`，默认目录为 `data/db/chroma/`。每条记录对应一个 `paper_id`，并记录 Paper Profile 内容哈希、Embedding 模型名称和向量维度。首次运行会写入全部论文向量；再次启动时复用未变化的向量，只重新计算新增或修改的论文，并删除目录中已经移除的论文记录。
+论文级 Dense 向量存储在本地 Chroma collection `paper_profiles_qwen_v4`，默认目录为 `data/db/chroma/`。每条记录对应一个 `paper_id`，并记录 Paper Profile 内容哈希、Embedding 模型名称和向量维度。首次运行会写入全部论文向量；再次启动时复用未变化的向量，只重新计算新增或修改的论文，并删除目录中已经移除的论文记录。
 
 本地开发使用默认的 `PersistentClient`。代码也支持通过同一个 `ChromaStore` 接口连接服务器模式：
 
@@ -115,22 +115,22 @@ python -m src.paper_assistant --retriever bm25 --disable-rejection search "使�
 python -m src.paper_assistant --retriever dense --chroma-mode server --chroma-host localhost --chroma-port 8000 search "使用强化学习招募用户的论文"
 ```
 
-服务器模式要求 Chroma Server 已经启动。本地与服务器模式使用相同的 `paper_profiles_v1` 数据契约，Dense、Hybrid 和 MCP 检索逻辑不需要随部署方式改变。
+服务器模式要求 Chroma Server 已经启动。本地与服务器模式使用相同的 `paper_profiles_qwen_v4` 数据契约，Dense、Hybrid 和 MCP 检索逻辑不需要随部署方式改变。
 
 ## 检索论文正文块
 
-论文级索引负责从整个目录中选择候选论文；正文索引使用独立的 Chroma collection `paper_chunks_v1`，负责在候选论文中定位原文证据。每个正文块保存 `paper_id`、PDF 文件名、PDF 页码、章节、块序号、PDF 哈希和正文内容哈希。
+论文级索引负责从整个目录中选择候选论文；正文索引使用独立的 Chroma collection `paper_chunks_qwen_v4`，负责在候选论文中定位原文证据。每个正文块保存 `paper_id`、PDF 文件名、PDF 页码、章节、块序号、PDF 哈希和正文内容哈希。
 
 自动执行“论文级路由 → 正文块检索”：
 
 ```powershell
-python -m src.paper_assistant --retriever bm25 --model-cache data/models/fastembed search-chunks "哪篇论文用CORAL生成伪历史数据，并用卡尔曼滤波融合专用模型和泛化模型，它具体怎么做" --candidate-papers 3 --top-k 5
+python -m src.paper_assistant --retriever bm25 --embedding-settings config/settings.qwen.local.yaml search-chunks "哪篇论文用CORAL生成伪历史数据，并用卡尔曼滤波融合专用模型和泛化模型，它具体怎么做" --candidate-papers 3 --top-k 5
 ```
 
 已经知道目标论文时，可以限定 `paper_id`：
 
 ```powershell
-python -m src.paper_assistant --model-cache data/models/fastembed search-chunks "卡尔曼滤波如何根据不确定性融合两路预测" --paper-id mapt_stc_2026 --top-k 5
+python -m src.paper_assistant --embedding-settings config/settings.qwen.local.yaml search-chunks "卡尔曼滤波如何根据不确定性融合两路预测" --paper-id mapt_stc_2026 --top-k 5
 ```
 
 默认按页处理双栏 PDF，以 1200 个字符为目标块大小、180 个字符重叠；块不会跨越 PDF 页，因此返回页码可以直接核验。程序过滤重复页眉、页脚、低文本质量坐标轴和 References 部分，并保留最近的章节标题。中文查询中的常见科研术语会追加透明的英文别名，然后结合正文 BM25 与 Dense 得分；自动路由时再加入论文级排名先验，降低其他论文中的泛化术语块压过目标论文证据的概率。
@@ -142,7 +142,7 @@ python -m src.paper_assistant --model-cache data/models/fastembed search-chunks 
 需要改善前几条证据的顺序时，可以显式启用本地 ONNX Cross-Encoder：
 
 ```powershell
-python -m src.paper_assistant --retriever bm25 --model-cache data/models/fastembed --chunk-reranker fastembed --reranker-cache data/models/fastembed search-chunks "MapT-STC如何根据不确定性融合两路预测" --top-k 5
+python -m src.paper_assistant --retriever bm25 --embedding-settings config/settings.qwen.local.yaml --chunk-reranker fastembed --reranker-cache data/models/fastembed search-chunks "MapT-STC如何根据不确定性融合两路预测" --top-k 5
 ```
 
 默认使用 MIT 许可的 `BAAI/bge-reranker-base`，模型约 1.04 GB，第一次运行下载到本地模型缓存。重排默认关闭；开启后先完成论文路由，再用原问题和最多三个术语子查询召回正文，使用加权 RRF 融合，并从默认 14 个候选中统一重排。候选和最终证据都会限制同一论文页的重复，同时保留第一候选论文中代表不同子问题的方法或公式片段。默认融合 35% Cross-Encoder 分数与 65% 原检索分数；运行时推理失败会返回多样化后的原排序，并在 JSON 的 `reranker_fallback` 中说明原因。
@@ -161,7 +161,7 @@ Copy-Item config/settings.yaml config/settings.local.yaml
 
 ```powershell
 $env:DEEPSEEK_API_KEY = "你的密钥"
-python -m src.paper_assistant --retriever hybrid --model-cache data/models/fastembed --chunk-reranker fastembed answer "MapT-STC如何根据不确定性融合两路预测？" --settings config/settings.local.yaml
+python -m src.paper_assistant --retriever hybrid --embedding-settings config/settings.qwen.local.yaml --chunk-reranker fastembed answer "MapT-STC如何根据不确定性融合两路预测？" --settings config/settings.local.yaml
 ```
 
 返回 JSON 包含 `answer`、逐条 `claims`、实际使用的 `citations`、模型名和 token 用量。没有候选论文、正文 Chunk 数量不足、LLM 调用失败或输出未通过引用校验时，系统不会拼凑答案，而是返回 `status=insufficient_evidence` 或明确的配置错误。
@@ -169,7 +169,7 @@ python -m src.paper_assistant --retriever hybrid --model-cache data/models/faste
 默认模式能保证每条输出Claim绑定到真实返回的Chunk。需要更保守的实时回答时，可开启双模型Claim–Evidence门控：
 
 ```powershell
-python -m src.paper_assistant --retriever hybrid --model-cache data/models/fastembed --chunk-reranker fastembed --reranker-cache data/models/fastembed answer "MapT-STC如何根据不确定性融合两路预测？" --settings config/settings.deepseek.local.yaml --verify-claims consensus --claim-judge-model deepseek-chat --claim-judge-model deepseek-v4-pro
+python -m src.paper_assistant --retriever hybrid --embedding-settings config/settings.qwen.local.yaml --chunk-reranker fastembed --reranker-cache data/models/fastembed answer "MapT-STC如何根据不确定性融合两路预测？" --settings config/settings.deepseek.local.yaml --verify-claims consensus --claim-judge-model deepseek-chat --claim-judge-model deepseek-v4-pro
 ```
 
 程序先检查Claim、Citation ID、Chunk和来源元数据是否真实对应，再让两个模型分别判断每条Claim能否由它声明的完整引用直接推出。只有两个模型都支持的Claim才进入最终答案；不一致或共同拒绝的Claim会在原候选论文中按Claim文本补检一次，复判仍未共同通过就删除。全部Claim被删除时返回证据不足。`single`模式只使用第一个`--claim-judge-model`，`off`关闭语义门控。输出中的`claim_verification`记录原始/保留/删除数量、补检结果、实际评审模型、错误和额外token。
@@ -202,20 +202,20 @@ MapT-STC真实烟雾测试中，候选答案有10条Claim；关于“卡尔曼�
 使用 Hybrid 论文路由、本地 Cross-Encoder 重排和私有 DeepSeek 配置运行整套评测：
 
 ```powershell
-python -m src.paper_assistant --retriever hybrid --model-cache data/models/fastembed --chunk-reranker fastembed --reranker-cache data/models/fastembed evaluate-answers --settings config/settings.deepseek.local.yaml --output tmp/answer_evaluation_deepseek.json
+python -m src.paper_assistant --retriever hybrid --embedding-settings config/settings.qwen.local.yaml --chunk-reranker fastembed --reranker-cache data/models/fastembed evaluate-answers --settings config/settings.deepseek.local.yaml --output tmp/answer_evaluation_deepseek.json
 ```
 
 使用同一个 DeepSeek API 配置、但让另一个模型独立评审：
 
 ```powershell
-python -m src.paper_assistant --retriever hybrid --model-cache data/models/fastembed --chunk-reranker fastembed --reranker-cache data/models/fastembed evaluate-answers --settings config/settings.deepseek.local.yaml --judge-model deepseek-v4-pro --output tmp/answer_evaluation_cross_model.json
+python -m src.paper_assistant --retriever hybrid --embedding-settings config/settings.qwen.local.yaml --chunk-reranker fastembed --reranker-cache data/models/fastembed evaluate-answers --settings config/settings.deepseek.local.yaml --judge-model deepseek-v4-pro --output tmp/answer_evaluation_cross_model.json
 ```
 
 此时生成仍使用私有配置中的模型（当前请求别名为`deepseek-chat`，接口实际返回`deepseek-flash`），事实覆盖和Claim支撑均由`deepseek-v4-pro`判定。DeepSeek V4模型默认开启高强度思考；程序对结构化评审调用明确传入`thinking.type=disabled`，避免长推理内容增加延迟或破坏JSON协议。API Key和Base URL继续复用同一份被Git忽略的私有配置。
 
 评测器每完成一题就原子写入本地报告，可在相同命令末尾增加 `--resume` 从已有结果继续。报告包含论文 Top-1 正确率、候选论文召回率、回答成功率、必备事实覆盖率、标注页对齐率、Claim 语义支撑率、延迟和 token 用量。生成完成后会有两次独立判分：一次检查答案是否覆盖必备事实；另一次把每条 Claim 与它实际引用的完整 Chunk 对照，只有全部实质性内容能由引用直接推出才算支撑。页码对齐率只衡量引用是否落在人工登记页，Claim 支撑率才衡量引用内容是否支持结论。两个指标均由同一 LLM 严格判分，仍存在模型偏差，不能替代人工抽检。完整回答、逐 Claim 结果和评测报告默认写入被 Git 忽略的 `tmp/`。
 
-当前 15 条开发题使用 Hybrid 路由、BGE 重排、7 个证据块和 16000 字上下文的结果为：15/15 成功回答，论文 Top-1 与候选召回均为 100%，59 个必备事实覆盖 43 个（72.88%），标注页召回 85.29%，平均延迟 5.43 秒。改造前同集事实覆盖为 62.71%、标注页召回为 55.88%。这是一组系统看过语料后构造的开发集结果，不能当作用户盲测准确率。
+当前 15 条开发题使用 Hybrid 路由、BGE Cross-Encoder 重排、7 个证据块和 16000 字上下文的结果为：15/15 成功回答，论文 Top-1 与候选召回均为 100%，59 个必备事实覆盖 43 个（72.88%），标注页召回 85.29%，平均延迟 5.43 秒。改造前同集事实覆盖为 62.71%、标注页召回为 55.88%。这是一组系统看过语料后构造的开发集结果，不能当作用户盲测准确率。
 
 加入 Claim-Evidence 判分后的一次独立运行中，14/15 题成功回答，成功答案共有 168 条 Claim，其中 167 条被其引用原文直接支撑，Claim 支撑率为 99.40%；13/14 个成功答案的全部 Claim 均获支撑。唯一未支撑项来自 CoFILL 的 Q/K/V 关系，另有一题由生成模型主动返回证据不足。该次判分额外使用 39,252 token；高支撑率来自带强引用约束的生成协议和同一模型评审，仍需用异构模型或人工抽检验证。
 
@@ -246,13 +246,13 @@ python -m src.paper_assistant compare-judges --input tmp/frozen_answer_evaluatio
 只评测已知目标论文内部的 Chunk 排序，用于隔离正文检索问题：
 
 ```powershell
-python -m src.paper_assistant --model-cache data/models/fastembed evaluate-chunks --oracle-paper
+python -m src.paper_assistant --embedding-settings config/settings.qwen.local.yaml evaluate-chunks --oracle-paper
 ```
 
 评测完整的“BM25 论文路由 → 候选论文正文检索”：
 
 ```powershell
-python -m src.paper_assistant --retriever bm25 --model-cache data/models/fastembed evaluate-chunks
+python -m src.paper_assistant --retriever bm25 --embedding-settings config/settings.qwen.local.yaml evaluate-chunks
 ```
 
 报告分别给出论文候选 Recall、正确页的 Recall@1/3/5 与 MRR，以及同时满足页码和证据词条件的 Evidence Recall@1/3/5 与 MRR。逐字核对 STEI 摘要后，第 1 页也被认定为能完整支撑自适应系数问题的相关证据页。修正后的首批 10 条开发题基线为：论文路由 Recall=1.00，Page/Evidence Recall@1=0.30、Recall@3=0.50、Recall@5=1.00、MRR=0.520。
@@ -278,8 +278,8 @@ python -m src.paper_assistant evaluate --split test_candidate
 
 ```powershell
 python -m src.paper_assistant --retriever bm25 evaluate
-python -m src.paper_assistant --retriever dense --model-cache data/models/fastembed evaluate
-python -m src.paper_assistant --retriever hybrid --model-cache data/models/fastembed evaluate
+python -m src.paper_assistant --retriever dense --embedding-settings config/settings.qwen.local.yaml evaluate
+python -m src.paper_assistant --retriever hybrid --embedding-settings config/settings.qwen.local.yaml evaluate
 ```
 
 当前 30 条同源种子问题的结果如下。这些问题来自同一批论文内容，只适合验证流程和做开发期消融，不能作为最终准确率：
@@ -287,8 +287,8 @@ python -m src.paper_assistant --retriever hybrid --model-cache data/models/faste
 | 检索器 | Recall@1 | Recall@3 | MRR |
 |---|---:|---:|---:|
 | 加权 BM25 | 100.0% | 100.0% | 1.000 |
-| BGE Dense | 73.3% | 90.0% | 0.824 |
-| BM25 + Dense + RRF | 86.7% | 96.7% | 0.925 |
+| Qwen text-embedding-v4 Dense | 83.3% | 93.3% | 0.894 |
+| BM25 + Qwen Dense + RRF | 96.7% | 100.0% | 0.983 |
 
 这组小数据上 BM25 的精确术语匹配最强，RRF 没有超过 BM25 的 Top-1。这个结果会被保留，而不是为了得到更好看的数字在同源题上反复调参。后续扩大论文库并增加独立盲测问题后，再判断混合检索是否带来稳定收益。
 
@@ -297,8 +297,8 @@ python -m src.paper_assistant --retriever hybrid --model-cache data/models/faste
 | 检索器 | 阈值后已知 Recall@1 | Rejection Accuracy | Open-set Accuracy |
 |---|---:|---:|---:|
 | 加权 BM25 | 96.7% | 100.0% | 97.4% |
-| BGE Dense | 70.0% | 66.7% | 69.2% |
-| BM25 + Dense + RRF | 73.3% | 77.8% | 74.4% |
+| Qwen text-embedding-v4 Dense | 80.0% | 66.7% | 76.9% |
+| BM25 + Qwen Dense + RRF | 83.3% | 44.4% | 74.4% |
 
 这里的 Open-set Accuracy 把“已知题第一名正确”和“未知题成功拒答”都计为正确。阈值和指标使用同一批开发数据，因此只能说明实现链路和当前取舍；不能当作未见数据上的泛化结果。Dense 和 Hybrid 的结果也表明，简单分数阈值仍无法可靠区分所有近领域未知问题。
 
@@ -318,7 +318,7 @@ MCP Server 会自动注册 `find_paper` 工具。客户端只需传入模糊描�
 
 工具返回人类可读文本和结构化结果，包括 `rejected`、`rejection_reason`、`top_score`、`min_score`，以及通过门槛后的 `paper_id`、中英文标题、作者、年份、期刊或会议、匹配词、方法摘要和本地 PDF 文件名。同一论文的多个 PDF 版本会出现在一个论文结果下。未达到门槛时 `results` 为空，并提示用户补充方法、数据集、作者、年份或期刊等线索。
 
-`retriever` 可选 `bm25`、`dense` 或 `hybrid`。默认使用 `bm25`，启动快且不需要加载向量模型；只有明确选择 `dense` 或 `hybrid` 时才加载本地 Embedding。
+`retriever` 可选 `bm25`、`dense` 或 `hybrid`。默认使用 `bm25`，启动快且不需要加载向量模型；只有明确选择 `dense` 或 `hybrid` 时才调用 Qwen Embedding API。
 
 ## 盘点本地论文目录
 
@@ -409,7 +409,7 @@ PDF 仅用于个人科研和本地实验，不应随公开仓库分发。公开 
 
 ## 下一步实现
 
-当前已经实现论文级 `PaperProfile`、加权 BM25、本地 BGE Dense、论文级与正文块 Chroma 持久化、两级论文路由与页级正文 Hybrid 检索、阈值拒答、RRF 融合、版本去重、候选档案生成、受控增量入库及 Recall@1、Recall@3、MRR、Rejection Accuracy 和 Open-set Accuracy 评测。下一阶段将实现：
+当前已经实现论文级 `PaperProfile`、加权 BM25、Qwen text-embedding-v4 Dense、论文级与正文块 Chroma 持久化、两级论文路由与页级正文 Hybrid 检索、阈值拒答、RRF 融合、版本去重、候选档案生成、受控增量入库及 Recall@1、Recall@3、MRR、Rejection Accuracy 和 Open-set Accuracy 评测。下一阶段将实现：
 
 1. 基于正文证据调用生成模型，输出逐条绑定论文、页码、章节和原文的回答；
 2. 扩展并冻结本人编写的正文盲测问题，独立报告 Chunk Recall@K；

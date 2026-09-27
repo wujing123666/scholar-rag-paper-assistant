@@ -9,7 +9,8 @@ import time
 from dataclasses import asdict
 from pathlib import Path
 
-from src.libs.embedding.fastembed_embedding import FastEmbedEmbedding
+from src.core.settings import load_settings
+from src.libs.embedding.embedding_factory import EmbeddingFactory
 from src.paper_assistant.catalog import PaperCatalog
 from src.paper_assistant.dense_retriever import PaperDenseRetriever
 from src.paper_assistant.evaluation import evaluate_retriever, load_evaluation_cases
@@ -24,11 +25,10 @@ DEFAULT_CHUNK_EVALUATION = Path("data/papers/chunk_eval_queries.jsonl")
 DEFAULT_ANSWER_EVALUATION = Path("data/papers/answer_eval_queries.jsonl")
 DEFAULT_INBOX = Path("data/papers/inbox")
 DEFAULT_PAPER_CHROMA = Path("data/db/chroma")
-DEFAULT_PAPER_COLLECTION = "paper_profiles_v1"
-DEFAULT_CHUNK_COLLECTION = "paper_chunks_v1"
+DEFAULT_PAPER_COLLECTION = "paper_profiles_qwen_v4"
+DEFAULT_CHUNK_COLLECTION = "paper_chunks_qwen_v4"
 
 
-DEFAULT_DENSE_MODEL = "BAAI/bge-small-zh-v1.5"
 DEFAULT_RERANKER_MODEL = "BAAI/bge-reranker-base"
 
 
@@ -119,8 +119,7 @@ def _add_resilience_arguments(command_parser: argparse.ArgumentParser) -> None:
 def _build_retriever(
     catalog_path: Path,
     retriever_name: str,
-    model: str,
-    model_cache: Path | None,
+    embedding_settings_path: Path,
     *,
     chroma_mode: str,
     chroma_path: Path,
@@ -137,7 +136,10 @@ def _build_retriever(
     from src.libs.vector_store.chroma_store import ChromaStore
 
     try:
-        embedding = FastEmbedEmbedding(model=model, cache_dir=model_cache)
+        settings = load_settings(embedding_settings_path)
+        if settings.embedding.provider.casefold() != "qwen":
+            raise ValueError("ScholarRAG requires embedding.provider=qwen")
+        embedding = EmbeddingFactory.create(settings)
         vector_store = ChromaStore(
             persist_directory=chroma_path,
             collection_name=DEFAULT_PAPER_COLLECTION,
@@ -166,8 +168,12 @@ def main() -> int:
     parser.add_argument(
         "--retriever", choices=("bm25", "dense", "hybrid"), default="bm25"
     )
-    parser.add_argument("--model", default=DEFAULT_DENSE_MODEL)
-    parser.add_argument("--model-cache", type=Path)
+    parser.add_argument(
+        "--embedding-settings",
+        type=Path,
+        default=Path("config/settings.yaml"),
+        help="Private settings containing the Qwen embedding API configuration",
+    )
     parser.add_argument("--chroma-mode", choices=("local", "server"), default="local")
     parser.add_argument("--chroma-path", type=Path, default=DEFAULT_PAPER_CHROMA)
     parser.add_argument("--chroma-host", default="localhost")
@@ -391,7 +397,6 @@ def main() -> int:
         )
         return 0
     if args.command == "compare-judges":
-        from src.core.settings import load_settings
         from src.libs.llm import LLMFactory
         from src.paper_assistant.judge_comparison import (
             JudgeSpec,
@@ -552,10 +557,9 @@ def main() -> int:
                     catalog_path=args.catalog,
                     inbox_path=args.inbox,
                     settings_path=args.settings,
+                    embedding_settings_path=args.embedding_settings,
                     fallback_settings_path=args.fallback_settings,
                     retriever=args.retriever,
-                    embedding_model=args.model,
-                    embedding_cache=args.model_cache,
                     chroma_mode=args.chroma_mode,
                     chroma_path=args.chroma_path,
                     chroma_host=args.chroma_host,
@@ -651,7 +655,10 @@ def main() -> int:
         if args.command == "evaluate-answers" and args.limit is not None and args.limit < 1:
             parser.error("--limit must be at least one")
         catalog = PaperCatalog.from_csv(args.catalog)
-        embedding = FastEmbedEmbedding(model=args.model, cache_dir=args.model_cache)
+        embedding_settings = load_settings(args.embedding_settings)
+        if embedding_settings.embedding.provider.casefold() != "qwen":
+            raise ValueError("ScholarRAG requires embedding.provider=qwen")
+        embedding = EmbeddingFactory.create(embedding_settings)
         paper_retriever = None
         paper_router_fallback = None
         needs_paper_router = args.command == "evaluate-chunks" and not args.oracle_paper
@@ -1075,7 +1082,13 @@ def main() -> int:
                 chunk_retriever,
                 load_chunk_evaluation_cases(args.queries),
                 top_k=args.top_k,
-                candidate_resolver=None if args.oracle_paper else resolve_candidates,
+                candidate_resolver=(
+                    # resolve_candidates also reports a router fallback; the
+                    # chunk evaluator only consumes the paper ids.
+                    None
+                    if args.oracle_paper
+                    else lambda query: resolve_candidates(query)[0]
+                ),
                 reranker=chunk_reranker,
                 rerank_candidates=args.rerank_candidates,
             )
@@ -1173,8 +1186,7 @@ def main() -> int:
     retriever, retriever_initialization_fallback = _build_retriever(
         args.catalog,
         args.retriever,
-        args.model,
-        args.model_cache,
+        args.embedding_settings,
         chroma_mode=args.chroma_mode,
         chroma_path=args.chroma_path,
         chroma_host=args.chroma_host,

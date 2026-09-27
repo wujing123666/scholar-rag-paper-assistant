@@ -3,13 +3,8 @@
 from __future__ import annotations
 
 import csv
-import sys
-import types
-
-import numpy as np
 
 from src.libs.embedding.base_embedding import BaseEmbedding
-from src.libs.embedding.fastembed_embedding import FastEmbedEmbedding
 from src.libs.vector_store.chroma_store import ChromaStore
 from src.paper_assistant.catalog import PaperCatalog
 from src.paper_assistant.dense_retriever import PaperDenseRetriever, profile_text
@@ -358,42 +353,6 @@ def test_profile_text_keeps_human_readable_field_labels(tmp_path):
     assert "中文标题：拓扑扩散插补" in text
     assert "数据集：Los-loop；PEMS-BAY" in text
     assert "记忆线索：百分之三观测率和切比雪夫图滤波" in text
-
-
-def test_fastembed_provider_uses_separate_document_and_query_methods(monkeypatch):
-    calls = []
-
-    class FakeTextEmbedding:
-        def __init__(self, **kwargs):
-            calls.append(("init", kwargs))
-
-        def embed(self, texts, **kwargs):
-            calls.append(("documents", tuple(texts), kwargs))
-            return iter([np.asarray([1.0, 0.0]) for _ in texts])
-
-        def query_embed(self, texts, **kwargs):
-            calls.append(("queries", tuple(texts), kwargs))
-            return iter([np.asarray([0.0, 1.0]) for _ in texts])
-
-    monkeypatch.setitem(
-        sys.modules, "fastembed", types.SimpleNamespace(TextEmbedding=FakeTextEmbedding)
-    )
-    embedding = FastEmbedEmbedding(model="BAAI/bge-small-zh-v1.5", threads=2)
-
-    assert embedding.embed(["论文档案"]) == [[1.0, 0.0]]
-    assert embedding.embed(["模糊查询"], is_query=True) == [[0.0, 1.0]]
-    assert calls == [
-        (
-            "init",
-            {
-                "model_name": "BAAI/bge-small-zh-v1.5",
-                "cache_dir": None,
-                "threads": 2,
-            },
-        ),
-        ("documents", ("论文档案",), {}),
-        ("queries", ("模糊查询",), {}),
-    ]
 
 
 def test_hybrid_retriever_combines_sparse_and_dense_ranks(tmp_path):

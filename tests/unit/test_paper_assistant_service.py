@@ -7,7 +7,11 @@ import sys
 
 from src.libs.llm.base_llm import ChatResponse
 from src.paper_assistant.catalog import PaperCatalog, PaperProfile
-from src.paper_assistant.chunk_retriever import ChunkIndexSync, ChunkSearchResult
+from src.paper_assistant.chunk_retriever import (
+    ChunkCorpusContext,
+    ChunkIndexSync,
+    ChunkSearchResult,
+)
 from src.paper_assistant.retriever import PaperSearchResult
 from src.paper_assistant.service import (
     PaperAssistantConfig,
@@ -52,7 +56,13 @@ class _ChunkRetriever:
     def __init__(self, catalog: PaperCatalog) -> None:
         self.catalog = catalog
         self.calls = []
+        self.context_calls = []
+        self.corpus = ChunkCorpusContext(frozenset(), ())
         self.index_sync = ChunkIndexSync(2, 2, 0, 2, 0, False)
+
+    def corpus_context(self, paper_ids: tuple[str, ...] = ()) -> ChunkCorpusContext:
+        self.context_calls.append(paper_ids)
+        return self.corpus
 
     def search(self, query: str, *, top_k: int, paper_ids=()):
         self.calls.append((query, top_k, paper_ids))
@@ -74,8 +84,11 @@ class _ChunkRetriever:
 
 
 class _GenerationLLM:
+    def __init__(self):
+        self.calls = []
+
     def chat(self, messages, **kwargs):
-        del messages, kwargs
+        self.calls.append((messages, kwargs))
         return ChatResponse(
             content=json.dumps(
                 {
@@ -133,6 +146,80 @@ def test_answer_question_runs_routing_retrieval_and_grounded_generation():
     assert payload["claims"][0]["citations"] == ("C1",)
     assert payload["citations"][0]["page_number"] == 3
     assert payload["evidence"][0]["text"] == "论文A使用扩散模型完成插补。"
+
+
+def test_answer_question_rule_splits_explicit_aspects_without_model_cost():
+    service = _service()
+    query = "这篇综述总结了哪些核心环节、常用数据集和开放问题？"
+
+    result = service.answer_question(query)
+
+    searched_questions = [call[0] for call in service.chunk_retriever.calls]
+    assert result.answer.status == "answered"
+    assert searched_questions == [
+        "life cycle stages",
+        "life cycle stages",
+        "datasets dataset",
+        "datasets dataset",
+        "open research problems",
+        "open research problems",
+    ]
+    assert service.chunk_retriever.context_calls == [("paper-a", "paper-b")]
+
+
+def test_answer_question_anchors_each_aspect_to_the_paper_table_captions():
+    service = _service()
+    service.chunk_retriever.corpus = ChunkCorpusContext(
+        topic_terms=frozenset({"sparse", "mobile", "crowdsensing", "data"}),
+        caption_sources=(
+            (
+                "Overview of life cycle of MCS and SMCS",
+                "Table 3 Overview of life cycle of MCS and SMCS\nFigure 2 Middleware",
+            ),
+        ),
+    )
+
+    service.answer_question("这篇综述总结了哪些核心环节、常用数据集和开放问题？")
+
+    searched = {call[0] for call in service.chunk_retriever.calls}
+    assert "life cycle stages overview mcs smcs" in searched
+    assert "datasets dataset" in searched
+    assert len(service.generation_llm.calls) == 1
+
+
+def test_answer_question_uses_model_split_for_ambiguous_wide_question():
+    class _SplitterAndGenerator:
+        def __init__(self):
+            self.calls = []
+
+        def chat(self, messages, **kwargs):
+            self.calls.append((messages, kwargs))
+            if messages[0].content.startswith("You rewrite one research question"):
+                return ChatResponse(
+                    content='["子问题甲？", "子问题乙？"]', model="splitter"
+                )
+            return ChatResponse(
+                content=json.dumps(
+                    {
+                        "status": "answered",
+                        "claims": [{"text": "有证据的回答", "citations": ["C1"]}],
+                    },
+                    ensure_ascii=False,
+                ),
+                model="generator",
+            )
+
+    service = _service()
+    service.generation_llm = _SplitterAndGenerator()
+
+    result = service.answer_question(
+        "这篇综述的核心环节、数据来源以及研究挑战分别是什么？"
+    )
+
+    searched_questions = [call[0] for call in service.chunk_retriever.calls]
+    assert result.answer.status == "answered"
+    assert searched_questions == ["子问题甲？", "子问题甲？", "子问题乙？", "子问题乙？"]
+    assert len(service.generation_llm.calls) == 2
 
 
 def test_answer_question_rejects_when_no_paper_passes_gate():
