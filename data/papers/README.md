@@ -83,7 +83,7 @@
 python -m src.paper_assistant search "我记得它先粗补，再用扩散模型学习残差" --top-k 3
 ```
 
-Dense 与 Hybrid 模式使用本地中文向量模型。首次运行前安装可选依赖：
+如果需要启用本地 Cross-Encoder 重排，首次运行前安装可选依赖：
 
 ```powershell
 pip install -e ".[rerank]"

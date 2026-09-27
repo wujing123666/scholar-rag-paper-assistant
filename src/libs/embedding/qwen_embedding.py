@@ -40,15 +40,17 @@ class QwenEmbedding(BaseEmbedding):
         self.batch_size = int(batch_size)
         if self.batch_size < 1:
             raise ValueError("Qwen embedding batch_size must be at least one")
-        api_key = config.api_key or os.getenv("DASHSCOPE_API_KEY")
-        if not api_key or str(api_key).startswith("YOUR_"):
+        configured_key = str(config.api_key or "").strip()
+        if not configured_key or configured_key.startswith("YOUR_"):
+            configured_key = str(os.getenv("DASHSCOPE_API_KEY") or "").strip()
+        if not configured_key or configured_key.startswith("YOUR_"):
             raise ValueError(
                 "Qwen embedding API key is missing. Set embedding.api_key in a "
                 "private settings file or DASHSCOPE_API_KEY."
             )
         self.index_identity = f"qwen:{self.model}:d{self.dimension}:document-v1"
         self._client = client or OpenAI(
-            api_key=api_key,
+            api_key=configured_key,
             base_url=self.base_url,
             timeout=timeout,
             max_retries=max_retries,
@@ -73,7 +75,11 @@ class QwenEmbedding(BaseEmbedding):
         vectors: list[list[float]] = []
         for start in range(0, len(prepared), self.batch_size):
             batch = prepared[start : start + self.batch_size]
-            response = self._client.embeddings.create(model=self.model, input=batch)
+            response = self._client.embeddings.create(
+                model=self.model,
+                input=batch,
+                dimensions=self.dimension,
+            )
             ordered = sorted(response.data, key=lambda item: item.index)
             batch_vectors = [list(item.embedding) for item in ordered]
             if len(batch_vectors) != len(batch):

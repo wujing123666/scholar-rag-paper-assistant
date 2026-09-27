@@ -20,6 +20,17 @@ import pytest
 
 # Project root for script execution
 PROJECT_ROOT = Path(__file__).parent.parent.parent
+EXTERNAL_E2E_CONFIG = os.getenv("RAG_E2E_CONFIG")
+RUN_EXTERNAL_E2E = os.getenv("RUN_EXTERNAL_E2E") == "1" and bool(
+    EXTERNAL_E2E_CONFIG
+)
+requires_external_e2e = pytest.mark.skipif(
+    not RUN_EXTERNAL_E2E,
+    reason=(
+        "requires RUN_EXTERNAL_E2E=1 and RAG_E2E_CONFIG pointing to a private "
+        "configuration with live LLM and embedding credentials"
+    ),
+)
 
 
 class TestDataIngestion:
@@ -99,6 +110,8 @@ class TestDataIngestion:
         
         if config:
             cmd.extend(["--config", config])
+        elif RUN_EXTERNAL_E2E and EXTERNAL_E2E_CONFIG:
+            cmd.extend(["--config", EXTERNAL_E2E_CONFIG])
         
         if dry_run:
             cmd.append("--dry-run")
@@ -179,10 +192,11 @@ class TestDataIngestion:
         assert "Unsupported" in result.stdout or "unsupported" in result.stdout.lower()
     
     @pytest.mark.integration
+    @requires_external_e2e
     def test_ingest_simple_pdf(self, sample_pdf):
         """Test ingesting a simple PDF file.
         
-        This test requires Azure API credentials to be configured.
+        This test requires a private configuration with live external credentials.
         """
         result = self.run_ingest_script(
             path=str(sample_pdf),
@@ -200,10 +214,11 @@ class TestDataIngestion:
         assert "SUMMARY" in result.stdout
     
     @pytest.mark.integration
+    @requires_external_e2e
     def test_ingest_complex_pdf_with_images(self, complex_pdf):
         """Test ingesting a complex PDF with images.
         
-        This test requires Azure API credentials and Vision LLM to be configured.
+        This test requires live LLM, embedding, and Vision LLM credentials.
         Tests the full pipeline including image captioning.
         """
         result = self.run_ingest_script(
@@ -226,6 +241,7 @@ class TestDataIngestion:
             assert "chunks" in result.stdout.lower()
     
     @pytest.mark.integration
+    @requires_external_e2e
     def test_ingest_skip_already_processed(self, sample_pdf):
         """Test that already processed files are skipped.
         
@@ -258,6 +274,7 @@ class TestDataIngestion:
         assert "skip" in result2.stdout.lower() or "already processed" in result2.stdout.lower()
     
     @pytest.mark.integration
+    @requires_external_e2e
     def test_ingest_force_reprocess(self, sample_pdf):
         """Test that --force flag causes re-processing."""
         # First run
@@ -288,6 +305,7 @@ class TestDataIngestion:
             assert "chunks" in result2.stdout.lower() or "processed" in result2.stdout.lower()
     
     @pytest.mark.integration
+    @requires_external_e2e
     def test_ingest_directory(self, tmp_path, sample_pdf):
         """Test ingesting all PDFs in a directory."""
         # Create a directory with multiple PDFs (copy sample)
@@ -330,6 +348,7 @@ class TestIngestScriptIntegration:
     """Integration tests that verify data persistence."""
     
     @pytest.mark.integration
+    @requires_external_e2e
     def test_creates_vector_store_data(self, tmp_path):
         """Verify that ingestion creates vector store data."""
         # This test verifies the pipeline creates the expected output files
@@ -338,15 +357,20 @@ class TestIngestScriptIntegration:
         sample_pdf = PROJECT_ROOT / "tests" / "fixtures" / "sample_documents" / "simple.pdf"
         if not sample_pdf.exists():
             pytest.skip("Sample PDF not found")
-        
+        assert EXTERNAL_E2E_CONFIG is not None
+
+        command = [
+            sys.executable,
+            str(PROJECT_ROOT / "scripts" / "ingest.py"),
+            "--path",
+            str(sample_pdf),
+            "--collection",
+            "e2e_test_persistence",
+            "--force",
+        ]
+        command.extend(["--config", EXTERNAL_E2E_CONFIG])
         result = subprocess.run(
-            [
-                sys.executable,
-                str(PROJECT_ROOT / "scripts" / "ingest.py"),
-                "--path", str(sample_pdf),
-                "--collection", "e2e_test_persistence",
-                "--force"
-            ],
+            command,
             capture_output=True,
             text=True,
             cwd=str(PROJECT_ROOT),
