@@ -100,7 +100,7 @@ def _add_resilience_arguments(command_parser: argparse.ArgumentParser) -> None:
     command_parser.add_argument(
         "--claim-second-judge-policy",
         choices=("all", "risk_based"),
-        default="all",
+        default="risk_based",
         help="Send every claim or only deterministic high-risk claims to later judges",
     )
     command_parser.add_argument(
@@ -259,6 +259,7 @@ def main() -> int:
     )
     answer_parser.add_argument("--max-context-chars", type=int, default=16000)
     answer_parser.add_argument("--min-evidence-chunks", type=int, default=1)
+    answer_parser.add_argument("--max-answer-claims", type=int, default=10)
     answer_parser.add_argument(
         "--verify-claims",
         choices=("off", "single", "consensus"),
@@ -311,6 +312,7 @@ def main() -> int:
     )
     answer_evaluate_parser.add_argument("--max-context-chars", type=int, default=16000)
     answer_evaluate_parser.add_argument("--min-evidence-chunks", type=int, default=1)
+    answer_evaluate_parser.add_argument("--max-answer-claims", type=int, default=10)
     answer_evaluate_parser.add_argument(
         "--verify-claims",
         choices=("off", "single", "consensus"),
@@ -572,6 +574,7 @@ def main() -> int:
                     disable_rejection=args.disable_rejection,
                     max_context_chars=args.max_context_chars,
                     min_evidence_chunks=args.min_evidence_chunks,
+                    max_answer_claims=args.max_answer_claims,
                     verify_claims=args.verify_claims,
                     claim_judge_models=tuple(args.claim_judge_model),
                     claim_retry_k=args.claim_retry_k,
@@ -936,6 +939,7 @@ def main() -> int:
                     matches,
                     max_context_chars=args.max_context_chars,
                     min_evidence_chunks=args.min_evidence_chunks,
+                    max_claims=args.max_answer_claims,
                 )
                 verification: dict[str, object] = {"mode": args.verify_claims}
                 if args.verify_claims != "off" and answer.status == "answered":

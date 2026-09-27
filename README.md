@@ -143,7 +143,7 @@ $env:SCHOLARRAG_FALLBACK_SETTINGS = "config/settings.fallback.local.yaml" # 可�
 streamlit run src/observability/dashboard/app.py
 ```
 
-页面中的“运行配置”可以切换论文检索器、正文重排和 Claim 验证方式。论文级路由未找到可信候选时会直接拒答，此时不会初始化完整 Chunk 索引或调用 LLM。
+页面中的“运行配置”可以切换论文检索器、正文重排和 Claim 验证方式，并设置每次回答最多保留的 Claim 数，默认 10 条。论文级路由未找到可信候选时会直接拒答，此时不会初始化完整 Chunk 索引或调用 LLM。
 
 ### 单进程并发与排队
 
@@ -192,7 +192,9 @@ python -m src.paper_assistant answer "这篇论文的方法解决了什么问题
 
 ### Claim 评审成本优化
 
-严格共识模式默认仍让所有评审检查全部 Claim。需要降低成本时，可以启用确定性的风险分流：第一评审检查全部 Claim，后续评审只检查包含数字、比较、因果、模块输入输出关系、多引用或长复合表述的高风险 Claim。
+共识模式默认启用确定性的风险分流：第一评审检查全部 Claim，后续评审只检查包含数字、比较、因果、模块输入输出关系、多引用或长复合表述的高风险 Claim。需要做严格全量双审对照时，可以显式传入 `--claim-second-judge-policy all`。
+
+答案生成默认最多保留 10 条 Claim。提示词要求先覆盖不同子问题，再在保持独立可核验的前提下合并相近细节；如果模型仍超出上限，服务会在进入评审前只保留按重要性排序的前 10 条，并在 `service_diagnostics.claim_limit` 中记录生成数和保留数。CLI 可以用 `--max-answer-claims` 调整上限，页面可以在“运行配置”中直接调整。
 
 ```powershell
 python -m src.paper_assistant answer "这篇论文的方法解决了什么问题？" `

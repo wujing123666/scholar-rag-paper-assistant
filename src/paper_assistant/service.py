@@ -68,11 +68,12 @@ class PaperAssistantConfig:
     disable_rejection: bool = False
     max_context_chars: int = 16000
     min_evidence_chunks: int = 1
+    max_answer_claims: int = 10
     verify_claims: str = "off"
     claim_judge_models: tuple[str, ...] = ()
     claim_retry_k: int = 3
     verification_failure_policy: str = "strict"
-    claim_second_judge_policy: str = "all"
+    claim_second_judge_policy: str = "risk_based"
     claim_cache_path: Path = Path("data/cache/claim_judgements.sqlite3")
     disable_claim_cache: bool = False
     retry_policy: RetryPolicy = field(default_factory=RetryPolicy)
@@ -98,6 +99,8 @@ class PaperAssistantConfig:
             raise ValueError("rerank_weight must be between zero and one")
         if self.max_context_chars < 1000 or self.min_evidence_chunks < 1:
             raise ValueError("invalid answer evidence limits")
+        if not 1 <= self.max_answer_claims <= 50:
+            raise ValueError("max_answer_claims must be between one and 50")
 
 
 @dataclass(frozen=True)
@@ -370,6 +373,7 @@ class PaperAssistantService:
             evidence,
             max_context_chars=self.config.max_context_chars,
             min_evidence_chunks=self.config.min_evidence_chunks,
+            max_claims=self.config.max_answer_claims,
         )
         verification: dict[str, Any] = {"mode": self.config.verify_claims}
         if self.config.verify_claims != "off" and answer.status == "answered":

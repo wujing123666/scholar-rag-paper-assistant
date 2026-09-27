@@ -225,3 +225,5 @@ def test_answer_cli_uses_shared_service(monkeypatch, capsys):
     assert captured["query"] == "论文如何插补？"
     assert captured["paper_ids"] == ("paper-a",)
     assert captured["config"].retriever == "bm25"
+    assert captured["config"].max_answer_claims == 10
+    assert captured["config"].claim_second_judge_policy == "risk_based"
