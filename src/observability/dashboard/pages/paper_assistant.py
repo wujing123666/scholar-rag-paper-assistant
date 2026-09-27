@@ -80,7 +80,7 @@ def _build_config() -> PaperAssistantConfig:
     default_settings = os.getenv("SCHOLARRAG_SETTINGS", "config/settings.yaml")
     with st.expander("运行配置", expanded=False):
         settings_path = st.text_input(
-            "LLM配置文件",
+            "LLM 与 Qwen Embedding 配置文件",
             value=default_settings,
             help="仅填写本地配置路径；页面不会显示或保存API Key。",
         )

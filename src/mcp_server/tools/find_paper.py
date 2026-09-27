@@ -4,15 +4,16 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
 import threading
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 from mcp import types
 
-from src.core.settings import resolve_path
+from src.core.settings import load_settings, resolve_path
 from src.libs.embedding.base_embedding import BaseEmbedding
-from src.libs.embedding.fastembed_embedding import FastEmbedEmbedding
+from src.libs.embedding.embedding_factory import EmbeddingFactory
 from src.paper_assistant.catalog import PaperCatalog
 from src.paper_assistant.dense_retriever import PaperDenseRetriever
 from src.paper_assistant.hybrid_retriever import PaperHybridRetriever
@@ -70,8 +71,7 @@ class FindPaperTool:
         self,
         catalog_path: str | Path = "data/papers/paper_catalog.csv",
         *,
-        model: str = FastEmbedEmbedding.DEFAULT_MODEL,
-        model_cache: str | Path = "data/models/fastembed",
+        embedding_settings_path: str | Path | None = None,
         embedding: BaseEmbedding | None = None,
         vector_store: BaseVectorStore | None = None,
         chroma_mode: str = "local",
@@ -82,8 +82,10 @@ class FindPaperTool:
         min_scores: dict[str, float] | None = None,
     ) -> None:
         self.catalog_path = resolve_path(catalog_path)
-        self.model = model
-        self.model_cache = resolve_path(model_cache)
+        self.embedding_settings_path = resolve_path(
+            embedding_settings_path
+            or os.getenv("SCHOLARRAG_SETTINGS", "config/settings.yaml")
+        )
         self._embedding = embedding
         self._vector_store = vector_store
         self.chroma_mode = chroma_mode
@@ -113,10 +115,10 @@ class FindPaperTool:
 
     def _get_embedding(self) -> BaseEmbedding:
         if self._embedding is None:
-            self._embedding = FastEmbedEmbedding(
-                model=self.model,
-                cache_dir=self.model_cache,
-            )
+            settings = load_settings(self.embedding_settings_path)
+            if settings.embedding.provider.casefold() != "qwen":
+                raise ValueError("find_paper dense retrieval requires Qwen embedding")
+            self._embedding = EmbeddingFactory.create(settings)
         return self._embedding
 
     def _get_vector_store(self) -> BaseVectorStore:
@@ -125,7 +127,7 @@ class FindPaperTool:
 
             self._vector_store = ChromaStore(
                 persist_directory=self.chroma_path,
-                collection_name="paper_profiles_v1",
+                collection_name="paper_profiles_qwen_v4",
                 mode=self.chroma_mode,
                 host=self.chroma_host,
                 port=self.chroma_port,

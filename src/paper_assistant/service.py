@@ -8,7 +8,9 @@ from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any
 
-from src.libs.embedding.fastembed_embedding import FastEmbedEmbedding
+from src.core.settings import load_settings
+from src.libs.embedding.base_embedding import BaseEmbedding
+from src.libs.embedding.embedding_factory import EmbeddingFactory
 from src.libs.llm import LLMFactory
 from src.libs.llm.resilient_llm import ResilientChatModel, RetryPolicy
 from src.libs.vector_store.chroma_store import ChromaStore
@@ -24,19 +26,20 @@ from src.paper_assistant.claim_judgement_cache import (
 )
 from src.paper_assistant.claim_safety import verify_and_filter_claims
 from src.paper_assistant.dense_retriever import PaperDenseRetriever
+from src.paper_assistant.facet_query import build_facet_queries
 from src.paper_assistant.grounded_answer import (
     REFUSAL_TEXT,
     GroundedAnswer,
     answer_from_evidence,
 )
 from src.paper_assistant.hybrid_retriever import PaperHybridRetriever
+from src.paper_assistant.query_split import merge_topic_groups, split_query
 from src.paper_assistant.rejection import decide_retrieval
 from src.paper_assistant.retriever import PaperBM25Retriever, PaperSearchResult
 
-DEFAULT_DENSE_MODEL = "BAAI/bge-small-zh-v1.5"
 DEFAULT_RERANKER_MODEL = "BAAI/bge-reranker-base"
-DEFAULT_PAPER_COLLECTION = "paper_profiles_v1"
-DEFAULT_CHUNK_COLLECTION = "paper_chunks_v1"
+DEFAULT_PAPER_COLLECTION = "paper_profiles_qwen_v4"
+DEFAULT_CHUNK_COLLECTION = "paper_chunks_qwen_v4"
 
 
 @dataclass(frozen=True)
@@ -46,10 +49,9 @@ class PaperAssistantConfig:
     catalog_path: Path = Path("data/papers/paper_catalog.csv")
     inbox_path: Path = Path("data/papers/inbox")
     settings_path: Path = Path("config/settings.yaml")
+    embedding_settings_path: Path | None = None
     fallback_settings_path: Path | None = None
     retriever: str = "hybrid"
-    embedding_model: str = DEFAULT_DENSE_MODEL
-    embedding_cache: Path | None = None
     chroma_mode: str = "local"
     chroma_path: Path = Path("data/db/chroma")
     chroma_host: str = "localhost"
@@ -101,6 +103,18 @@ class PaperAssistantConfig:
             raise ValueError("invalid answer evidence limits")
         if not 1 <= self.max_answer_claims <= 50:
             raise ValueError("max_answer_claims must be between one and 50")
+
+
+def _build_qwen_embedding(config: PaperAssistantConfig) -> BaseEmbedding:
+    """Create the single supported ScholarRAG embedding provider."""
+    settings_path = config.embedding_settings_path or config.settings_path
+    settings = load_settings(settings_path)
+    if settings.embedding.provider.casefold() != "qwen":
+        raise ValueError(
+            "ScholarRAG requires embedding.provider=qwen so indexing and queries "
+            "use the same production embedding model"
+        )
+    return EmbeddingFactory.create(settings)
 
 
 @dataclass(frozen=True)
@@ -340,32 +354,33 @@ class PaperAssistantService:
             if self.chunk_reranker is not None
             else self.config.top_k
         )
-        if automatic_routing:
-            evidence: list[ChunkSearchResult] = []
-            for paper_id in candidate_ids:
-                evidence.extend(
-                    self.chunk_retriever.search(
-                        query, top_k=retrieval_k, paper_ids=(paper_id,)
-                    )
-                )
-            evidence = apply_paper_routing_prior(evidence, candidate_ids)
-        else:
-            evidence = self.chunk_retriever.search(
-                query, top_k=retrieval_k, paper_ids=candidate_ids
-            )
-
+        sub_questions = split_query(query, llm=self.generation_llm)
         reranker_fallback = None
-        if self.chunk_reranker is not None:
-            from src.paper_assistant.chunk_reranker import rerank_with_fallback
-
-            evidence, reranker_fallback = rerank_with_fallback(
-                self.chunk_reranker,
-                query,
-                evidence[:retrieval_k],
-                top_k=self.config.top_k,
+        if len(sub_questions) > 1:
+            evidence, reranker_fallback = self._multi_aspect_evidence(
+                sub_questions,
+                candidate_ids,
+                retrieval_k,
+                automatic_routing=automatic_routing,
             )
         else:
-            evidence = evidence[: self.config.top_k]
+            evidence = self._search_for_question(
+                query,
+                candidate_ids,
+                retrieval_k,
+                automatic_routing=automatic_routing,
+            )
+            if self.chunk_reranker is not None:
+                from src.paper_assistant.chunk_reranker import rerank_with_fallback
+
+                evidence, reranker_fallback = rerank_with_fallback(
+                    self.chunk_reranker,
+                    query,
+                    evidence[:retrieval_k],
+                    top_k=self.config.top_k,
+                )
+            else:
+                evidence = evidence[: self.config.top_k]
 
         answer = answer_from_evidence(
             self.generation_llm,
@@ -463,6 +478,84 @@ class PaperAssistantService:
             claim_verification=verification,
         )
 
+    def _search_for_question(
+        self,
+        question: str,
+        candidate_ids: tuple[str, ...],
+        retrieval_k: int,
+        *,
+        automatic_routing: bool,
+    ) -> list[ChunkSearchResult]:
+        """Search one question across the already selected candidate papers."""
+        if not automatic_routing:
+            return list(
+                self.chunk_retriever.search(
+                    question, top_k=retrieval_k, paper_ids=candidate_ids
+                )
+            )
+        evidence: list[ChunkSearchResult] = []
+        for paper_id in candidate_ids:
+            evidence.extend(
+                self.chunk_retriever.search(
+                    question, top_k=retrieval_k, paper_ids=(paper_id,)
+                )
+            )
+        return apply_paper_routing_prior(evidence, candidate_ids)
+
+    def _multi_aspect_evidence(
+        self,
+        sub_questions: tuple[str, ...],
+        candidate_ids: tuple[str, ...],
+        retrieval_k: int,
+        *,
+        automatic_routing: bool,
+    ) -> tuple[list[ChunkSearchResult], str | None]:
+        """Retrieve each aspect separately and interleave the ranked groups.
+
+        Every aspect is first rewritten into a retrieval query that names its own
+        facet.  A wide question's own words are mostly the paper's topic words,
+        which match nearly every chunk and therefore bury the few chunks that
+        answer one particular aspect.
+        """
+        groups: list[list[ChunkSearchResult]] = []
+        fallback: str | None = None
+        for query in self._facet_queries(sub_questions, candidate_ids):
+            group = self._search_for_question(
+                query,
+                candidate_ids,
+                retrieval_k,
+                automatic_routing=automatic_routing,
+            )
+            if self.chunk_reranker is not None:
+                from src.paper_assistant.chunk_reranker import rerank_with_fallback
+
+                group, group_fallback = rerank_with_fallback(
+                    self.chunk_reranker,
+                    query,
+                    group[:retrieval_k],
+                    top_k=self.config.top_k,
+                )
+                fallback = fallback or group_fallback
+            groups.append(group)
+        return merge_topic_groups(groups, top_k=self.config.top_k), fallback
+
+    def _facet_queries(
+        self, sub_questions: tuple[str, ...], candidate_ids: tuple[str, ...]
+    ) -> tuple[str, ...]:
+        """Rewrite every aspect into a query that keeps its own facet words.
+
+        The paper's topic terms and table captions are measured from the ready
+        index, and ``build_facet_queries`` always returns one query per aspect, so
+        an aspect whose facet words are not recognised is searched unchanged.
+        """
+        context = self.chunk_retriever.corpus_context(candidate_ids)
+        return build_facet_queries(
+            sub_questions,
+            topic=context.topic_terms,
+            caption_sources=context.caption_sources,
+            max_queries=len(sub_questions),
+        )
+
     def _ensure_answer_dependencies(self) -> None:
         if self.chunk_retriever is not None and self.generation_llm is not None:
             return
@@ -544,9 +637,7 @@ def build_paper_assistant_service(
         paper_retriever: Any = PaperBM25Retriever(catalog)
     else:
         try:
-            embedding = FastEmbedEmbedding(
-                model=config.embedding_model, cache_dir=config.embedding_cache
-            )
+            embedding = _build_qwen_embedding(config)
             profile_store = ChromaStore(
                 persist_directory=config.chroma_path,
                 collection_name=DEFAULT_PAPER_COLLECTION,
@@ -572,11 +663,7 @@ def build_paper_assistant_service(
             )
 
     def load_answer_dependencies() -> PaperAnswerDependencies:
-        from src.core.settings import load_settings
-
-        answer_embedding = embedding or FastEmbedEmbedding(
-            model=config.embedding_model, cache_dir=config.embedding_cache
-        )
+        answer_embedding = embedding or _build_qwen_embedding(config)
         chunk_store = ChromaStore(
             persist_directory=config.chroma_path,
             collection_name=DEFAULT_CHUNK_COLLECTION,
@@ -665,9 +752,7 @@ def build_paper_search_service(
         paper_retriever: Any = PaperBM25Retriever(catalog)
     else:
         try:
-            embedding = FastEmbedEmbedding(
-                model=config.embedding_model, cache_dir=config.embedding_cache
-            )
+            embedding = _build_qwen_embedding(config)
             profile_store = ChromaStore(
                 persist_directory=config.chroma_path,
                 collection_name=DEFAULT_PAPER_COLLECTION,

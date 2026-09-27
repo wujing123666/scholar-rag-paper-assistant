@@ -131,10 +131,10 @@ def _register_builtin_providers() -> None:
         pass  # Ollama provider not available
 
     try:
-        from src.libs.embedding.fastembed_embedding import FastEmbedEmbedding
-        EmbeddingFactory.register_provider("fastembed", FastEmbedEmbedding)
+        from src.libs.embedding.qwen_embedding import QwenEmbedding
+        EmbeddingFactory.register_provider("qwen", QwenEmbedding)
     except ImportError:
-        pass  # FastEmbed provider not available
+        pass  # Qwen provider not available
 
 
 # Register providers when module is imported

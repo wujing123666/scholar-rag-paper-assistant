@@ -39,7 +39,7 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-local = [
+rerank = [
     "fastembed>=0.8,<0.9",
 ]
 dev = [

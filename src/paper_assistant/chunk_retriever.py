@@ -15,6 +15,7 @@ from langchain_text_splitters import RecursiveCharacterTextSplitter
 from src.libs.embedding.base_embedding import BaseEmbedding
 from src.libs.vector_store.base_vector_store import BaseVectorStore
 from src.paper_assistant.catalog import PaperCatalog, PaperProfile
+from src.paper_assistant.facet_query import table_captions, topic_terms
 from src.paper_assistant.inventory import sha256_file
 from src.paper_assistant.retriever import tokenize
 
@@ -414,6 +415,14 @@ def extract_paper_chunks(
     return chunks
 
 
+@dataclass(frozen=True)
+class ChunkCorpusContext:
+    """Measured vocabulary of the searched papers, used to build facet queries."""
+
+    topic_terms: frozenset[str]
+    caption_sources: tuple[tuple[str, str], ...]
+
+
 class PaperChunkRetriever:
     """Synchronize page-aware chunks to Chroma and retrieve source evidence."""
 
@@ -436,7 +445,11 @@ class PaperChunkRetriever:
         self.chunk_size = chunk_size
         self.chunk_overlap = chunk_overlap
         self.embedding_model = str(
-            getattr(embedding, "model", embedding.__class__.__qualname__)
+            getattr(
+                embedding,
+                "index_identity",
+                getattr(embedding, "model", embedding.__class__.__qualname__),
+            )
         )
         self.embedding_dimension = embedding.get_dimension()
         self._query_embeddings: OrderedDict[str, list[float]] = OrderedDict()
@@ -461,6 +474,22 @@ class PaperChunkRetriever:
             sum(self._document_lengths.values()) / len(self._document_lengths)
             if self._document_lengths
             else 0.0
+        )
+
+    def corpus_context(self, paper_ids: tuple[str, ...] = ()) -> ChunkCorpusContext:
+        """Return the topic terms and table captions of the searched papers."""
+        allowed = set(paper_ids)
+        document_counts: Counter[str] = Counter()
+        texts: list[str] = []
+        for record_id, record in self._search_records.items():
+            metadata = record.get("metadata", {})
+            if allowed and str(metadata.get("paper_id", "")) not in allowed:
+                continue
+            texts.append(str(record.get("text", "")))
+            document_counts.update(self._term_frequencies[record_id].keys())
+        return ChunkCorpusContext(
+            topic_terms=topic_terms(document_counts, len(texts)),
+            caption_sources=table_captions(texts),
         )
 
     def _sparse_search(

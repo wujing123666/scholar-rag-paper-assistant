@@ -55,7 +55,11 @@ class PaperDenseRetriever:
         self.embedding = embedding
         self.vector_store = vector_store
         self.embedding_model = str(
-            getattr(embedding, "model", embedding.__class__.__qualname__)
+            getattr(
+                embedding,
+                "index_identity",
+                getattr(embedding, "model", embedding.__class__.__qualname__),
+            )
         )
         self.embedding_dimension = embedding.get_dimension()
         self.index_sync = self._sync_index()
