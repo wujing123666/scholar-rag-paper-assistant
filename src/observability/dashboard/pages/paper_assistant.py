@@ -7,6 +7,12 @@ from pathlib import Path
 
 import streamlit as st
 
+from src.paper_assistant.request_gate import (
+    RequestExecutionError,
+    RequestGate,
+    RequestQueueFullError,
+    RequestQueueWaitTimeoutError,
+)
 from src.paper_assistant.service import (
     PaperAnswerResponse,
     PaperAssistantConfig,
@@ -14,6 +20,24 @@ from src.paper_assistant.service import (
     build_paper_assistant_service,
     build_paper_search_service,
 )
+
+REQUEST_LOG_PATH = Path("logs/paper_requests.jsonl")
+
+
+def _positive_env_int(name: str, default: int) -> int:
+    try:
+        value = int(os.getenv(name, str(default)))
+    except ValueError:
+        return default
+    return value if value > 0 else default
+
+
+def _positive_env_float(name: str, default: float) -> float:
+    try:
+        value = float(os.getenv(name, str(default)))
+    except ValueError:
+        return default
+    return value if value > 0 else default
 
 
 @st.cache_resource(show_spinner=False)
@@ -24,6 +48,32 @@ def _cached_search_service(config: PaperAssistantConfig):
 @st.cache_resource(show_spinner=False)
 def _cached_answer_service(config: PaperAssistantConfig):
     return build_paper_assistant_service(config)
+
+
+@st.cache_resource(show_spinner=False)
+def _cached_search_gate() -> RequestGate:
+    return RequestGate(
+        kind="paper_search",
+        max_workers=_positive_env_int("SCHOLARRAG_SEARCH_WORKERS", 8),
+        max_queue_size=_positive_env_int("SCHOLARRAG_MAX_QUEUE", 20),
+        max_queue_wait_seconds=_positive_env_float(
+            "SCHOLARRAG_QUEUE_WAIT_SECONDS", 60.0
+        ),
+        log_path=REQUEST_LOG_PATH,
+    )
+
+
+@st.cache_resource(show_spinner=False)
+def _cached_answer_gate() -> RequestGate:
+    return RequestGate(
+        kind="paper_answer",
+        max_workers=_positive_env_int("SCHOLARRAG_ANSWER_WORKERS", 3),
+        max_queue_size=_positive_env_int("SCHOLARRAG_MAX_QUEUE", 20),
+        max_queue_wait_seconds=_positive_env_float(
+            "SCHOLARRAG_QUEUE_WAIT_SECONDS", 60.0
+        ),
+        log_path=REQUEST_LOG_PATH,
+    )
 
 
 def _build_config() -> PaperAssistantConfig:
@@ -94,6 +144,29 @@ def _render_search(response: PaperSearchResponse) -> None:
         st.info(f"本次检索发生降级：{response.fallback_reason}")
 
 
+def _render_request_record(record: dict | None) -> None:
+    if not record:
+        return
+    st.caption(
+        "请求调度："
+        f"排队 {record.get('queue_wait_seconds', 0):.3f}s · "
+        f"执行 {record.get('execution_seconds', 0):.3f}s · "
+        f"总耗时 {record.get('total_seconds', 0):.3f}s"
+    )
+
+
+def _classify_search_result(
+    response: PaperSearchResponse,
+) -> tuple[str, str | None]:
+    return ("rejected" if response.rejected else "matched", response.reason)
+
+
+def _classify_answer_result(
+    response: PaperAnswerResponse,
+) -> tuple[str, str | None]:
+    return response.answer.status, response.answer.reason
+
+
 def _render_verification(report: dict) -> None:
     if report.get("mode") == "off":
         st.caption("Claim验证未启用。")
@@ -108,13 +181,16 @@ def _render_verification(report: dict) -> None:
         st.warning(f"缓存错误 {report['cache_errors']} 次，已退回实时评审。")
 
 
-def _render_answer(response: PaperAnswerResponse) -> None:
+def _render_answer(
+    response: PaperAnswerResponse, request_record: dict | None = None
+) -> None:
     if response.answer.status != "answered":
         st.warning(response.answer.answer)
         st.caption(f"原因：{response.answer.reason or 'unknown'}")
         if response.paper_retriever_fallback:
             st.info(f"论文检索降级：{response.paper_retriever_fallback}")
         _render_verification(response.claim_verification)
+        _render_request_record(request_record)
         return
 
     st.success("已生成有原文依据的回答")
@@ -153,8 +229,10 @@ def _render_answer(response: PaperAnswerResponse) -> None:
                 "generation_model": response.answer.model,
                 "generation_usage": response.answer.usage,
                 "service_diagnostics": response.answer.service_diagnostics,
+                "request_queue": request_record,
             }
         )
+    _render_request_record(request_record)
 
 
 def render() -> None:
@@ -162,6 +240,18 @@ def render() -> None:
     st.header("📚 ScholarRAG 论文助手")
     st.caption(
         "根据模糊记忆找回论文，或从论文正文中生成带页码、章节和原文依据的回答。"
+    )
+    search_gate = _cached_search_gate()
+    answer_gate = _cached_answer_gate()
+    search_state = search_gate.snapshot()
+    answer_state = answer_gate.snapshot()
+    st.caption(
+        "单进程共享队列："
+        f"找论文最多 {search_state.max_workers} 个并发"
+        f"（执行 {search_state.active} / 等待 {search_state.queued}）；"
+        f"论文问答最多 {answer_state.max_workers} 个并发"
+        f"（执行 {answer_state.active} / 等待 {answer_state.queued}）；"
+        f"每类最多等待 {answer_state.max_queue_size} 个请求。"
     )
     config = _build_config()
     search_tab, answer_tab = st.tabs(("🔎 找论文", "💬 论文问答"))
@@ -175,15 +265,40 @@ def render() -> None:
             )
             search_clicked = st.form_submit_button("开始检索", type="primary")
         if search_clicked:
+            st.session_state.pop("paper_search_response", None)
+            st.session_state.pop("paper_search_request_record", None)
             if not search_query.strip():
                 st.warning("请先输入论文描述。")
             else:
                 try:
                     with st.spinner("正在检索论文目录……"):
-                        response = _cached_search_service(config).find_papers(
-                            search_query
+                        execution = search_gate.run(
+                            _cached_search_service(config).find_papers,
+                            search_query,
+                            result_classifier=_classify_search_result,
                         )
-                    st.session_state["paper_search_response"] = response
+                    st.session_state["paper_search_response"] = execution.value
+                    st.session_state["paper_search_request_record"] = (
+                        execution.record.to_dict()
+                    )
+                except RequestQueueFullError as error:
+                    st.session_state["paper_search_request_record"] = (
+                        error.record.to_dict()
+                    )
+                    st.warning("找论文请求队列已满，请稍后再试。")
+                except RequestQueueWaitTimeoutError as error:
+                    st.session_state["paper_search_request_record"] = (
+                        error.record.to_dict()
+                    )
+                    st.warning("找论文请求排队超过允许时间，请稍后重试。")
+                except RequestExecutionError as error:
+                    st.session_state["paper_search_request_record"] = (
+                        error.record.to_dict()
+                    )
+                    st.error(
+                        f"论文检索初始化失败（{error.record.error_type}）。"
+                        "请检查论文目录、向量索引和本地模型配置。"
+                    )
                 except Exception as error:
                     st.error(
                         f"论文检索初始化失败（{type(error).__name__}）。"
@@ -192,6 +307,9 @@ def render() -> None:
         cached_search = st.session_state.get("paper_search_response")
         if isinstance(cached_search, PaperSearchResponse):
             _render_search(cached_search)
+        _render_request_record(
+            st.session_state.get("paper_search_request_record")
+        )
 
     with answer_tab:
         with st.form("paper_answer_form"):
@@ -202,15 +320,40 @@ def render() -> None:
             )
             answer_clicked = st.form_submit_button("生成证据回答", type="primary")
         if answer_clicked:
+            st.session_state.pop("paper_answer_response", None)
+            st.session_state.pop("paper_answer_request_record", None)
             if not answer_query.strip():
                 st.warning("请先输入问题。")
             else:
                 try:
                     with st.spinner("正在检索正文、生成答案并核验Claim……"):
-                        response = _cached_answer_service(config).answer_question(
-                            answer_query
+                        execution = answer_gate.run(
+                            _cached_answer_service(config).answer_question,
+                            answer_query,
+                            result_classifier=_classify_answer_result,
                         )
-                    st.session_state["paper_answer_response"] = response
+                    st.session_state["paper_answer_response"] = execution.value
+                    st.session_state["paper_answer_request_record"] = (
+                        execution.record.to_dict()
+                    )
+                except RequestQueueFullError as error:
+                    st.session_state["paper_answer_request_record"] = (
+                        error.record.to_dict()
+                    )
+                    st.warning("论文问答请求队列已满，请稍后再试。")
+                except RequestQueueWaitTimeoutError as error:
+                    st.session_state["paper_answer_request_record"] = (
+                        error.record.to_dict()
+                    )
+                    st.warning("论文问答请求排队超过允许时间，请稍后重试。")
+                except RequestExecutionError as error:
+                    st.session_state["paper_answer_request_record"] = (
+                        error.record.to_dict()
+                    )
+                    st.error(
+                        f"论文问答初始化或运行失败（{error.record.error_type}）。"
+                        "请检查LLM私有配置、论文PDF和索引状态。"
+                    )
                 except Exception as error:
                     st.error(
                         f"论文问答初始化或运行失败（{type(error).__name__}）。"
@@ -218,4 +361,7 @@ def render() -> None:
                     )
         cached_answer = st.session_state.get("paper_answer_response")
         if isinstance(cached_answer, PaperAnswerResponse):
-            _render_answer(cached_answer)
+            _render_answer(
+                cached_answer,
+                st.session_state.get("paper_answer_request_record"),
+            )

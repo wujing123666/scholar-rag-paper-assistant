@@ -145,6 +145,22 @@ streamlit run src/observability/dashboard/app.py
 
 页面中的“运行配置”可以切换论文检索器、正文重排和 Claim 验证方式。论文级路由未找到可信候选时会直接拒答，此时不会初始化完整 Chunk 索引或调用 LLM。
 
+### 单进程并发与排队
+
+ScholarRAG 页面在一个 Streamlit 进程内共享两条有界队列。默认最多同时执行 8 个论文检索和 3 个论文问答，每类最多再等待 20 个请求；队列已满时立即提示稍后重试，排队超过 60 秒的任务不会再调用 RAG。每次请求只把类型、状态、排队时间、执行时间、总耗时和异常类型写入本地 `logs/paper_requests.jsonl`，不记录问题、论文原文、模型响应或 API Key。
+
+可以在启动前通过环境变量调整：
+
+```powershell
+$env:SCHOLARRAG_SEARCH_WORKERS = "8"
+$env:SCHOLARRAG_ANSWER_WORKERS = "3"
+$env:SCHOLARRAG_MAX_QUEUE = "20"
+$env:SCHOLARRAG_QUEUE_WAIT_SECONDS = "60"
+streamlit run src/observability/dashboard/app.py
+```
+
+这些限制只在同一个 Streamlit 进程内共享。运行多个 Streamlit 进程或多台服务器时，每个进程会有自己的队列，需要再引入共享队列或统一后端；当前约 20 人的局域网部署先保留单进程结构，并依据压测结果决定是否扩展。
+
 ### ScholarRAG 的运行时降级
 
 `answer` 和 `evaluate-answers` 对外部依赖采用分层降级，避免把服务故障伪装成正常答案：
