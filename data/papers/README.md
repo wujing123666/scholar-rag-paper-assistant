@@ -83,7 +83,7 @@
 python -m src.paper_assistant search "我记得它先粗补，再用扩散模型学习残差" --top-k 3
 ```
 
-Dense 与 Hybrid 模式使用本地中文向量模型。首次运行前安装可选依赖：
+如果需要启用本地 Cross-Encoder 重排，首次运行前安装可选依赖：
 
 ```powershell
 pip install -e ".[rerank]"
@@ -96,18 +96,25 @@ python -m src.paper_assistant --retriever dense --embedding-settings config/sett
 python -m src.paper_assistant --retriever hybrid --embedding-settings config/settings.qwen.local.yaml search "使用强化学习招募用户的论文" --top-k 3
 ```
 
-搜索默认启用未知论文拒答。不同检索器使用各自的开发阈值；返回 JSON 中的 `rejected`、`top_score` 和 `min_score` 说明本次判定。可以临时覆盖阈值或查看未经过滤的原始排序：
+CLI与Web论文搜索默认采用两阶段路由：BM25/Dense/Hybrid先召回最多20篇候选论文，本地`BAAI/bge-reranker-base`再对“查询—论文画像”逐对打分，并用原始Cross-Encoder logit判断是否拒答。默认门槛为`2.5`；返回JSON中的`score_kind=cross_encoder_logit`、`rejected`、`top_score`和`min_score`说明本次判定。可以临时覆盖门槛、关闭Cross-Encoder，或查看未经拒答过滤的原始排序：
 
 ```powershell
-python -m src.paper_assistant --retriever bm25 --min-score 9.0 search "使用强化学习控制机器人的论文"
+python -m src.paper_assistant --retriever hybrid --embedding-settings config/settings.qwen.local.yaml --min-score 3.0 search "使用强化学习控制机器人的论文"
+python -m src.paper_assistant --retriever hybrid --embedding-settings config/settings.qwen.local.yaml --paper-reranker none search "使用强化学习控制机器人的论文"
 python -m src.paper_assistant --retriever bm25 --disable-rejection search "使用强化学习控制机器人的论文"
 ```
 
-当前默认值为 BM25 `8.0`、Dense `0.78`、Hybrid `2/61`。它们来自当前 30 条已知开发题和 9 条未知开发题，只是小语料起点；论文库、Embedding 模型或 RRF 参数变化后必须重新校准。
+门槛`2.5`只适用于当前`BAAI/bge-reranker-base`。更换Cross-Encoder后必须重新标定。若关闭或无法加载Cross-Encoder，系统会明确返回`paper_reranker_unavailable`降级原因，并退回旧的一阶段门槛：BM25 `8.0`、Dense `0.78`、Hybrid `2/61`。
+
+`evaluate`与CLI/Web搜索复用同一个Paper Service，因此会实际执行所配置的Top-20召回、Cross-Encoder门控和拒答规则；报告中的分数与线上搜索是同一量纲，不再由另一套旧评测路由单独计算。
+
+宽问题先拆成最多3个Facet，每个Facet独立召回和Cross-Encoder判定；任一Facet没有论文通过门槛时，问答链路以`incomplete_facet_paper_coverage`安全拒答。这样避免用一篇论文同时覆盖多个主题的整句分数，误杀“低功耗连接、设备管理、协议互操作”这类可由多篇论文共同回答的问题。
 
 如果查询明确写出档案中的 `paper_id` 简称，例如 `TCDI`、`DEMI` 或 `MapT-STC`，Hybrid 检索会把对应论文提升到首位并越过开放集阈值。这条确定性规则用于处理用户已经记得论文简称、只是继续追问方法细节的场景。
 
 论文级 Dense 向量存储在本地 Chroma collection `paper_profiles_qwen_v4`，默认目录为 `data/db/chroma/`。每条记录对应一个 `paper_id`，并记录 Paper Profile 内容哈希、Embedding 模型名称和向量维度。首次运行会写入全部论文向量；再次启动时复用未变化的向量，只重新计算新增或修改的论文，并删除目录中已经移除的论文记录。
+
+若Embedding维度发生变化，Chunk索引会在独立临时collection中按Chroma允许的最大批量逐篇写入；全部论文成功后才切换为正式collection。中途Embedding或写入失败会删除临时collection并继续保留旧索引，避免先清空5万多个Chunk后因单批上限或服务故障留下空库。
 
 本地开发使用默认的 `PersistentClient`。代码也支持通过同一个 `ChromaStore` 接口连接服务器模式：
 
@@ -205,6 +212,8 @@ MapT-STC真实烟雾测试中，候选答案有10条Claim；关于“卡尔曼�
 python -m src.paper_assistant --retriever hybrid --embedding-settings config/settings.qwen.local.yaml --chunk-reranker fastembed --reranker-cache data/models/fastembed evaluate-answers --settings config/settings.deepseek.local.yaml --output tmp/answer_evaluation_deepseek.json
 ```
 
+`evaluate-answers`直接调用与Streamlit和`answer`命令相同的`PaperAssistantService.answer_question()`：宽问题执行同样的Facet拆分、每Facet独立Paper Cross-Encoder门控、Chunk检索、交错合并、生成和可选Claim验证。评审模型随后只对这份生产链路的答案和冻结证据判分。
+
 使用同一个 DeepSeek API 配置、但让另一个模型独立评审：
 
 ```powershell
@@ -292,7 +301,7 @@ python -m src.paper_assistant --retriever hybrid --embedding-settings config/set
 
 这组小数据上 BM25 的精确术语匹配最强，RRF 没有超过 BM25 的 Top-1。这个结果会被保留，而不是为了得到更好看的数字在同源题上反复调参。后续扩大论文库并增加独立盲测问题后，再判断混合检索是否带来稳定收益。
 
-启用开发阈值后，对 30 条已知题和 9 条未知题得到：
+下面是接入Paper Cross-Encoder以前，一阶段检索分数门槛在30条已知题和9条未知题上的历史基线：
 
 | 检索器 | 阈值后已知 Recall@1 | Rejection Accuracy | Open-set Accuracy |
 |---|---:|---:|---:|
@@ -301,6 +310,8 @@ python -m src.paper_assistant --retriever hybrid --embedding-settings config/set
 | BM25 + Qwen Dense + RRF | 83.3% | 44.4% | 74.4% |
 
 这里的 Open-set Accuracy 把“已知题第一名正确”和“未知题成功拒答”都计为正确。阈值和指标使用同一批开发数据，因此只能说明实现链路和当前取舍；不能当作未见数据上的泛化结果。Dense 和 Hybrid 的结果也表明，简单分数阈值仍无法可靠区分所有近领域未知问题。
+
+当前Paper Cross-Encoder以Hybrid Top-20作为短名单。在原10篇开发库上，门槛2.5得到已知题接受29/30、未知题拒答9/9，共38/39；在676篇规模库上，25条多方面问题Facet全部通过，10条库外及带IoT干扰词的合成负例全部拒答。规模库最低已知Facet分3.617，最高负例分2.354。本结果仍是开发标定，不是用户盲测；它证明拒答信号和生产链路有效，不能写成真实用户准确率100%。
 
 检索以 `paper_id` 为单位。TCDI 的两个 PDF 版本会合并成一个候选结果，但结果中仍会列出两个可用文件。
 

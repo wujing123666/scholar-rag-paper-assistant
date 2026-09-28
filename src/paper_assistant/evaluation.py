@@ -23,6 +23,20 @@ class PaperRetriever(Protocol):
     def search(self, query: str, top_k: int = 3) -> list[PaperSearchResult]: ...
 
 
+class PaperSearchResponse(Protocol):
+    requested_retriever: str
+    effective_retriever: str
+    fallback_reason: str | None
+    rejected: bool
+    top_score: float | None
+    min_score: float | None
+    results: tuple[PaperSearchResult, ...]
+
+
+class PaperSearchService(Protocol):
+    def find_papers(self, query: str, *, top_k: int) -> PaperSearchResponse: ...
+
+
 @dataclass(frozen=True)
 class EvaluationCaseResult:
     query_id: str
@@ -153,6 +167,55 @@ def evaluate_retriever(
             )
         )
 
+    return _summarize_results(retriever.name, split, results)
+
+
+def evaluate_search_service(
+    service: PaperSearchService,
+    cases: Iterable[dict[str, Any]],
+    *,
+    split: str | None = None,
+    top_k: int = 3,
+) -> dict[str, Any]:
+    """Evaluate the same paper gate used by CLI, Web, and answer generation."""
+    selected_cases = [case for case in cases if split is None or case.get("split") == split]
+    results: list[EvaluationCaseResult] = []
+    retriever_name = "unknown"
+    for case in selected_cases:
+        response = service.find_papers(case["description"], top_k=top_k)
+        retriever_name = response.requested_retriever
+        returned_ids = tuple(item.paper.paper_id for item in response.results)
+        expected_paper_id = case["expected_paper_id"]
+        if expected_paper_id is None:
+            rank = None
+        else:
+            try:
+                rank = returned_ids.index(expected_paper_id) + 1
+            except ValueError:
+                rank = None
+        results.append(
+            EvaluationCaseResult(
+                query_id=case["id"],
+                expected_paper_id=expected_paper_id,
+                rank=rank,
+                returned_paper_ids=returned_ids,
+                split=case.get("split", "unspecified"),
+                difficulty=case.get("difficulty", "unspecified"),
+                rejected=response.rejected,
+                top_score=response.top_score,
+                min_score=response.min_score,
+                effective_retriever=response.effective_retriever,
+                fallback_reason=response.fallback_reason,
+            )
+        )
+    return _summarize_results(retriever_name, split, results)
+
+
+def _summarize_results(
+    retriever_name: str,
+    split: str | None,
+    results: list[EvaluationCaseResult],
+) -> dict[str, Any]:
     known_results = [result for result in results if result.expected_paper_id is not None]
     unknown_results = [result for result in results if result.expected_paper_id is None]
     groups: dict[str, list[EvaluationCaseResult]] = defaultdict(list)
@@ -162,7 +225,7 @@ def evaluate_retriever(
     correct_open_set = sum(result.rank == 1 for result in known_results) + correctly_rejected
     total = len(results)
     return {
-        "retriever": retriever.name,
+        "retriever": retriever_name,
         "split": split or "all",
         "overall": _metrics(known_results),
         "rejection": {

@@ -27,6 +27,19 @@ _TRAILING_PUNCTUATION = "？?。.!！"
 _MAX_ENUMERATION_ITEM_CHARS = 24
 _WIDE_MARKERS = ("综述", "总结", "概述", "调研", "梳理", "归纳", "全景")
 _WIDE_MIN_CHARS = 30
+_STRONG_ASPECT_SEPARATORS = ("、", "以及", "；", ";")
+_PAIR_SEPARATORS = ("和", "与")
+_SINGLE_RELATION_GOALS = (
+    "如何结合",
+    "怎样结合",
+    "怎么结合",
+    "如何融合",
+    "怎样融合",
+    "怎么融合",
+    "如何协同",
+    "怎样协同",
+    "怎么协同",
+)
 _JSON_FENCE = re.compile(r"^```[a-zA-Z]*\s*|\s*```$")
 
 
@@ -44,7 +57,22 @@ ItemT = TypeVar("ItemT", bound=HasChunkId)
 def looks_wide(query: str) -> bool:
     """Return whether an unresolved question is worth a splitter-model call."""
     text = query.strip()
-    return len(text) >= _WIDE_MIN_CHARS or any(marker in text for marker in _WIDE_MARKERS)
+    if len(text) >= _WIDE_MIN_CHARS or any(
+        marker in text for marker in _WIDE_MARKERS
+    ):
+        return True
+    if any(separator in text for separator in _STRONG_ASPECT_SEPARATORS):
+        return True
+
+    pair_count = sum(text.count(separator) for separator in _PAIR_SEPARATORS)
+    if pair_count >= 2:
+        return True
+    if pair_count == 1 and any(cue in text for cue in ("如何", "怎样", "怎么")):
+        # Questions such as "X 和 Y 如何结合" still ask for one relationship.
+        # Other compact Chinese questions commonly place two answer facets on
+        # either side of 和/与 and should be judged by the splitter model.
+        return not any(goal in text for goal in _SINGLE_RELATION_GOALS)
+    return sum(text.count(cue) for cue in ("什么", "哪些", "哪几", "有何")) >= 2
 
 
 def rule_split_query(
@@ -206,11 +234,14 @@ _SPLIT_SYSTEM_PROMPT = (
     "English.\n"
     "Rules:\n"
     "- Split only when the question really asks several distinct things at once.\n"
+    "- Return exactly one query per explicitly requested facet. If the user asks "
+    "two facets, return two queries; never add a combined or third query.\n"
     "- Add the aspect's own research vocabulary (for example \"datasets\" or "
     "\"open research problems\") so each query names the facet it looks for.\n"
     "- Write a short phrase, not a sentence, and never a literal translation.\n"
     "- Repeat the shared topic inside every query so it stands alone.\n"
-    "- Do not answer the question or add topics that the user did not ask about.\n"
+    "- Do not answer the question or add datasets, challenges, evaluations, or "
+    "other topics that the user did not ask about.\n"
     "- Reply with a JSON array of strings and nothing else; reply [] when the "
     "question is already focused."
 )

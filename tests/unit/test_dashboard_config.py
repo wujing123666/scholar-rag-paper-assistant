@@ -6,15 +6,13 @@ Covers:
 """
 
 from pathlib import Path
-from unittest.mock import MagicMock, patch
+from unittest.mock import MagicMock, call, patch
 
 import pytest
 
 from src.observability.dashboard.services.config_service import (
-    ComponentInfo,
     ConfigService,
 )
-
 
 # ── Fake Settings ────────────────────────────────────────────────────
 
@@ -140,3 +138,60 @@ class TestDashboardImports:
     def test_start_script_exists(self) -> None:
         script_path = Path("scripts/start_dashboard.py")
         assert script_path.exists()
+
+    def test_paper_request_gates_use_separate_wait_defaults(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from src.observability.dashboard.pages import paper_assistant as page
+
+        for name in (
+            "SCHOLARRAG_QUEUE_WAIT_SECONDS",
+            "SCHOLARRAG_SEARCH_QUEUE_WAIT_SECONDS",
+            "SCHOLARRAG_ANSWER_QUEUE_WAIT_SECONDS",
+        ):
+            monkeypatch.delenv(name, raising=False)
+        page._cached_search_gate.clear()
+        page._cached_answer_gate.clear()
+        try:
+            with patch.object(page, "RequestGate") as gate:
+                page._cached_search_gate()
+                page._cached_answer_gate()
+            assert gate.call_args_list == [
+                call(
+                    kind="paper_search",
+                    max_workers=8,
+                    max_queue_size=20,
+                    max_queue_wait_seconds=60.0,
+                    log_path=page.REQUEST_LOG_PATH,
+                ),
+                call(
+                    kind="paper_answer",
+                    max_workers=3,
+                    max_queue_size=20,
+                    max_queue_wait_seconds=180.0,
+                    log_path=page.REQUEST_LOG_PATH,
+                ),
+            ]
+        finally:
+            page._cached_search_gate.clear()
+            page._cached_answer_gate.clear()
+
+    def test_specific_queue_wait_overrides_shared_fallback(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from src.observability.dashboard.pages import paper_assistant as page
+
+        monkeypatch.setenv("SCHOLARRAG_QUEUE_WAIT_SECONDS", "90")
+        monkeypatch.setenv("SCHOLARRAG_SEARCH_QUEUE_WAIT_SECONDS", "30")
+        monkeypatch.delenv("SCHOLARRAG_ANSWER_QUEUE_WAIT_SECONDS", raising=False)
+        page._cached_search_gate.clear()
+        page._cached_answer_gate.clear()
+        try:
+            with patch.object(page, "RequestGate") as gate:
+                page._cached_search_gate()
+                page._cached_answer_gate()
+            assert gate.call_args_list[0].kwargs["max_queue_wait_seconds"] == 30.0
+            assert gate.call_args_list[1].kwargs["max_queue_wait_seconds"] == 90.0
+        finally:
+            page._cached_search_gate.clear()
+            page._cached_answer_gate.clear()

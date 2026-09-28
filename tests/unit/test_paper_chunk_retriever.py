@@ -33,9 +33,17 @@ class FakeEmbedding:
         return [[0.1, 0.2, 0.3] for _ in texts]
 
 
+class FailOnSecondDocumentBatch(FakeEmbedding):
+    def embed(self, texts, **kwargs):
+        if not kwargs.get("is_query") and len(self.calls) == 1:
+            raise RuntimeError("simulated provider interruption")
+        return super().embed(texts, **kwargs)
+
+
 class FakeStore:
     def __init__(self) -> None:
         self.records: dict[str, dict] = {}
+        self.staging_records: dict[str, dict] | None = None
         self.last_filters = None
 
     def list_ids(self):
@@ -56,6 +64,29 @@ class FakeStore:
     def delete(self, ids):
         for record_id in ids:
             self.records.pop(record_id, None)
+
+    def begin_rebuild(self):
+        self.staging_records = {}
+
+    def upsert_rebuild(self, records):
+        if self.staging_records is None:
+            raise RuntimeError("rebuild not active")
+        for record in records:
+            self.staging_records[record["id"]] = {
+                "id": record["id"],
+                "text": record["document"],
+                "metadata": record["metadata"],
+                "score": 0.9,
+            }
+
+    def commit_rebuild(self):
+        if self.staging_records is None:
+            raise RuntimeError("rebuild not active")
+        self.records = self.staging_records
+        self.staging_records = None
+
+    def abort_rebuild(self):
+        self.staging_records = None
 
     def query(self, vector, top_k=10, filters=None):
         del vector
@@ -204,6 +235,149 @@ def test_chunk_retriever_indexes_once_and_reuses_unchanged_chunks(tmp_path):
     assert second.index_sync.embedded == 0
     assert second.index_sync.reused == embedded
     assert len(embedding.calls) == 1
+
+
+def test_chunk_retriever_resumes_after_provider_failure_by_paper(tmp_path):
+    inbox = tmp_path / "inbox"
+    inbox.mkdir()
+    _write_pdf(inbox / "first.pdf")
+    _write_pdf(inbox / "second.pdf")
+    catalog = PaperCatalog(
+        [_profile("first", "first.pdf"), _profile("second", "second.pdf")]
+    )
+    store = FakeStore()
+
+    with pytest.raises(RuntimeError, match="simulated provider interruption"):
+        PaperChunkRetriever(
+            catalog,
+            inbox,
+            FailOnSecondDocumentBatch(),
+            store,
+            chunk_size=300,
+            chunk_overlap=40,
+        )
+
+    durable_first_ids = {
+        record_id
+        for record_id, record in store.records.items()
+        if record["metadata"]["paper_id"] == "first"
+    }
+    assert durable_first_ids
+    assert all(
+        record["metadata"]["paper_id"] != "second"
+        for record in store.records.values()
+    )
+
+    recovery_embedding = FakeEmbedding()
+    recovered = PaperChunkRetriever(
+        catalog,
+        inbox,
+        recovery_embedding,
+        store,
+        chunk_size=300,
+        chunk_overlap=40,
+    )
+
+    assert recovered.index_sync.reused == len(durable_first_ids)
+    assert recovered.index_sync.embedded > 0
+    assert len(recovery_embedding.calls) == 1
+    assert {record["metadata"]["paper_id"] for record in store.records.values()} == {
+        "first",
+        "second",
+    }
+
+
+def test_chunk_retriever_reports_progress_after_durable_paper_commit(tmp_path):
+    inbox = tmp_path / "inbox"
+    inbox.mkdir()
+    _write_pdf(inbox / "paper.pdf")
+    events = []
+
+    retriever = PaperChunkRetriever(
+        PaperCatalog([_profile()]),
+        inbox,
+        FakeEmbedding(),
+        FakeStore(),
+        chunk_size=300,
+        chunk_overlap=40,
+        progress_callback=events.append,
+        build_sparse_index=False,
+    )
+
+    assert len(events) == 1
+    assert events[0].completed_papers == 1
+    assert events[0].total_papers == 1
+    assert events[0].run_completed_papers == 1
+    assert events[0].run_total_papers == 1
+    assert events[0].paper_id == "paper_a"
+    assert events[0].paper_chunks == retriever.index_sync.embedded
+    assert not hasattr(retriever, "_search_records")
+
+
+def test_dimension_change_stages_each_paper_before_replacing_live_index(tmp_path):
+    inbox = tmp_path / "inbox"
+    inbox.mkdir()
+    _write_pdf(inbox / "paper.pdf")
+    catalog = PaperCatalog([_profile()])
+    store = FakeStore()
+    PaperChunkRetriever(catalog, inbox, FakeEmbedding(), store)
+
+    class FourDimensionEmbedding(FakeEmbedding):
+        model = "replacement-model"
+
+        def get_dimension(self) -> int:
+            return 4
+
+        def embed(self, texts, **kwargs):
+            self.calls.append((list(texts), bool(kwargs.get("is_query", False))))
+            return [[0.1, 0.2, 0.3, 0.4] for _ in texts]
+
+    rebuilt = PaperChunkRetriever(
+        catalog,
+        inbox,
+        FourDimensionEmbedding(),
+        store,
+    )
+
+    assert rebuilt.index_sync.rebuilt is True
+    assert rebuilt.index_sync.embedded == len(store.records)
+    assert {
+        record["metadata"]["embedding_dimension"] for record in store.records.values()
+    } == {4}
+
+
+def test_dimension_change_aborts_staging_when_reembedding_fails(tmp_path):
+    inbox = tmp_path / "inbox"
+    inbox.mkdir()
+    _write_pdf(inbox / "first.pdf")
+    _write_pdf(inbox / "second.pdf")
+    catalog = PaperCatalog(
+        [_profile("first", "first.pdf"), _profile("second", "second.pdf")]
+    )
+    store = FakeStore()
+    PaperChunkRetriever(catalog, inbox, FakeEmbedding(), store)
+    original_ids = set(store.records)
+
+    class FailingReplacement(FakeEmbedding):
+        model = "failing-replacement"
+
+        def get_dimension(self) -> int:
+            return 4
+
+        def embed(self, texts, **kwargs):
+            if self.calls:
+                raise RuntimeError("replacement interrupted")
+            self.calls.append((list(texts), False))
+            return [[0.1, 0.2, 0.3, 0.4] for _ in texts]
+
+    with pytest.raises(RuntimeError, match="replacement interrupted"):
+        PaperChunkRetriever(catalog, inbox, FailingReplacement(), store)
+
+    assert set(store.records) == original_ids
+    assert store.staging_records is None
+    assert {
+        record["metadata"]["embedding_dimension"] for record in store.records.values()
+    } == {3}
 
 
 def test_chunk_search_filters_candidates_and_returns_traceable_text(tmp_path):

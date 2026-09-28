@@ -7,6 +7,7 @@ a lightweight, open-source embedding database designed for local-first deploymen
 from __future__ import annotations
 
 import logging
+import uuid
 from typing import TYPE_CHECKING, Any, Dict, List, Optional
 
 try:
@@ -24,6 +25,8 @@ if TYPE_CHECKING:
     from src.core.settings import Settings
 
 logger = logging.getLogger(__name__)
+GET_BY_IDS_BATCH_SIZE = 500
+DEFAULT_UPSERT_BATCH_SIZE = 5000
 
 
 class ChromaStore(BaseVectorStore):
@@ -116,6 +119,8 @@ class ChromaStore(BaseVectorStore):
         
         self.client = None
         self.collection = None
+        self._rebuild_collection = None
+        self._rebuild_collection_name = None
         self._ensure_open()
 
         logger.info(
@@ -165,6 +170,8 @@ class ChromaStore(BaseVectorStore):
         client = getattr(self, "client", None)
         if client is None:
             return
+        if getattr(self, "_rebuild_collection", None) is not None:
+            self.abort_rebuild()
 
         self.collection = None
         self.client = None
@@ -238,19 +245,135 @@ class ChromaStore(BaseVectorStore):
             document = record.get('document', metadata.get('text', record['id']))
             documents.append(str(document))
         
-        # Perform upsert (ChromaDB's add() is idempotent with same IDs)
+        self._upsert_prepared(
+            self.collection,
+            ids=ids,
+            embeddings=embeddings,
+            metadatas=metadatas,
+            documents=documents,
+        )
+        logger.debug(f"Successfully upserted {len(records)} records to ChromaDB")
+
+    def _upsert_prepared(
+        self,
+        collection: Any,
+        *,
+        ids: list[str],
+        embeddings: list[list[float]],
+        metadatas: list[dict[str, Any]],
+        documents: list[str],
+    ) -> None:
+        """Write records without exceeding the active Chroma client's limit."""
+        get_limit = getattr(self.client, "get_max_batch_size", None)
+        max_batch_size = (
+            int(get_limit()) if callable(get_limit) else DEFAULT_UPSERT_BATCH_SIZE
+        )
+        batch_size = max(1, min(DEFAULT_UPSERT_BATCH_SIZE, max_batch_size))
         try:
-            self.collection.upsert(
-                ids=ids,
-                embeddings=embeddings,
-                metadatas=metadatas,
-                documents=documents,
-            )
-            logger.debug(f"Successfully upserted {len(records)} records to ChromaDB")
+            for start in range(0, len(ids), batch_size):
+                end = start + batch_size
+                collection.upsert(
+                    ids=ids[start:end],
+                    embeddings=embeddings[start:end],
+                    metadatas=metadatas[start:end],
+                    documents=documents[start:end],
+                )
         except Exception as e:
             raise RuntimeError(
-                f"Failed to upsert {len(records)} records to ChromaDB: {e}"
+                f"Failed to upsert {len(ids)} records to ChromaDB: {e}"
             ) from e
+
+    def begin_rebuild(self) -> None:
+        """Create an isolated staging collection for a dimension-changing rebuild."""
+        self._ensure_open()
+        if self._rebuild_collection is not None:
+            raise RuntimeError("A Chroma collection rebuild is already active")
+        name = f"{self.collection_name}__rebuild_{uuid.uuid4().hex[:12]}"
+        try:
+            self._rebuild_collection = self.client.create_collection(
+                name=name,
+                metadata={"hnsw:space": "cosine"},
+            )
+            self._rebuild_collection_name = name
+        except Exception as e:
+            raise RuntimeError(
+                f"Failed to create staging collection for '{self.collection_name}': {e}"
+            ) from e
+
+    def upsert_rebuild(self, records: List[Dict[str, Any]]) -> None:
+        """Write one durable batch into the active staging collection."""
+        if self._rebuild_collection is None:
+            raise RuntimeError("No Chroma collection rebuild is active")
+        self.validate_records(records)
+        ids = [str(record["id"]) for record in records]
+        embeddings = [record["vector"] for record in records]
+        metadatas = [
+            self._sanitize_metadata(record.get("metadata", {}))
+            or {"_placeholder": "true"}
+            for record in records
+        ]
+        documents = [
+            str(
+                record.get(
+                    "document",
+                    record.get("metadata", {}).get("text", record["id"]),
+                )
+            )
+            for record in records
+        ]
+        self._upsert_prepared(
+            self._rebuild_collection,
+            ids=ids,
+            embeddings=embeddings,
+            metadatas=metadatas,
+            documents=documents,
+        )
+
+    def commit_rebuild(self) -> None:
+        """Atomically expose the staged collection and then remove the old one."""
+        if self._rebuild_collection is None or self._rebuild_collection_name is None:
+            raise RuntimeError("No Chroma collection rebuild is active")
+        self._ensure_open()
+        old_collection = self.collection
+        staging_collection = self._rebuild_collection
+        backup_name = f"{self.collection_name}__backup_{uuid.uuid4().hex[:12]}"
+        old_renamed = False
+        try:
+            old_collection.modify(name=backup_name)
+            old_renamed = True
+            staging_collection.modify(name=self.collection_name)
+        except Exception as e:
+            if old_renamed:
+                try:
+                    old_collection.modify(name=self.collection_name)
+                except Exception:
+                    logger.exception("Failed to roll back Chroma collection rename")
+            raise RuntimeError(
+                f"Failed to activate rebuilt collection '{self.collection_name}': {e}"
+            ) from e
+
+        self.collection = self.client.get_collection(name=self.collection_name)
+        self._rebuild_collection = None
+        self._rebuild_collection_name = None
+        try:
+            self.client.delete_collection(name=backup_name)
+        except Exception:
+            logger.exception(
+                "Activated rebuilt collection but could not delete backup '%s'",
+                backup_name,
+            )
+
+    def abort_rebuild(self) -> None:
+        """Discard a failed staging collection without touching the live index."""
+        name = self._rebuild_collection_name
+        self._rebuild_collection = None
+        self._rebuild_collection_name = None
+        if not name or self.client is None:
+            return
+        try:
+            self.client.delete_collection(name=name)
+        except Exception:
+            logger.exception("Failed to delete staging Chroma collection '%s'", name)
     
     def query(
         self,
@@ -549,31 +672,35 @@ class ChromaStore(BaseVectorStore):
         # Ensure all IDs are strings
         str_ids = [str(id_) for id_ in ids]
         
+        # Build a mapping from ID to result for O(1) lookup
+        id_to_result: Dict[str, Dict[str, Any]] = {}
         try:
-            # ChromaDB's get method retrieves records by IDs
-            results = self.collection.get(
-                ids=str_ids,
-                include=["metadatas", "documents"]
-            )
+            # One very large ``ids IN (...)`` query exceeds SQLite's variable
+            # limit once a corpus reaches tens of thousands of chunks.
+            for start in range(0, len(str_ids), GET_BY_IDS_BATCH_SIZE):
+                batch_ids = str_ids[start : start + GET_BY_IDS_BATCH_SIZE]
+                results = self.collection.get(
+                    ids=batch_ids,
+                    include=["metadatas", "documents"],
+                )
+                if not results or not results.get("ids"):
+                    continue
+                result_ids = results["ids"]
+                documents = results.get("documents", [None] * len(result_ids))
+                metadatas = results.get("metadatas", [{}] * len(result_ids))
+
+                for i, record_id in enumerate(result_ids):
+                    id_to_result[record_id] = {
+                        "id": record_id,
+                        "text": documents[i] if documents and documents[i] else "",
+                        "metadata": (
+                            metadatas[i] if metadatas and metadatas[i] else {}
+                        ),
+                    }
         except Exception as e:
             raise RuntimeError(
                 f"Failed to get records by IDs from ChromaDB: {e}"
             ) from e
-        
-        # Build a mapping from ID to result for O(1) lookup
-        id_to_result: Dict[str, Dict[str, Any]] = {}
-        
-        if results and results.get('ids'):
-            result_ids = results['ids']
-            documents = results.get('documents', [None] * len(result_ids))
-            metadatas = results.get('metadatas', [{}] * len(result_ids))
-            
-            for i, record_id in enumerate(result_ids):
-                id_to_result[record_id] = {
-                    'id': record_id,
-                    'text': documents[i] if documents and documents[i] else '',
-                    'metadata': metadatas[i] if metadatas and metadatas[i] else {}
-                }
         
         # Return results in the same order as input ids
         output = []

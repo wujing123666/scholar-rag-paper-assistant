@@ -147,7 +147,7 @@ streamlit run src/observability/dashboard/app.py
 
 ### 单进程并发与排队
 
-ScholarRAG 页面在一个 Streamlit 进程内共享两条有界队列。默认最多同时执行 8 个论文检索和 3 个论文问答，每类最多再等待 20 个请求；队列已满时立即提示稍后重试，排队超过 60 秒的任务不会再调用 RAG。每次请求只把类型、状态、排队时间、执行时间、总耗时和异常类型写入本地 `logs/paper_requests.jsonl`，不记录问题、论文原文、模型响应或 API Key。
+ScholarRAG 页面在一个 Streamlit 进程内共享两条有界队列。默认最多同时执行 8 个论文检索和 3 个论文问答，每类最多再等待 20 个请求；队列已满时立即提示稍后重试。快速搜索最多等待 60 秒，完整问答最多等待 180 秒。20 请求压测中，单次完整问答约需 15～34 秒，原来的 60 秒会让后半批请求尚未获得执行槽就超时；延长问答的有界等待时间可以接住突发流量，同时不增加模型 API 和 CPU 重排器的并行压力。每次请求只把类型、状态、排队时间、执行时间、总耗时和异常类型写入本地 `logs/paper_requests.jsonl`，不记录问题、论文原文、模型响应或 API Key。
 
 可以在启动前通过环境变量调整：
 
@@ -155,9 +155,14 @@ ScholarRAG 页面在一个 Streamlit 进程内共享两条有界队列。默认�
 $env:SCHOLARRAG_SEARCH_WORKERS = "8"
 $env:SCHOLARRAG_ANSWER_WORKERS = "3"
 $env:SCHOLARRAG_MAX_QUEUE = "20"
-$env:SCHOLARRAG_QUEUE_WAIT_SECONDS = "60"
+$env:SCHOLARRAG_SEARCH_QUEUE_WAIT_SECONDS = "60"
+$env:SCHOLARRAG_ANSWER_QUEUE_WAIT_SECONDS = "180"
 streamlit run src/observability/dashboard/app.py
 ```
+
+旧的 `SCHOLARRAG_QUEUE_WAIT_SECONDS` 仍可作为两类请求的共同回退值；分别设置上面两个变量时，以分类配置为准。
+
+在开发机上使用676篇论文、53,578个正文Chunk做正式链路验收：一条多方面问题开启双模型Claim共识验证后生成10条Claim，10条全部保留，其中4条高风险Claim进入第二评审；并发阶段关闭Claim评审，只隔离测试生产检索与答案生成能力。压测请求由10个物联网主题的两种自然问法组成，20个查询字符串互不相同，避免重复问题直接命中查询向量缓存。20个完整问答同时到达、3个问答Worker、180秒等待上限时，20/20完成并正常回答、0超时、0检索降级；总墙钟134.25秒，P95总响应127.58秒，最长排队124.83秒。常驻进程峰值RSS约5.57 GiB，主要来自53,578个Chunk的Sparse结构和本地ONNX重排器；这组数据是单台开发机的容量基线，不是不同硬件和公网环境下的吞吐承诺。
 
 这些限制只在同一个 Streamlit 进程内共享。运行多个 Streamlit 进程或多台服务器时，每个进程会有自己的队列，需要再引入共享队列或统一后端；当前约 20 人的局域网部署先保留单进程结构，并依据压测结果决定是否扩展。
 

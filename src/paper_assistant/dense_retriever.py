@@ -11,6 +11,7 @@ from src.paper_assistant.catalog import PaperCatalog, PaperProfile
 from src.paper_assistant.retriever import PaperSearchResult
 
 PAPER_RECORD_PREFIX = "paper:"
+DEFAULT_SYNC_BATCH_SIZE = 64
 
 
 def profile_text(profile: PaperProfile) -> str:
@@ -72,6 +73,41 @@ class PaperDenseRetriever:
     def _profile_hash(text: str) -> str:
         return hashlib.sha256(text.encode("utf-8")).hexdigest()
 
+    def _records_for_profiles(
+        self,
+        items: list[tuple[str, PaperProfile, str, str]],
+        vectors: list[list[float]],
+    ) -> list[dict]:
+        if len(vectors) != len(items):
+            raise ValueError("Embedding provider returned an invalid document matrix")
+        records = []
+        for (record_id, profile, text, content_hash), vector in zip(items, vectors):
+            if len(vector) != self.embedding_dimension:
+                raise ValueError(
+                    "Embedding provider returned a document vector with the wrong dimension"
+                )
+            records.append(
+                {
+                    "id": record_id,
+                    "vector": vector,
+                    "document": text,
+                    "metadata": {
+                        "record_type": "paper_profile",
+                        "paper_id": profile.paper_id,
+                        "profile_hash": content_hash,
+                        "embedding_model": self.embedding_model,
+                        "embedding_dimension": self.embedding_dimension,
+                    },
+                }
+            )
+        return records
+
+    def _embed_profiles(
+        self, items: list[tuple[str, PaperProfile, str, str]]
+    ) -> list[dict]:
+        vectors = self.embedding.embed([item[2] for item in items])
+        return self._records_for_profiles(items, vectors)
+
     def _sync_index(self) -> PaperIndexSync:
         profiles = {self._record_id(item.paper_id): item for item in self.catalog.profiles}
         current_ids = set(self.vector_store.list_ids())
@@ -82,58 +118,55 @@ class PaperDenseRetriever:
             if record and record.get("id")
         }
 
-        rebuilt = any(
-            record.get("metadata", {}).get("embedding_model") != self.embedding_model
-            or record.get("metadata", {}).get("embedding_dimension")
+        dimension_rebuild = any(
+            record.get("metadata", {}).get("embedding_dimension")
             != self.embedding_dimension
             for record in current.values()
         )
+        rebuilt = dimension_rebuild or any(
+            record.get("metadata", {}).get("embedding_model") != self.embedding_model
+            for record in current.values()
+        )
         expected_ids = set(profiles)
-        stale_ids = [] if rebuilt else sorted(current_ids - expected_ids)
+        stale_ids = sorted(current_ids - expected_ids)
 
         changed: list[tuple[str, PaperProfile, str, str]] = []
         for record_id, profile in profiles.items():
             text = profile_text(profile)
             content_hash = self._profile_hash(text)
             metadata = current.get(record_id, {}).get("metadata", {})
-            if rebuilt or metadata.get("profile_hash") != content_hash:
+            if (
+                dimension_rebuild
+                or metadata.get("profile_hash") != content_hash
+                or metadata.get("embedding_model") != self.embedding_model
+                or metadata.get("embedding_dimension") != self.embedding_dimension
+            ):
                 changed.append((record_id, profile, text, content_hash))
 
-        records = []
-        if changed:
-            vectors = self.embedding.embed([item[2] for item in changed])
-            if len(vectors) != len(changed):
-                raise ValueError("Embedding provider returned an invalid document matrix")
-            for (record_id, profile, text, content_hash), vector in zip(changed, vectors):
-                if len(vector) != self.embedding_dimension:
-                    raise ValueError(
-                        "Embedding provider returned a document vector with the wrong dimension"
-                    )
-                records.append(
-                    {
-                        "id": record_id,
-                        "vector": vector,
-                        "document": text,
-                        "metadata": {
-                            "record_type": "paper_profile",
-                            "paper_id": profile.paper_id,
-                            "profile_hash": content_hash,
-                            "embedding_model": self.embedding_model,
-                            "embedding_dimension": self.embedding_dimension,
-                        },
-                    }
-                )
         deleted = 0
-        if rebuilt and current_ids:
-            # Do not remove the last usable index until all replacement vectors
-            # have been generated and validated successfully.
+        if dimension_rebuild:
+            # Chroma collections have a fixed vector dimension. Do not remove the
+            # last usable index until every replacement vector has succeeded.
+            replacement_records = self._embed_profiles(changed) if changed else []
             self.vector_store.clear()
             deleted = len(current_ids)
-        if records:
-            self.vector_store.upsert(records)
-        if stale_ids:
-            self.vector_store.delete(stale_ids)
-            deleted += len(stale_ids)
+            if replacement_records:
+                self.vector_store.upsert(replacement_records)
+        else:
+            # Keep the provider's own request batch size as the persistence
+            # checkpoint. A later failure leaves completed batches available for
+            # reuse when the same synchronization job is restarted.
+            sync_batch_size = int(
+                getattr(self.embedding, "batch_size", DEFAULT_SYNC_BATCH_SIZE)
+            )
+            if sync_batch_size < 1:
+                sync_batch_size = DEFAULT_SYNC_BATCH_SIZE
+            for start in range(0, len(changed), sync_batch_size):
+                batch = changed[start : start + sync_batch_size]
+                self.vector_store.upsert(self._embed_profiles(batch))
+            if stale_ids:
+                self.vector_store.delete(stale_ids)
+                deleted += len(stale_ids)
 
         return PaperIndexSync(
             total=len(profiles),

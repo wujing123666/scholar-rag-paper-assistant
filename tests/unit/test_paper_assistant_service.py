@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import sys
+from dataclasses import replace
 
 from src.libs.llm.base_llm import ChatResponse
 from src.paper_assistant.catalog import PaperCatalog, PaperProfile
@@ -134,6 +135,97 @@ def test_find_papers_returns_ui_ready_metadata():
     assert payload["results"][0]["pdf_files"] == ["paper-a.pdf"]
 
 
+class _PaperReranker:
+    def __init__(self, scores=None, error=None):
+        self.scores = scores or {}
+        self.error = error
+        self.calls = []
+
+    def rerank(self, query, candidates, *, top_k):
+        self.calls.append((query, candidates, top_k))
+        if self.error:
+            raise self.error
+        scored = [
+            replace(item, score=self.scores[item.paper.paper_id])
+            for item in candidates
+        ]
+        return sorted(scored, key=lambda item: -item.score)[:top_k]
+
+
+def test_find_papers_uses_cross_encoder_logit_for_ranking_and_acceptance():
+    catalog = PaperCatalog((_paper("paper-a", "论文A"), _paper("paper-b", "论文B")))
+    reranker = _PaperReranker({"paper-a": -2.0, "paper-b": 4.2})
+    service = PaperAssistantService(
+        catalog=catalog,
+        paper_retriever=_PaperRetriever(catalog),
+        paper_reranker=reranker,
+        requested_retriever="bm25",
+        config=PaperAssistantConfig(
+            retriever="bm25",
+            candidate_papers=2,
+            paper_rerank_candidates=20,
+            paper_min_score=1.5,
+        ),
+    )
+
+    result = service.find_papers("目标论文")
+
+    assert result.rejected is False
+    assert result.score_kind == "cross_encoder_logit"
+    assert result.top_score == 4.2
+    assert result.min_score == 1.5
+    assert [item.paper.paper_id for item in result.results] == ["paper-b"]
+    assert reranker.calls[0][2] == 2
+
+
+def test_find_papers_rejects_when_all_cross_encoder_logits_are_low():
+    catalog = PaperCatalog((_paper("paper-a", "论文A"), _paper("paper-b", "论文B")))
+    service = PaperAssistantService(
+        catalog=catalog,
+        paper_retriever=_PaperRetriever(catalog),
+        paper_reranker=_PaperReranker({"paper-a": 1.4, "paper-b": -3.0}),
+        requested_retriever="bm25",
+        config=PaperAssistantConfig(retriever="bm25", candidate_papers=2),
+    )
+
+    result = service.find_papers("库外问题")
+
+    assert result.rejected is True
+    assert result.reason == "below_threshold"
+    assert result.top_score == 1.4
+    assert result.results == ()
+
+
+def test_find_papers_falls_back_to_legacy_gate_when_cross_encoder_fails():
+    catalog = PaperCatalog((_paper("paper-a", "论文A"), _paper("paper-b", "论文B")))
+    service = PaperAssistantService(
+        catalog=catalog,
+        paper_retriever=_PaperRetriever(catalog),
+        paper_reranker=_PaperReranker(error=RuntimeError("inference failed")),
+        requested_retriever="bm25",
+        config=PaperAssistantConfig(retriever="bm25", candidate_papers=2),
+    )
+
+    result = service.find_papers("目标论文")
+
+    assert result.rejected is False
+    assert result.score_kind == "retriever_fallback"
+    assert result.min_score == 8.0
+    assert "paper_reranker_unavailable:RuntimeError" in result.fallback_reason
+
+
+def test_disable_rejection_bypasses_paper_cross_encoder():
+    service = _service()
+    reranker = _PaperReranker(error=AssertionError("must not run"))
+    service.paper_reranker = reranker
+
+    result = service.find_papers("目标论文", disable_rejection=True)
+
+    assert result.rejected is False
+    assert result.score_kind == "retriever"
+    assert reranker.calls == []
+
+
 def test_answer_question_runs_routing_retrieval_and_grounded_generation():
     service = _service()
 
@@ -164,7 +256,99 @@ def test_answer_question_rule_splits_explicit_aspects_without_model_cost():
         "open research problems",
         "open research problems",
     ]
-    assert service.chunk_retriever.context_calls == [("paper-a", "paper-b")]
+    assert service.chunk_retriever.context_calls == [
+        ("paper-a", "paper-b"),
+        ("paper-a", "paper-b"),
+        ("paper-a", "paper-b"),
+    ]
+
+
+def test_multi_aspect_question_routes_each_facet_to_its_own_paper():
+    catalog = PaperCatalog(
+        (
+            _paper("paper-a", "环节论文"),
+            _paper("paper-b", "数据集论文"),
+            _paper("paper-c", "开放问题论文"),
+        )
+    )
+
+    class _FacetPaperRetriever:
+        name = "paper_bm25"
+
+        def __init__(self):
+            self.catalog = catalog
+            self.calls = []
+
+        def search(self, query: str, top_k: int = 3):
+            self.calls.append((query, top_k))
+            if "datasets" in query:
+                paper = catalog.get("paper-b")
+            elif "open research problems" in query:
+                paper = catalog.get("paper-c")
+            else:
+                paper = catalog.get("paper-a")
+            return [PaperSearchResult(paper, 12.0, ())]
+
+    paper_retriever = _FacetPaperRetriever()
+    chunk_retriever = _ChunkRetriever(catalog)
+    service = PaperAssistantService(
+        catalog=catalog,
+        paper_retriever=paper_retriever,
+        requested_retriever="bm25",
+        chunk_retriever=chunk_retriever,
+        generation_llm=_GenerationLLM(),
+        config=PaperAssistantConfig(
+            retriever="bm25",
+            min_score=0.0,
+            candidate_papers=1,
+            top_k=3,
+        ),
+    )
+
+    result = service.answer_question(
+        "这篇综述总结了哪些核心环节、常用数据集和开放问题？"
+    )
+
+    assert result.candidate_paper_ids == ("paper-a", "paper-b", "paper-c")
+    assert {call[2] for call in chunk_retriever.calls} == {
+        ("paper-a",),
+        ("paper-b",),
+        ("paper-c",),
+    }
+    assert [item.paper.paper_id for item in result.evidence_results] == [
+        "paper-a",
+        "paper-b",
+        "paper-c",
+    ]
+
+
+def test_multi_aspect_question_refuses_when_one_facet_has_no_relevant_paper():
+    catalog = PaperCatalog((_paper("paper-a", "论文A"), _paper("paper-b", "论文B")))
+
+    class _IncompleteFacetRetriever:
+        name = "paper_bm25"
+
+        def search(self, query: str, top_k: int = 3):
+            if "datasets" in query:
+                return []
+            return [PaperSearchResult(catalog.profiles[0], 12.0, ())]
+
+    service = PaperAssistantService(
+        catalog=catalog,
+        paper_retriever=_IncompleteFacetRetriever(),
+        requested_retriever="bm25",
+        chunk_retriever=_ChunkRetriever(catalog),
+        generation_llm=_GenerationLLM(),
+        config=PaperAssistantConfig(retriever="bm25", min_score=0.0),
+    )
+
+    result = service.answer_question(
+        "这篇综述总结了哪些核心环节、常用数据集和开放问题？"
+    )
+
+    assert result.answer.status == "insufficient_evidence"
+    assert result.answer.reason == "incomplete_facet_paper_coverage"
+    assert service.generation_llm.calls == []
 
 
 def test_answer_question_anchors_each_aspect_to_the_paper_table_captions():
@@ -256,6 +440,39 @@ def test_answer_question_does_not_load_expensive_dependencies_when_routing_rejec
 
     assert result.answer.status == "insufficient_evidence"
     assert calls == []
+
+
+def test_long_unknown_question_loads_splitter_without_loading_chunk_index():
+    catalog = PaperCatalog((_paper("paper-a", "论文A"), _paper("paper-b", "论文B")))
+    splitter_calls = []
+    answer_dependency_calls = []
+
+    class _FocusedSplitter:
+        def chat(self, messages, **kwargs):
+            splitter_calls.append((messages, kwargs))
+            return ChatResponse(content="[]", model="splitter")
+
+    def load_answer_dependencies():
+        answer_dependency_calls.append("loaded")
+        raise AssertionError("chunk index should stay lazy for a rejected query")
+
+    service = PaperAssistantService(
+        catalog=catalog,
+        paper_retriever=_PaperRetriever(catalog),
+        requested_retriever="bm25",
+        splitter_llm_loader=_FocusedSplitter,
+        answer_dependency_loader=load_answer_dependencies,
+        config=PaperAssistantConfig(retriever="bm25", min_score=99.0),
+    )
+
+    result = service.answer_question(
+        "请帮我寻找一篇讨论量子引力、黑洞信息悖论和弦理论统一框架的论文，最好还有实验验证"
+    )
+
+    assert result.answer.status == "insufficient_evidence"
+    assert result.answer.reason == "no_candidate_papers"
+    assert len(splitter_calls) == 1
+    assert answer_dependency_calls == []
 
 
 def test_answer_question_validates_explicit_paper_ids():

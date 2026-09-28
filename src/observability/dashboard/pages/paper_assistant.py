@@ -18,7 +18,6 @@ from src.paper_assistant.service import (
     PaperAssistantConfig,
     PaperSearchResponse,
     build_paper_assistant_service,
-    build_paper_search_service,
 )
 
 REQUEST_LOG_PATH = Path("logs/paper_requests.jsonl")
@@ -42,7 +41,9 @@ def _positive_env_float(name: str, default: float) -> float:
 
 @st.cache_resource(show_spinner=False)
 def _cached_search_service(config: PaperAssistantConfig):
-    return build_paper_search_service(config)
+    # Both tabs share one lazy service, one paper index, and one synchronized
+    # Cross-Encoder model instead of keeping duplicate model copies in memory.
+    return _cached_answer_service(config)
 
 
 @st.cache_resource(show_spinner=False)
@@ -57,7 +58,8 @@ def _cached_search_gate() -> RequestGate:
         max_workers=_positive_env_int("SCHOLARRAG_SEARCH_WORKERS", 8),
         max_queue_size=_positive_env_int("SCHOLARRAG_MAX_QUEUE", 20),
         max_queue_wait_seconds=_positive_env_float(
-            "SCHOLARRAG_QUEUE_WAIT_SECONDS", 60.0
+            "SCHOLARRAG_SEARCH_QUEUE_WAIT_SECONDS",
+            _positive_env_float("SCHOLARRAG_QUEUE_WAIT_SECONDS", 60.0),
         ),
         log_path=REQUEST_LOG_PATH,
     )
@@ -70,7 +72,8 @@ def _cached_answer_gate() -> RequestGate:
         max_workers=_positive_env_int("SCHOLARRAG_ANSWER_WORKERS", 3),
         max_queue_size=_positive_env_int("SCHOLARRAG_MAX_QUEUE", 20),
         max_queue_wait_seconds=_positive_env_float(
-            "SCHOLARRAG_QUEUE_WAIT_SECONDS", 60.0
+            "SCHOLARRAG_ANSWER_QUEUE_WAIT_SECONDS",
+            _positive_env_float("SCHOLARRAG_QUEUE_WAIT_SECONDS", 180.0),
         ),
         log_path=REQUEST_LOG_PATH,
     )
@@ -93,6 +96,12 @@ def _build_config() -> PaperAssistantConfig:
             retriever = st.selectbox(
                 "论文检索器", ("hybrid", "bm25", "dense"), index=0
             )
+            paper_reranker = st.selectbox(
+                "论文相关性判定",
+                ("fastembed", "none"),
+                index=0,
+                help="Hybrid先召回候选论文，再用本地Cross-Encoder排序并判断是否应拒答。",
+            )
             reranker = st.selectbox(
                 "正文重排", ("fastembed", "none"), index=0
             )
@@ -102,6 +111,12 @@ def _build_config() -> PaperAssistantConfig:
             )
             second_policy = st.selectbox(
                 "第二评审策略", ("risk_based", "all"), index=0
+            )
+            paper_min_score = st.number_input(
+                "论文相关性门槛",
+                value=2.5,
+                step=0.1,
+                help="BAAI/bge-reranker-base的原始logit；更换模型后必须重新标定。",
             )
         max_answer_claims = st.number_input(
             "每次回答最多Claim数",
@@ -119,6 +134,8 @@ def _build_config() -> PaperAssistantConfig:
         settings_path=Path(settings_path.strip() or default_settings),
         fallback_settings_path=(Path(fallback_path.strip()) if fallback_path.strip() else None),
         retriever=retriever,
+        paper_reranker=paper_reranker,
+        paper_min_score=float(paper_min_score),
         chunk_reranker=reranker,
         verify_claims=verification,
         claim_second_judge_policy=second_policy,
@@ -134,6 +151,8 @@ def _render_search(response: PaperSearchResponse) -> None:
             st.caption(
                 f"最高分 {response.top_score:.4f}，门槛 {response.min_score:.4f}"
             )
+        if response.fallback_reason:
+            st.info(f"本次检索发生降级：{response.fallback_reason}")
         return
     st.success(f"找到 {len(response.results)} 篇候选论文")
     for item in payload["results"]:
@@ -142,7 +161,12 @@ def _render_search(response: PaperSearchResponse) -> None:
             if item["canonical_title"] != item["title"]:
                 st.caption(item["canonical_title"])
             col_a, col_b, col_c = st.columns(3)
-            col_a.metric("匹配分数", f"{item['score']:.4f}")
+            score_label = (
+                "Cross-Encoder相关性"
+                if response.score_kind == "cross_encoder_logit"
+                else "匹配分数"
+            )
+            col_a.metric(score_label, f"{item['score']:.4f}")
             col_b.metric("年份", item["year"] or "—")
             col_c.metric("发表渠道", item["venue"] or "—")
             st.write("作者：" + ("、".join(item["authors"]) or "未知"))
