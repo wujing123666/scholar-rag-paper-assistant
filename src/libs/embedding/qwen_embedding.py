@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import os
+import time
+from concurrent.futures import ThreadPoolExecutor
 from typing import TYPE_CHECKING, Any
 
 from openai import OpenAI
@@ -29,6 +31,9 @@ class QwenEmbedding(BaseEmbedding):
         settings: Settings,
         *,
         batch_size: int = 10,
+        max_workers: int = 1,
+        backend_max_attempts: int = 3,
+        backend_retry_base_seconds: float = 1.0,
         timeout: float = 60.0,
         max_retries: int = 2,
         client: Any | None = None,
@@ -40,6 +45,15 @@ class QwenEmbedding(BaseEmbedding):
         self.batch_size = int(batch_size)
         if self.batch_size < 1:
             raise ValueError("Qwen embedding batch_size must be at least one")
+        self.max_workers = int(max_workers)
+        if self.max_workers < 1:
+            raise ValueError("Qwen embedding max_workers must be at least one")
+        self.backend_max_attempts = int(backend_max_attempts)
+        self.backend_retry_base_seconds = float(backend_retry_base_seconds)
+        if self.backend_max_attempts < 1:
+            raise ValueError("Qwen backend_max_attempts must be at least one")
+        if self.backend_retry_base_seconds < 0:
+            raise ValueError("Qwen backend_retry_base_seconds cannot be negative")
         configured_key = str(config.api_key or "").strip()
         if not configured_key or configured_key.startswith("YOUR_"):
             configured_key = str(os.getenv("DASHSCOPE_API_KEY") or "").strip()
@@ -72,14 +86,34 @@ class QwenEmbedding(BaseEmbedding):
             if is_query
             else list(texts)
         )
-        vectors: list[list[float]] = []
-        for start in range(0, len(prepared), self.batch_size):
-            batch = prepared[start : start + self.batch_size]
-            response = self._client.embeddings.create(
-                model=self.model,
-                input=batch,
-                dimensions=self.dimension,
-            )
+        batches = [
+            prepared[start : start + self.batch_size]
+            for start in range(0, len(prepared), self.batch_size)
+        ]
+
+        def embed_batch(batch: list[str]) -> list[list[float]]:
+            for attempt in range(1, self.backend_max_attempts + 1):
+                try:
+                    response = self._client.embeddings.create(
+                        model=self.model,
+                        input=batch,
+                        dimensions=self.dimension,
+                    )
+                    break
+                except Exception as error:
+                    message = str(error).casefold()
+                    transient_internal_error = (
+                        getattr(error, "status_code", None) == 400
+                        and (
+                            "internalerror" in message
+                            or "batching backend response failed" in message
+                        )
+                    )
+                    if not transient_internal_error or attempt >= self.backend_max_attempts:
+                        raise
+                    time.sleep(
+                        self.backend_retry_base_seconds * (2 ** (attempt - 1))
+                    )
             ordered = sorted(response.data, key=lambda item: item.index)
             batch_vectors = [list(item.embedding) for item in ordered]
             if len(batch_vectors) != len(batch):
@@ -88,8 +122,17 @@ class QwenEmbedding(BaseEmbedding):
                 raise RuntimeError(
                     "Qwen returned an embedding vector with an unexpected dimension"
                 )
-            vectors.extend(batch_vectors)
-        return vectors
+            return batch_vectors
+
+        if self.max_workers == 1 or len(batches) == 1:
+            embedded_batches = [embed_batch(batch) for batch in batches]
+        else:
+            with ThreadPoolExecutor(
+                max_workers=min(self.max_workers, len(batches)),
+                thread_name_prefix="qwen-embedding",
+            ) as executor:
+                embedded_batches = list(executor.map(embed_batch, batches))
+        return [vector for batch in embedded_batches for vector in batch]
 
     def get_dimension(self) -> int:
         return self.dimension

@@ -73,6 +73,47 @@ _STOPWORDS = frozenset(
 )
 
 
+def canonical_paper_query(query: str) -> str:
+    """Map precise IoT synonym clusters to short terms used by the corpus.
+
+    Cross-Encoders are sensitive to diluted queries such as ``operation and
+    maintenance management lifecycle``.  These rules require the complete
+    concept cluster, so an unrelated query that merely contains one IoT word is
+    left intact and still has to pass the normal open-set gate.
+    """
+    text = " ".join(query.split())
+    lowered = text.lower()
+    if (
+        "device" in lowered
+        and "management" in lowered
+        and ("operation" in lowered or "maintenance" in lowered)
+    ):
+        return "IoT devices device management"
+    if "边缘计算" in text and "卸载" in text and any(
+        cue in text for cue in ("资源调度", "资源分配")
+    ):
+        return "IoT edge computing computation offloading resource allocation"
+    if "医疗物联网" in text and any(
+        cue in text for cue in ("连续监护", "患者监测", "患者监护")
+    ):
+        return "medical IoT patient monitoring"
+    if "医疗物联网" in text and "可穿戴" in text and any(
+        cue in text for cue in ("健康感知", "健康监测", "医疗")
+    ):
+        return "medical IoT wearable health sensing"
+    if "无线传感器网络" in text and any(
+        cue in text for cue in ("覆盖增强", "网络覆盖", "覆盖优化")
+    ):
+        return "wireless sensor networks coverage optimization"
+    if "无线传感器网络" in text and "节点定位" in text:
+        return "wireless sensor networks node localization"
+    if "无线传感器网络" in text and any(
+        cue in text for cue in ("节能路由", "能耗优化", "能源效率")
+    ):
+        return "wireless sensor networks energy consumption optimization"
+    return text
+
+
 def facet_english_words(aspect: str) -> tuple[str, ...]:
     """Return the English retrieval words for an aspect, or an empty tuple."""
     if not isinstance(aspect, str) or not aspect.strip():
@@ -180,6 +221,10 @@ def build_facet_queries(
         raise ValueError("max_queries must be at least one")
     queries: list[str] = []
     for aspect in aspects:
+        canonical = canonical_paper_query(aspect)
+        if canonical != " ".join(aspect.split()):
+            queries.append(canonical)
+            continue
         words = facet_english_words(aspect)
         if not words:
             queries.append(aspect)

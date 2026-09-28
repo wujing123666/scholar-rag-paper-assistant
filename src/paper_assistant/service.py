@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
+import math
 import threading
 from collections.abc import Callable
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any
@@ -26,15 +28,20 @@ from src.paper_assistant.claim_judgement_cache import (
 )
 from src.paper_assistant.claim_safety import verify_and_filter_claims
 from src.paper_assistant.dense_retriever import PaperDenseRetriever
-from src.paper_assistant.facet_query import build_facet_queries
+from src.paper_assistant.facet_query import build_facet_queries, canonical_paper_query
 from src.paper_assistant.grounded_answer import (
     REFUSAL_TEXT,
     GroundedAnswer,
     answer_from_evidence,
 )
 from src.paper_assistant.hybrid_retriever import PaperHybridRetriever
-from src.paper_assistant.query_split import merge_topic_groups, split_query
-from src.paper_assistant.rejection import decide_retrieval
+from src.paper_assistant.query_split import (
+    looks_wide,
+    merge_topic_groups,
+    rule_split_query,
+    split_query,
+)
+from src.paper_assistant.rejection import decide_retrieval, default_min_score
 from src.paper_assistant.retriever import PaperBM25Retriever, PaperSearchResult
 
 DEFAULT_RERANKER_MODEL = "BAAI/bge-reranker-base"
@@ -58,8 +65,11 @@ class PaperAssistantConfig:
     chroma_port: int = 8000
     chroma_ssl: bool = False
     chunk_reranker: str = "none"
+    paper_reranker: str = "fastembed"
     reranker_model: str = DEFAULT_RERANKER_MODEL
     reranker_cache: Path = Path("data/models/fastembed")
+    paper_rerank_candidates: int = 20
+    paper_min_score: float = 2.5
     rerank_candidates: int = 14
     rerank_weight: float = 0.35
     candidate_papers: int = 3
@@ -85,6 +95,8 @@ class PaperAssistantConfig:
             raise ValueError("retriever must be bm25, dense, or hybrid")
         if self.chunk_reranker not in {"none", "fastembed"}:
             raise ValueError("chunk_reranker must be none or fastembed")
+        if self.paper_reranker not in {"none", "fastembed"}:
+            raise ValueError("paper_reranker must be none or fastembed")
         if self.chroma_mode not in {"local", "server"}:
             raise ValueError("chroma_mode must be local or server")
         if self.verify_claims not in {"off", "single", "consensus"}:
@@ -97,6 +109,15 @@ class PaperAssistantConfig:
             raise ValueError("candidate_papers and top_k must be at least one")
         if self.rerank_candidates < 1 or self.claim_retry_k < 1:
             raise ValueError("rerank_candidates and claim_retry_k must be at least one")
+        if (
+            self.paper_reranker != "none"
+            and self.paper_rerank_candidates < self.candidate_papers
+        ):
+            raise ValueError(
+                "paper_rerank_candidates must be at least candidate_papers"
+            )
+        if not math.isfinite(self.paper_min_score):
+            raise ValueError("paper_min_score must be finite")
         if not 0 <= self.rerank_weight <= 1:
             raise ValueError("rerank_weight must be between zero and one")
         if self.max_context_chars < 1000 or self.min_evidence_chunks < 1:
@@ -117,6 +138,17 @@ def _build_qwen_embedding(config: PaperAssistantConfig) -> BaseEmbedding:
     return EmbeddingFactory.create(settings)
 
 
+def _build_paper_reranker(config: PaperAssistantConfig) -> Any | None:
+    if config.paper_reranker == "none":
+        return None
+    from src.paper_assistant.paper_reranker import FastEmbedPaperReranker
+
+    return FastEmbedPaperReranker(
+        config.reranker_model,
+        cache_dir=config.reranker_cache,
+    )
+
+
 @dataclass(frozen=True)
 class PaperSearchResponse:
     query: str
@@ -127,6 +159,7 @@ class PaperSearchResponse:
     reason: str
     top_score: float | None
     min_score: float | None
+    score_kind: str
     results: tuple[PaperSearchResult, ...]
 
     def to_dict(self) -> dict[str, Any]:
@@ -141,6 +174,7 @@ class PaperSearchResponse:
                 round(self.top_score, 6) if self.top_score is not None else None
             ),
             "min_score": self.min_score,
+            "score_kind": self.score_kind,
             "results": [
                 {
                     "rank": rank,
@@ -229,6 +263,7 @@ class PaperAssistantService:
         paper_retriever: Any,
         requested_retriever: str,
         paper_retriever_fallback: str | None = None,
+        paper_reranker: Any | None = None,
         chunk_retriever: Any | None = None,
         chunk_reranker: Any | None = None,
         generation_llm: Any | None = None,
@@ -238,6 +273,7 @@ class PaperAssistantService:
         llm_base_url: str | None = None,
         claim_cache: ClaimJudgementCache | None = None,
         claim_cache_fallback: str | None = None,
+        splitter_llm_loader: Callable[[], Any] | None = None,
         answer_dependency_loader: Callable[[], PaperAnswerDependencies] | None = None,
         config: PaperAssistantConfig | None = None,
     ) -> None:
@@ -245,6 +281,7 @@ class PaperAssistantService:
         self.paper_retriever = paper_retriever
         self.requested_retriever = requested_retriever
         self.paper_retriever_fallback = paper_retriever_fallback
+        self.paper_reranker = paper_reranker
         self.chunk_retriever = chunk_retriever
         self.chunk_reranker = chunk_reranker
         self.generation_llm = generation_llm
@@ -254,7 +291,9 @@ class PaperAssistantService:
         self.llm_base_url = llm_base_url
         self.claim_cache = claim_cache
         self.claim_cache_fallback = claim_cache_fallback
+        self.splitter_llm_loader = splitter_llm_loader
         self.answer_dependency_loader = answer_dependency_loader
+        self._splitter_llm_lock = threading.Lock()
         self._answer_dependency_lock = threading.Lock()
         self.config = config or PaperAssistantConfig(retriever=requested_retriever)
 
@@ -277,31 +316,118 @@ class PaperAssistantService:
             if disable_rejection is None
             else disable_rejection
         )
-        threshold = self.config.min_score if min_score is None else min_score
         if raw:
-            search_with_diagnostics = getattr(
-                self.paper_retriever, "search_with_diagnostics", None
+            results, effective, dynamic_fallback = self._raw_paper_search(
+                query, top_k=limit
             )
-            if callable(search_with_diagnostics):
-                diagnostics = search_with_diagnostics(query, top_k=limit)
-                results = tuple(diagnostics.results)
-                effective = str(diagnostics.effective_retriever)
-                dynamic_fallback = diagnostics.fallback_reason
-            else:
-                results = tuple(self.paper_retriever.search(query, top_k=limit))
-                effective = str(self.paper_retriever.name)
-                dynamic_fallback = None
             return PaperSearchResponse(
-                query,
-                self.requested_retriever,
-                effective,
-                self.paper_retriever_fallback or dynamic_fallback,
-                not results,
-                "no_candidates" if not results else "rejection_disabled",
-                results[0].score if results else None,
-                None,
-                results,
+                query=query,
+                requested_retriever=self.requested_retriever,
+                effective_retriever=effective,
+                fallback_reason=self.paper_retriever_fallback or dynamic_fallback,
+                rejected=not results,
+                reason="no_candidates" if not results else "rejection_disabled",
+                top_score=results[0].score if results else None,
+                min_score=None,
+                score_kind="retriever",
+                results=results,
             )
+        if self.paper_reranker is not None:
+            pool_size = min(
+                len(self.catalog),
+                max(limit, self.config.paper_rerank_candidates),
+            )
+            candidates, effective, dynamic_fallback = self._raw_paper_search(
+                query, top_k=pool_size
+            )
+            threshold = self.config.paper_min_score
+            if self.config.min_score is not None:
+                threshold = self.config.min_score
+            if min_score is not None:
+                threshold = min_score
+            if not math.isfinite(threshold):
+                raise ValueError("min_score must be finite")
+            if not candidates:
+                return PaperSearchResponse(
+                    query=query,
+                    requested_retriever=self.requested_retriever,
+                    effective_retriever=effective,
+                    fallback_reason=self.paper_retriever_fallback or dynamic_fallback,
+                    rejected=True,
+                    reason="no_candidates",
+                    top_score=None,
+                    min_score=threshold,
+                    score_kind="cross_encoder_logit",
+                    results=(),
+                )
+            try:
+                reranked = tuple(
+                    self.paper_reranker.rerank(
+                        query,
+                        list(candidates),
+                        top_k=limit,
+                    )
+                )
+            except Exception as error:
+                gate_fallback = (
+                    "paper_reranker_unavailable:"
+                    f"{type(error).__name__}:{error}"
+                )
+                fallback = ";".join(
+                    item
+                    for item in (
+                        self.paper_retriever_fallback,
+                        dynamic_fallback,
+                        gate_fallback,
+                    )
+                    if item
+                )
+                legacy_threshold = (
+                    default_min_score(effective)
+                    if self.config.min_score is None and min_score is None
+                    else (
+                        min_score
+                        if min_score is not None
+                        else self.config.min_score
+                    )
+                )
+                if legacy_threshold is None or legacy_threshold < 0:
+                    raise ValueError("min_score must be zero or greater")
+                top_score = candidates[0].score
+                rejected = top_score < legacy_threshold
+                return PaperSearchResponse(
+                    query=query,
+                    requested_retriever=self.requested_retriever,
+                    effective_retriever=effective,
+                    fallback_reason=fallback,
+                    rejected=rejected,
+                    reason="below_threshold" if rejected else "accepted",
+                    top_score=top_score,
+                    min_score=legacy_threshold,
+                    score_kind="retriever_fallback",
+                    results=() if rejected else candidates[:limit],
+                )
+            top_score = reranked[0].score if reranked else None
+            accepted = tuple(item for item in reranked if item.score >= threshold)
+            rejected = not accepted
+            return PaperSearchResponse(
+                query=query,
+                requested_retriever=self.requested_retriever,
+                effective_retriever=effective,
+                fallback_reason=self.paper_retriever_fallback or dynamic_fallback,
+                rejected=rejected,
+                reason=(
+                    "no_candidates"
+                    if top_score is None
+                    else "below_threshold" if rejected else "accepted"
+                ),
+                top_score=top_score,
+                min_score=threshold,
+                score_kind="cross_encoder_logit",
+                results=accepted,
+            )
+
+        threshold = self.config.min_score if min_score is None else min_score
         decision = decide_retrieval(
             self.paper_retriever,
             query,
@@ -309,15 +435,35 @@ class PaperAssistantService:
             min_score=threshold,
         )
         return PaperSearchResponse(
-            query,
-            self.requested_retriever,
-            decision.effective_retriever,
-            self.paper_retriever_fallback or decision.fallback_reason,
-            decision.rejected,
-            decision.reason,
-            decision.top_score,
-            decision.min_score,
-            decision.results,
+            query=query,
+            requested_retriever=self.requested_retriever,
+            effective_retriever=decision.effective_retriever,
+            fallback_reason=self.paper_retriever_fallback or decision.fallback_reason,
+            rejected=decision.rejected,
+            reason=decision.reason,
+            top_score=decision.top_score,
+            min_score=decision.min_score,
+            score_kind="retriever",
+            results=decision.results,
+        )
+
+    def _raw_paper_search(
+        self, query: str, *, top_k: int
+    ) -> tuple[tuple[PaperSearchResult, ...], str, str | None]:
+        search_with_diagnostics = getattr(
+            self.paper_retriever, "search_with_diagnostics", None
+        )
+        if callable(search_with_diagnostics):
+            diagnostics = search_with_diagnostics(query, top_k=top_k)
+            return (
+                tuple(diagnostics.results),
+                str(diagnostics.effective_retriever),
+                diagnostics.fallback_reason,
+            )
+        return (
+            tuple(self.paper_retriever.search(query, top_k=top_k)),
+            str(self.paper_retriever.name),
+            None,
         )
 
     def answer_question(
@@ -335,13 +481,24 @@ class PaperAssistantService:
             raise ValueError(f"Unknown paper_id values: {', '.join(unknown)}")
         automatic_routing = not explicit_ids
         paper_fallback = self.paper_retriever_fallback
-        if automatic_routing:
-            routing = self.find_papers(query)
+        sub_questions: tuple[str, ...] = ()
+        if automatic_routing and looks_wide(query):
+            # Gate wide questions per facet. One paper rarely covers every
+            # requested aspect strongly, even when different papers collectively
+            # provide sound evidence for all aspects.
+            sub_questions = rule_split_query(query)
+            if not sub_questions:
+                sub_questions = split_query(
+                    query, llm=self._ensure_splitter_llm()
+                )
+        multi_aspect_routing = len(sub_questions) > 1
+        if automatic_routing and not multi_aspect_routing:
+            routing = self.find_papers(canonical_paper_query(query))
             candidate_ids = tuple(result.paper.paper_id for result in routing.results)
             paper_fallback = routing.fallback_reason
         else:
             candidate_ids = explicit_ids
-        if not candidate_ids:
+        if not candidate_ids and not multi_aspect_routing:
             return self._refusal_response(
                 query,
                 "no_candidate_papers",
@@ -354,15 +511,31 @@ class PaperAssistantService:
             if self.chunk_reranker is not None
             else self.config.top_k
         )
-        sub_questions = split_query(query, llm=self.generation_llm)
+        if not sub_questions:
+            sub_questions = split_query(query, llm=self.generation_llm)
         reranker_fallback = None
         if len(sub_questions) > 1:
-            evidence, reranker_fallback = self._multi_aspect_evidence(
+            (
+                evidence,
+                reranker_fallback,
+                facet_candidate_ids,
+                facet_paper_fallback,
+                missing_facets,
+            ) = self._multi_aspect_evidence(
                 sub_questions,
                 candidate_ids,
                 retrieval_k,
                 automatic_routing=automatic_routing,
             )
+            if automatic_routing:
+                candidate_ids = facet_candidate_ids
+                paper_fallback = paper_fallback or facet_paper_fallback
+                if missing_facets:
+                    return self._refusal_response(
+                        query,
+                        "incomplete_facet_paper_coverage",
+                        paper_fallback,
+                    )
         else:
             evidence = self._search_for_question(
                 query,
@@ -509,23 +682,93 @@ class PaperAssistantService:
         retrieval_k: int,
         *,
         automatic_routing: bool,
-    ) -> tuple[list[ChunkSearchResult], str | None]:
-        """Retrieve each aspect separately and interleave the ranked groups.
+    ) -> tuple[
+        list[ChunkSearchResult],
+        str | None,
+        tuple[str, ...],
+        str | None,
+        tuple[str, ...],
+    ]:
+        """Route and retrieve every aspect independently, then interleave groups.
 
         Every aspect is first rewritten into a retrieval query that names its own
         facet.  A wide question's own words are mostly the paper's topic words,
         which match nearly every chunk and therefore bury the few chunks that
-        answer one particular aspect.
+        answer one particular aspect.  Automatic routing deliberately happens
+        again per facet: the papers that best cover one aspect must not constrain
+        the other aspects.  ``executor.map`` preserves facet order so the final
+        merge remains deterministic even though retrieval runs concurrently.
         """
-        groups: list[list[ChunkSearchResult]] = []
-        fallback: str | None = None
-        for query in self._facet_queries(sub_questions, candidate_ids):
-            group = self._search_for_question(
+        routing_queries = self._facet_queries(sub_questions, candidate_ids)
+
+        def route(query: str) -> tuple[tuple[str, ...], str | None]:
+            routed_ids = candidate_ids
+            paper_fallback = None
+            if automatic_routing:
+                routing = self.find_papers(query)
+                routed_ids = tuple(
+                    result.paper.paper_id for result in routing.results
+                )
+                paper_fallback = routing.fallback_reason
+            return routed_ids, paper_fallback
+
+        max_workers = min(3, len(routing_queries))
+        with ThreadPoolExecutor(
+            max_workers=max_workers,
+            thread_name_prefix="scholarrag-facet",
+        ) as executor:
+            routes = list(executor.map(route, routing_queries))
+
+        facet_queries = []
+        for aspect, routing_query, (routed_ids, _) in zip(
+            sub_questions, routing_queries, routes, strict=True
+        ):
+            if automatic_routing and routed_ids:
+                facet_queries.append(self._facet_queries((aspect,), routed_ids)[0])
+            else:
+                facet_queries.append(routing_query)
+
+        def retrieve(
+            item: tuple[str, tuple[str, ...]],
+        ) -> list[ChunkSearchResult]:
+            query, routed_ids = item
+            if not routed_ids:
+                return []
+            return self._search_for_question(
                 query,
-                candidate_ids,
+                routed_ids,
                 retrieval_k,
                 automatic_routing=automatic_routing,
             )
+
+        with ThreadPoolExecutor(
+            max_workers=max_workers,
+            thread_name_prefix="scholarrag-facet",
+        ) as executor:
+            groups = list(
+                executor.map(
+                    retrieve,
+                    [
+                        (query, routed_ids)
+                        for query, (routed_ids, _) in zip(
+                            facet_queries, routes, strict=True
+                        )
+                    ],
+                )
+            )
+
+        fallback: str | None = None
+        paper_fallback: str | None = None
+        routed_paper_ids: list[str] = []
+        missing_facets: list[str] = []
+        ranked_groups: list[list[ChunkSearchResult]] = []
+        for query, group, (routed_ids, group_paper_fallback) in zip(
+            facet_queries, groups, routes, strict=True
+        ):
+            routed_paper_ids.extend(routed_ids)
+            if not routed_ids or not group:
+                missing_facets.append(query)
+            paper_fallback = paper_fallback or group_paper_fallback
             if self.chunk_reranker is not None:
                 from src.paper_assistant.chunk_reranker import rerank_with_fallback
 
@@ -536,8 +779,14 @@ class PaperAssistantService:
                     top_k=self.config.top_k,
                 )
                 fallback = fallback or group_fallback
-            groups.append(group)
-        return merge_topic_groups(groups, top_k=self.config.top_k), fallback
+            ranked_groups.append(group)
+        return (
+            merge_topic_groups(ranked_groups, top_k=self.config.top_k),
+            fallback,
+            tuple(dict.fromkeys(routed_paper_ids)),
+            paper_fallback,
+            tuple(missing_facets),
+        )
 
     def _facet_queries(
         self, sub_questions: tuple[str, ...], candidate_ids: tuple[str, ...]
@@ -548,6 +797,12 @@ class PaperAssistantService:
         index, and ``build_facet_queries`` always returns one query per aspect, so
         an aspect whose facet words are not recognised is searched unchanged.
         """
+        if not candidate_ids:
+            return build_facet_queries(
+                sub_questions,
+                max_queries=len(sub_questions),
+                use_anchors=False,
+            )
         context = self.chunk_retriever.corpus_context(candidate_ids)
         return build_facet_queries(
             sub_questions,
@@ -574,6 +829,18 @@ class PaperAssistantService:
             self.llm_base_url = dependencies.llm_base_url
             self.claim_cache = dependencies.claim_cache
             self.claim_cache_fallback = dependencies.claim_cache_fallback
+
+    def _ensure_splitter_llm(self) -> Any:
+        """Load only the lightweight LLM needed to classify a wide question."""
+        if self.generation_llm is not None:
+            return self.generation_llm
+        if self.splitter_llm_loader is None:
+            self._ensure_answer_dependencies()
+            return self.generation_llm
+        with self._splitter_llm_lock:
+            if self.generation_llm is None:
+                self.generation_llm = self.splitter_llm_loader()
+        return self.generation_llm
 
     def _judge_models(self) -> list[str]:
         models = list(dict.fromkeys(self.config.claim_judge_models))
@@ -631,6 +898,7 @@ def build_paper_assistant_service(
     """Build a service whose answer-only dependencies are loaded on first use."""
     config.validate()
     catalog = PaperCatalog.from_csv(config.catalog_path)
+    paper_reranker = _build_paper_reranker(config)
     embedding = None
     paper_fallback = None
     if config.retriever == "bm25":
@@ -662,7 +930,53 @@ def build_paper_assistant_service(
                 f"dense_initialization_unavailable:{type(error).__name__}"
             )
 
+    llm_lock = threading.Lock()
+    llm_state: dict[str, Any] = {}
+
+    def load_llms() -> dict[str, Any]:
+        """Create one shared LLM bundle without opening the Chunk index."""
+        if llm_state:
+            return llm_state
+        with llm_lock:
+            if llm_state:
+                return llm_state
+            settings = load_settings(config.settings_path)
+            primary = LLMFactory.create(settings)
+            judge_llm = ResilientChatModel(
+                primary,
+                primary_name=settings.llm.provider,
+                policy=config.retry_policy,
+            )
+            fallback = None
+            fallback_name = None
+            fallback_model = None
+            if config.fallback_settings_path is not None:
+                fallback_settings = load_settings(config.fallback_settings_path)
+                fallback = LLMFactory.create(fallback_settings)
+                fallback_name = fallback_settings.llm.provider
+                fallback_model = fallback_settings.llm.model
+            generation_llm = ResilientChatModel(
+                primary,
+                primary_name=settings.llm.provider,
+                fallback=fallback,
+                fallback_name=fallback_name,
+                fallback_model=fallback_model,
+                policy=config.retry_policy,
+            )
+            llm_state.update(
+                generation_llm=generation_llm,
+                judge_llm=judge_llm,
+                provider=settings.llm.provider,
+                model=settings.llm.model,
+                base_url=settings.llm.base_url,
+            )
+        return llm_state
+
+    def load_splitter_llm() -> Any:
+        return load_llms()["generation_llm"]
+
     def load_answer_dependencies() -> PaperAnswerDependencies:
+        state = load_llms()
         answer_embedding = embedding or _build_qwen_embedding(config)
         chunk_store = ChromaStore(
             persist_directory=config.chroma_path,
@@ -688,31 +1002,14 @@ def build_paper_assistant_service(
                 config.reranker_model,
                 cache_dir=config.reranker_cache,
                 weight=config.rerank_weight,
+                model=(
+                    paper_reranker.model
+                    if paper_reranker is not None
+                    and paper_reranker.model_name == config.reranker_model
+                    else None
+                ),
             )
 
-        settings = load_settings(config.settings_path)
-        primary = LLMFactory.create(settings)
-        judge_llm = ResilientChatModel(
-            primary,
-            primary_name=settings.llm.provider,
-            policy=config.retry_policy,
-        )
-        fallback = None
-        fallback_name = None
-        fallback_model = None
-        if config.fallback_settings_path is not None:
-            fallback_settings = load_settings(config.fallback_settings_path)
-            fallback = LLMFactory.create(fallback_settings)
-            fallback_name = fallback_settings.llm.provider
-            fallback_model = fallback_settings.llm.model
-        generation_llm = ResilientChatModel(
-            primary,
-            primary_name=settings.llm.provider,
-            fallback=fallback,
-            fallback_name=fallback_name,
-            fallback_model=fallback_model,
-            policy=config.retry_policy,
-        )
         claim_cache = None
         claim_cache_fallback = None
         if not config.disable_claim_cache and config.verify_claims != "off":
@@ -722,11 +1019,11 @@ def build_paper_assistant_service(
         return PaperAnswerDependencies(
             chunk_retriever=chunk_retriever,
             chunk_reranker=chunk_reranker,
-            generation_llm=generation_llm,
-            judge_llm=judge_llm,
-            llm_provider=settings.llm.provider,
-            llm_model=settings.llm.model,
-            llm_base_url=settings.llm.base_url,
+            generation_llm=state["generation_llm"],
+            judge_llm=state["judge_llm"],
+            llm_provider=state["provider"],
+            llm_model=state["model"],
+            llm_base_url=state["base_url"],
             claim_cache=claim_cache,
             claim_cache_fallback=claim_cache_fallback,
         )
@@ -736,6 +1033,8 @@ def build_paper_assistant_service(
         paper_retriever=paper_retriever,
         requested_retriever=config.retriever,
         paper_retriever_fallback=paper_fallback,
+        paper_reranker=paper_reranker,
+        splitter_llm_loader=load_splitter_llm,
         answer_dependency_loader=load_answer_dependencies,
         config=config,
     )
@@ -747,6 +1046,7 @@ def build_paper_search_service(
     """Build only paper-level retrieval for the lightweight search UI."""
     config.validate()
     catalog = PaperCatalog.from_csv(config.catalog_path)
+    paper_reranker = _build_paper_reranker(config)
     paper_fallback = None
     if config.retriever == "bm25":
         paper_retriever: Any = PaperBM25Retriever(catalog)
@@ -781,5 +1081,6 @@ def build_paper_search_service(
         paper_retriever=paper_retriever,
         requested_retriever=config.retriever,
         paper_retriever_fallback=paper_fallback,
+        paper_reranker=paper_reranker,
         config=config,
     )

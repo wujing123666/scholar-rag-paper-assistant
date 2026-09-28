@@ -8,7 +8,11 @@ from src.libs.embedding.base_embedding import BaseEmbedding
 from src.libs.vector_store.chroma_store import ChromaStore
 from src.paper_assistant.catalog import PaperCatalog
 from src.paper_assistant.dense_retriever import PaperDenseRetriever, profile_text
-from src.paper_assistant.evaluation import evaluate_retriever, load_evaluation_cases
+from src.paper_assistant.evaluation import (
+    evaluate_retriever,
+    evaluate_search_service,
+    load_evaluation_cases,
+)
 from src.paper_assistant.hybrid_retriever import PaperHybridRetriever
 from src.paper_assistant.rejection import decide_retrieval
 from src.paper_assistant.retriever import PaperBM25Retriever, PaperSearchResult
@@ -217,6 +221,54 @@ def test_evaluation_reports_unknown_paper_rejection(tmp_path):
     assert report["cases"][1]["rejected"] is True
 
 
+def test_service_evaluation_uses_production_gate_response(tmp_path):
+    catalog = PaperCatalog.from_csv(_write_catalog(tmp_path))
+    calls = []
+
+    class _Response:
+        requested_retriever = "hybrid"
+        effective_retriever = "paper_hybrid_rrf"
+        fallback_reason = None
+        min_score = 2.5
+
+        def __init__(self, query):
+            self.rejected = "unknown" in query
+            self.top_score = 1.0 if self.rejected else 4.0
+            self.results = (
+                ()
+                if self.rejected
+                else (PaperSearchResult(catalog.get("recruitment"), 4.0, ()),)
+            )
+
+    class _Service:
+        def find_papers(self, query, *, top_k):
+            calls.append((query, top_k))
+            return _Response(query)
+
+    report = evaluate_search_service(
+        _Service(),
+        [
+            {
+                "id": "known",
+                "description": "known recruitment paper",
+                "expected_paper_id": "recruitment",
+            },
+            {
+                "id": "unknown",
+                "description": "unknown external paper",
+                "expected_paper_id": None,
+            },
+        ],
+    )
+
+    assert calls == [
+        ("known recruitment paper", 3),
+        ("unknown external paper", 3),
+    ]
+    assert report["open_set"] == {"queries": 2, "correct": 2, "accuracy": 1.0}
+    assert report["cases"][0]["min_score"] == 2.5
+
+
 def test_evaluation_loader_allows_explicit_unknown_cases(tmp_path):
     path = tmp_path / "unknown.jsonl"
     path.write_text(
@@ -314,13 +366,16 @@ def test_dense_retriever_reuses_persisted_profile_vectors(tmp_path):
         assert "paper:removed" not in store.list_ids()
 
 
-def test_dense_model_change_keeps_old_index_when_reembedding_fails(tmp_path):
+def test_dense_dimension_change_keeps_old_index_when_reembedding_fails(tmp_path):
     catalog = PaperCatalog.from_csv(_write_catalog(tmp_path))
     original_embedding = _KeywordEmbedding()
     original_embedding.model = "test-model-v1"
 
     class BrokenReplacement(_KeywordEmbedding):
         model = "test-model-v2"
+
+        def get_dimension(self):
+            return 3
 
         def embed(self, texts, trace=None, **kwargs):
             raise RuntimeError("replacement model failed")
@@ -343,6 +398,44 @@ def test_dense_model_change_keeps_old_index_when_reembedding_fails(tmp_path):
         assert {
             record["metadata"]["embedding_model"] for record in records
         } == {"test-model-v1"}
+
+
+def test_dense_retriever_resumes_after_provider_failure_by_batch(tmp_path):
+    catalog = PaperCatalog.from_csv(_write_catalog(tmp_path))
+
+    class FailOnSecondBatch(_KeywordEmbedding):
+        model = "checkpoint-model"
+        batch_size = 1
+
+        def embed(self, texts, trace=None, **kwargs):
+            if len(self.calls) == 1:
+                raise RuntimeError("second batch failed")
+            return super().embed(texts, trace=trace, **kwargs)
+
+    class RecoveryEmbedding(_KeywordEmbedding):
+        model = "checkpoint-model"
+        batch_size = 1
+
+    with ChromaStore(
+        persist_directory=tmp_path / "chroma", collection_name="paper_profiles_test"
+    ) as store:
+        try:
+            PaperDenseRetriever(catalog, FailOnSecondBatch(), store)
+        except RuntimeError as error:
+            assert "second batch failed" in str(error)
+        else:
+            raise AssertionError("Expected the second embedding batch to fail")
+
+        assert len(store.list_ids()) == 1
+
+        recovery = RecoveryEmbedding()
+        resumed = PaperDenseRetriever(catalog, recovery, store)
+
+        assert resumed.index_sync.embedded == 1
+        assert resumed.index_sync.reused == 1
+        assert len(recovery.calls) == 1
+        assert len(recovery.calls[0][0]) == 1
+        assert set(store.list_ids()) == {"paper:diffusion", "paper:recruitment"}
 
 
 def test_profile_text_keeps_human_readable_field_labels(tmp_path):

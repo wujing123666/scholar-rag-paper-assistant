@@ -7,6 +7,7 @@ import pytest
 from src.paper_assistant.facet_query import (
     anchor_words,
     build_facet_queries,
+    canonical_paper_query,
     facet_english_words,
     table_captions,
     topic_terms,
@@ -123,3 +124,44 @@ def test_build_facet_queries_honour_the_query_budgets():
     ) == ("life cycle stages",)
     with pytest.raises(ValueError):
         build_facet_queries(SURVEY_ASPECTS, max_queries=0)
+
+
+def test_canonical_paper_query_normalizes_precise_iot_synonym_clusters():
+    assert canonical_paper_query(
+        "IoT device operation and maintenance management lifecycle"
+    ) == "IoT devices device management"
+    assert canonical_paper_query(
+        "边缘计算场景下，物联网任务应如何卸载并进行计算资源调度？"
+    ) == "IoT edge computing computation offloading resource allocation"
+    assert canonical_paper_query(
+        "医疗物联网有哪些患者连续监护方案？"
+    ) == "medical IoT patient monitoring"
+    assert canonical_paper_query(
+        "医疗物联网有哪些可穿戴健康感知方案？"
+    ) == "medical IoT wearable health sensing"
+    assert canonical_paper_query(
+        "无线传感器网络有哪些节能路由方法？"
+    ) == "wireless sensor networks energy consumption optimization"
+
+
+def test_canonical_paper_query_preserves_unrelated_iot_constraints():
+    edge_unknown = "边缘计算利用CRISPR-Cas9进行任务卸载的论文"
+    healthcare_unknown = "医疗物联网利用古埃及象形文字加密患者数据的论文"
+
+    assert canonical_paper_query(edge_unknown) == edge_unknown
+    assert canonical_paper_query(healthcare_unknown) == healthcare_unknown
+
+
+def test_build_facet_queries_keeps_domain_topic_in_compound_facets():
+    assert build_facet_queries(
+        (
+            "无线传感器网络有哪些覆盖增强？",
+            "无线传感器网络有哪些节点定位？",
+            "无线传感器网络有哪些节能路由方法？",
+        ),
+        use_anchors=False,
+    ) == (
+        "wireless sensor networks coverage optimization",
+        "wireless sensor networks node localization",
+        "wireless sensor networks energy consumption optimization",
+    )

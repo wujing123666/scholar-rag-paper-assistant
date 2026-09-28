@@ -13,10 +13,12 @@ from src.core.settings import load_settings
 from src.libs.embedding.embedding_factory import EmbeddingFactory
 from src.paper_assistant.catalog import PaperCatalog
 from src.paper_assistant.dense_retriever import PaperDenseRetriever
-from src.paper_assistant.evaluation import evaluate_retriever, load_evaluation_cases
+from src.paper_assistant.evaluation import (
+    evaluate_search_service,
+    load_evaluation_cases,
+)
 from src.paper_assistant.hybrid_retriever import PaperHybridRetriever
 from src.paper_assistant.inventory import build_paper_inventory, write_inventory_report
-from src.paper_assistant.rejection import decide_retrieval
 from src.paper_assistant.retriever import PaperBM25Retriever
 
 DEFAULT_CATALOG = Path("data/papers/paper_catalog.csv")
@@ -182,12 +184,22 @@ def main() -> int:
     parser.add_argument(
         "--chunk-reranker", choices=("none", "fastembed"), default="none"
     )
+    parser.add_argument(
+        "--paper-reranker", choices=("none", "fastembed"), default="fastembed"
+    )
     parser.add_argument("--reranker-model", default=DEFAULT_RERANKER_MODEL)
     parser.add_argument(
         "--reranker-cache", type=Path, default=Path("data/models/fastembed")
     )
     parser.add_argument("--rerank-candidates", type=int, default=14)
     parser.add_argument("--rerank-weight", type=float, default=0.35)
+    parser.add_argument("--paper-rerank-candidates", type=int, default=20)
+    parser.add_argument(
+        "--paper-min-score",
+        type=float,
+        default=2.5,
+        help="Raw BGE reranker logit used by the paper-level open-set gate.",
+    )
     parser.add_argument(
         "--min-score",
         type=float,
@@ -566,10 +578,15 @@ def main() -> int:
                     chroma_port=args.chroma_port,
                     chroma_ssl=args.chroma_ssl,
                     chunk_reranker=args.chunk_reranker,
+                    paper_reranker=args.paper_reranker,
                     reranker_model=args.reranker_model,
                     reranker_cache=args.reranker_cache,
                     rerank_candidates=args.rerank_candidates,
                     rerank_weight=args.rerank_weight,
+                    paper_rerank_candidates=max(
+                        args.paper_rerank_candidates, args.candidate_papers
+                    ),
+                    paper_min_score=args.paper_min_score,
                     candidate_papers=args.candidate_papers,
                     top_k=args.top_k,
                     chunk_size=args.chunk_size,
@@ -763,6 +780,14 @@ def main() -> int:
             chunk_overlap=args.chunk_overlap,
         )
         index_sync = chunk_retriever.index_sync
+        paper_reranker = None
+        if args.paper_reranker == "fastembed":
+            from src.paper_assistant.paper_reranker import FastEmbedPaperReranker
+
+            paper_reranker = FastEmbedPaperReranker(
+                args.reranker_model,
+                cache_dir=args.reranker_cache,
+            )
         chunk_reranker = None
         if args.chunk_reranker == "fastembed":
             from src.paper_assistant.chunk_reranker import FastEmbedChunkReranker
@@ -771,6 +796,12 @@ def main() -> int:
                 args.reranker_model,
                 cache_dir=args.reranker_cache,
                 weight=args.rerank_weight,
+                model=(
+                    paper_reranker.model
+                    if paper_reranker is not None
+                    and paper_reranker.model_name == args.reranker_model
+                    else None
+                ),
             )
         if args.command == "evaluate-answers":
             from src.paper_assistant.answer_evaluation import (
@@ -783,16 +814,10 @@ def main() -> int:
                 summarize_answer_results,
                 write_answer_evaluation_report,
             )
-            from src.paper_assistant.chunk_reranker import (
-                rerank_with_fallback,
-                select_rerank_candidates,
-            )
             from src.paper_assistant.claim_judgement_cache import (
                 CLAIM_JUDGE_PROMPT_VERSION,
                 open_claim_judgement_cache,
             )
-            from src.paper_assistant.claim_safety import verify_and_filter_claims
-            from src.paper_assistant.grounded_answer import answer_from_evidence
 
             cases = load_answer_evaluation_cases(args.queries)
             if args.limit is not None:
@@ -830,8 +855,59 @@ def main() -> int:
                 claim_cache, claim_cache_fallback = open_claim_judgement_cache(
                     args.claim_cache
                 )
+            from src.paper_assistant.service import (
+                PaperAssistantConfig,
+                PaperAssistantService,
+            )
+
+            production_service = PaperAssistantService(
+                catalog=catalog,
+                paper_retriever=paper_retriever,
+                requested_retriever=args.retriever,
+                paper_retriever_fallback=paper_router_fallback,
+                paper_reranker=paper_reranker,
+                chunk_retriever=chunk_retriever,
+                chunk_reranker=chunk_reranker,
+                generation_llm=generation_llm,
+                judge_llm=judge_llm,
+                llm_provider=llm_settings.llm.provider,
+                llm_model=llm_settings.llm.model,
+                llm_base_url=llm_settings.llm.base_url,
+                claim_cache=claim_cache,
+                claim_cache_fallback=claim_cache_fallback,
+                config=PaperAssistantConfig(
+                    retriever=args.retriever,
+                    paper_reranker=args.paper_reranker,
+                    chunk_reranker=args.chunk_reranker,
+                    reranker_model=args.reranker_model,
+                    reranker_cache=args.reranker_cache,
+                    paper_rerank_candidates=max(
+                        args.paper_rerank_candidates, args.candidate_papers
+                    ),
+                    paper_min_score=args.paper_min_score,
+                    rerank_candidates=args.rerank_candidates,
+                    rerank_weight=args.rerank_weight,
+                    candidate_papers=args.candidate_papers,
+                    top_k=args.top_k,
+                    min_score=args.min_score,
+                    disable_rejection=args.disable_rejection,
+                    max_context_chars=args.max_context_chars,
+                    min_evidence_chunks=args.min_evidence_chunks,
+                    max_answer_claims=args.max_answer_claims,
+                    verify_claims=args.verify_claims,
+                    claim_judge_models=tuple(claim_judge_models),
+                    claim_retry_k=args.claim_retry_k,
+                    verification_failure_policy=args.verification_failure_policy,
+                    claim_second_judge_policy=args.claim_second_judge_policy,
+                    claim_cache_path=args.claim_cache,
+                    disable_claim_cache=args.disable_claim_cache,
+                ),
+            )
             run_config = {
                 "paper_retriever": args.retriever,
+                "paper_reranker": args.paper_reranker,
+                "paper_rerank_candidates": args.paper_rerank_candidates,
+                "paper_min_score": args.paper_min_score,
                 "chunk_reranker": args.chunk_reranker,
                 "reranker_model": (
                     args.reranker_model if args.chunk_reranker != "none" else None
@@ -875,11 +951,6 @@ def main() -> int:
                     result["id"]: result for result in previous.get("results", [])
                 }
             results = []
-            retrieval_k = (
-                max(args.top_k, args.rerank_candidates)
-                if chunk_reranker
-                else args.top_k
-            )
             for index, case in enumerate(cases, start=1):
                 if case["id"] in completed:
                     previous_result = completed[case["id"]]
@@ -899,117 +970,13 @@ def main() -> int:
                     results.append(previous_result)
                     continue
                 started = time.perf_counter()
-                case_paper_fallback = paper_router_fallback
-                if args.disable_rejection:
-                    candidate_ids, case_paper_fallback = resolve_candidates(
-                        case["question"]
-                    )
-                else:
-                    decision = decide_retrieval(
-                        paper_retriever,
-                        case["question"],
-                        top_k=min(args.candidate_papers, len(catalog)),
-                        min_score=args.min_score,
-                    )
-                    candidate_ids = tuple(
-                        result.paper.paper_id for result in decision.results
-                    )
-                    case_paper_fallback = (
-                        case_paper_fallback or decision.fallback_reason
-                    )
-                matches = []
-                for paper_id in candidate_ids:
-                    matches.extend(
-                        chunk_retriever.search(
-                            case["question"],
-                            top_k=retrieval_k,
-                            paper_ids=(paper_id,),
-                        )
-                    )
-                matches = apply_paper_routing_prior(matches, candidate_ids)
-                reranker_fallback = None
-                if chunk_reranker:
-                    matches = select_rerank_candidates(
-                        matches, top_k=retrieval_k
-                    )
-                    matches, reranker_fallback = rerank_with_fallback(
-                        chunk_reranker,
-                        case["question"],
-                        matches,
-                        top_k=args.top_k,
-                    )
-                else:
-                    matches = matches[: args.top_k]
-                answer = answer_from_evidence(
-                    generation_llm,
-                    case["question"],
-                    matches,
-                    max_context_chars=args.max_context_chars,
-                    min_evidence_chunks=args.min_evidence_chunks,
-                    max_claims=args.max_answer_claims,
-                )
-                verification: dict[str, object] = {"mode": args.verify_claims}
-                if args.verify_claims != "off" and answer.status == "answered":
-                    original_chunk_ids = {match.chunk_id for match in matches}
-
-                    def retrieve_evaluation_claim_evidence(
-                        claim_text: str, paper_ids: tuple[str, ...], top_k: int
-                    ) -> list:
-                        supplement = []
-                        candidate_k = max(
-                            args.rerank_candidates, top_k + len(matches)
-                        )
-                        for paper_id in paper_ids:
-                            supplement.extend(
-                                chunk_retriever.search(
-                                    claim_text,
-                                    top_k=candidate_k,
-                                    paper_ids=(paper_id,),
-                                )
-                            )
-                        supplement = [
-                            item
-                            for item in supplement
-                            if item.chunk_id not in original_chunk_ids
-                        ]
-                        supplement = apply_paper_routing_prior(supplement, paper_ids)
-                        if chunk_reranker and supplement:
-                            candidates = select_rerank_candidates(
-                                supplement, top_k=candidate_k
-                            )
-                            supplement, _ = rerank_with_fallback(
-                                chunk_reranker,
-                                claim_text,
-                                candidates,
-                                top_k=top_k,
-                            )
-                        return supplement[:top_k]
-
-                    safety = verify_and_filter_claims(
-                        judge_llm,
-                        answer,
-                        matches,
-                        judge_models=claim_judge_models,
-                        retrieve_more=retrieve_evaluation_claim_evidence,
-                        retry_k=args.claim_retry_k,
-                        disable_thinking=llm_settings.llm.provider == "deepseek",
-                        failure_policy=args.verification_failure_policy,
-                        cache=claim_cache,
-                        cache_namespace=(
-                            f"{llm_settings.llm.provider}|"
-                            f"{llm_settings.llm.base_url or ''}"
-                        ),
-                        second_judge_policy=args.claim_second_judge_policy,
-                    )
-                    answer = safety.answer
-                    matches = list(safety.evidence_results)
-                    verification = {"mode": args.verify_claims, **safety.report}
-                    verification["cache_initialization_fallback"] = (
-                        claim_cache_fallback
-                    )
-                elif args.verify_claims != "off":
-                    verification["status"] = "skipped"
-                    verification["reason"] = "answer_not_generated"
+                response = production_service.answer_question(case["question"])
+                candidate_ids = response.candidate_paper_ids
+                matches = list(response.evidence_results)
+                answer = response.answer
+                verification = response.claim_verification
+                reranker_fallback = response.reranker_fallback
+                case_paper_fallback = response.paper_retriever_fallback
                 judgement = (
                     judge_required_facts(
                         judge_llm,
@@ -1183,67 +1150,72 @@ def main() -> int:
         )
         return 0
 
-    retriever, retriever_initialization_fallback = _build_retriever(
-        args.catalog,
-        args.retriever,
-        args.embedding_settings,
-        chroma_mode=args.chroma_mode,
-        chroma_path=args.chroma_path,
-        chroma_host=args.chroma_host,
-        chroma_port=args.chroma_port,
-        chroma_ssl=args.chroma_ssl,
+    if args.command == "search":
+        from src.paper_assistant.service import (
+            PaperAssistantConfig,
+            build_paper_search_service,
+        )
+
+        service = build_paper_search_service(
+            PaperAssistantConfig(
+                catalog_path=args.catalog,
+                embedding_settings_path=args.embedding_settings,
+                retriever=args.retriever,
+                chroma_mode=args.chroma_mode,
+                chroma_path=args.chroma_path,
+                chroma_host=args.chroma_host,
+                chroma_port=args.chroma_port,
+                chroma_ssl=args.chroma_ssl,
+                paper_reranker=args.paper_reranker,
+                reranker_model=args.reranker_model,
+                reranker_cache=args.reranker_cache,
+                paper_rerank_candidates=max(
+                    args.paper_rerank_candidates, args.top_k
+                ),
+                paper_min_score=args.paper_min_score,
+                candidate_papers=args.top_k,
+                min_score=args.min_score,
+                disable_rejection=args.disable_rejection,
+            )
+        )
+        output = service.find_papers(args.query, top_k=args.top_k).to_dict()
+        print(json.dumps(output, ensure_ascii=False, indent=2))
+        return 0
+
+    from src.paper_assistant.service import (
+        PaperAssistantConfig,
+        build_paper_search_service,
     )
 
-    if args.command == "search":
-        decision = None
-        if args.disable_rejection:
-            results = retriever.search(args.query, top_k=args.top_k)
-            rejected = not results
-            top_score = results[0].score if results else None
-            threshold = None
-        else:
-            decision = decide_retrieval(
-                retriever, args.query, top_k=args.top_k, min_score=args.min_score
-            )
-            results = list(decision.results)
-            rejected = decision.rejected
-            top_score = decision.top_score
-            threshold = decision.min_score
-        output = {
-            "query": args.query,
-            "retriever": args.retriever,
-            "effective_retriever": (
-                decision.effective_retriever if decision else retriever.name
-            ),
-            "retriever_fallback": (
-                retriever_initialization_fallback
-                or (decision.fallback_reason if decision else None)
-            ),
-            "rejected": rejected,
-            "top_score": round(top_score, 6) if top_score is not None else None,
-            "min_score": threshold,
-            "results": [
-                {
-                    "rank": rank,
-                    "paper_id": result.paper.paper_id,
-                    "title": result.paper.display_title,
-                    "score": round(result.score, 4),
-                    "matched_terms": result.matched_terms,
-                    "pdf_files": result.paper.pdf_files,
-                }
-                for rank, result in enumerate(results, start=1)
-            ],
-        }
-    else:
-        output = evaluate_retriever(
-            retriever,
-            load_evaluation_cases(args.queries),
-            split=args.split,
+    service = build_paper_search_service(
+        PaperAssistantConfig(
+            catalog_path=args.catalog,
+            embedding_settings_path=args.embedding_settings,
+            retriever=args.retriever,
+            chroma_mode=args.chroma_mode,
+            chroma_path=args.chroma_path,
+            chroma_host=args.chroma_host,
+            chroma_port=args.chroma_port,
+            chroma_ssl=args.chroma_ssl,
+            paper_reranker=args.paper_reranker,
+            reranker_model=args.reranker_model,
+            reranker_cache=args.reranker_cache,
+            paper_rerank_candidates=args.paper_rerank_candidates,
+            paper_min_score=args.paper_min_score,
+            candidate_papers=3,
             min_score=args.min_score,
-            use_default_threshold=not args.disable_rejection,
+            disable_rejection=args.disable_rejection,
         )
-        output["requested_retriever"] = args.retriever
-        output["retriever_initialization_fallback"] = retriever_initialization_fallback
+    )
+    output = evaluate_search_service(
+        service,
+        load_evaluation_cases(args.queries),
+        split=args.split,
+        top_k=3,
+    )
+    output["requested_retriever"] = args.retriever
+    output["paper_reranker"] = args.paper_reranker
+    output["paper_min_score"] = args.paper_min_score
     print(json.dumps(output, ensure_ascii=False, indent=2))
     return 0
 

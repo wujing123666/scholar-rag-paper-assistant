@@ -65,7 +65,24 @@ def test_rule_split_caps_the_number_of_subquestions():
 
 def test_looks_wide_only_flags_broad_questions():
     assert looks_wide(SURVEY_QUERY)
+    assert looks_wide("无线传感器网络如何优化覆盖、节点定位和能耗？")
+    assert looks_wide("物联网边缘计算中的任务卸载与资源分配如何实现？")
+    assert looks_wide("工业物联网如何进行预测性维护和设备异常检测？")
     assert not looks_wide("HDDI 模型如何融合预测？")
+    assert not looks_wide("扩散模型和切比雪夫如何结合？")
+
+
+def test_compact_multi_aspect_question_reaches_the_splitter_model():
+    llm = FakeLLM(
+        '["wireless sensor network coverage optimization", '
+        '"wireless sensor node localization", '
+        '"wireless sensor network energy efficiency"]'
+    )
+
+    parts = split_query("无线传感器网络如何优化覆盖、节点定位和能耗？", llm=llm)
+
+    assert len(parts) == 3
+    assert len(llm.calls) == 1
 
 
 def test_split_query_falls_back_to_the_original_question_without_a_model():
@@ -96,6 +113,10 @@ def test_split_prompt_asks_the_model_for_english_search_queries():
     split_query("这篇综述的核心环节、数据来源以及研究挑战分别是什么？", llm=llm)
 
     assert "English" in llm.calls[0][0][0].content
+    assert "exactly one query per explicitly requested facet" in (
+        llm.calls[0][0][0].content
+    )
+    assert "never add a combined or third query" in llm.calls[0][0][0].content
 
 
 def test_split_query_does_not_spend_a_model_call_on_a_focused_question():

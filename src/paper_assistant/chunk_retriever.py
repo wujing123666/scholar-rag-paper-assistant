@@ -5,7 +5,9 @@ from __future__ import annotations
 import hashlib
 import math
 import re
+import threading
 from collections import Counter, OrderedDict
+from collections.abc import Callable
 from dataclasses import dataclass, replace
 from pathlib import Path
 
@@ -145,6 +147,20 @@ class ChunkIndexSync:
     reused: int
     deleted: int
     rebuilt: bool
+
+
+@dataclass(frozen=True)
+class ChunkIndexProgress:
+    """Durable synchronization progress reported after one paper is committed."""
+
+    completed_papers: int
+    total_papers: int
+    run_completed_papers: int
+    run_total_papers: int
+    paper_id: str
+    paper_chunks: int
+    embedded_chunks: int
+    reused_chunks: int
 
 
 def is_method_detail(result: ChunkSearchResult) -> bool:
@@ -437,6 +453,8 @@ class PaperChunkRetriever:
         *,
         chunk_size: int = 1200,
         chunk_overlap: int = 180,
+        progress_callback: Callable[[ChunkIndexProgress], None] | None = None,
+        build_sparse_index: bool = True,
     ) -> None:
         self.catalog = catalog
         self.inbox = Path(inbox)
@@ -444,6 +462,7 @@ class PaperChunkRetriever:
         self.vector_store = vector_store
         self.chunk_size = chunk_size
         self.chunk_overlap = chunk_overlap
+        self.progress_callback = progress_callback
         self.embedding_model = str(
             getattr(
                 embedding,
@@ -453,8 +472,10 @@ class PaperChunkRetriever:
         )
         self.embedding_dimension = embedding.get_dimension()
         self._query_embeddings: OrderedDict[str, list[float]] = OrderedDict()
+        self._query_embedding_lock = threading.Lock()
         self.index_sync = self._sync_index()
-        self._build_sparse_index()
+        if build_sparse_index:
+            self._build_sparse_index()
 
     def _build_sparse_index(self) -> None:
         ids = self.vector_store.list_ids()
@@ -543,72 +564,20 @@ class PaperChunkRetriever:
             sources[profile.paper_id] = existing[0]
         return sources
 
-    def _sync_index(self) -> ChunkIndexSync:
-        sources = self._primary_sources()
-        source_hashes = {paper_id: sha256_file(path) for paper_id, path in sources.items()}
-        current_ids = set(self.vector_store.list_ids())
-        records = self.vector_store.get_by_ids(sorted(current_ids)) if current_ids else []
-        current = {record["id"]: record for record in records if record and record.get("id")}
-        by_paper: dict[str, list[dict]] = {}
-        for record in current.values():
-            metadata = record.get("metadata", {})
-            by_paper.setdefault(str(metadata.get("paper_id", "")), []).append(record)
-
-        rebuilt = any(
-            record.get("metadata", {}).get("embedding_model") != self.embedding_model
-            or record.get("metadata", {}).get("embedding_dimension")
-            != self.embedding_dimension
-            for record in current.values()
-        )
-        changed_papers: list[str] = []
-        reused = 0
-        for paper_id in sources:
-            paper_records = by_paper.get(paper_id, [])
-            metadata = paper_records[0].get("metadata", {}) if paper_records else {}
-            expected_count = int(metadata.get("paper_chunk_count", 0) or 0)
-            unchanged = (
-                not rebuilt
-                and bool(paper_records)
-                and metadata.get("source_hash") == source_hashes[paper_id]
-                and metadata.get("chunk_size") == self.chunk_size
-                and metadata.get("chunk_overlap") == self.chunk_overlap
-                and metadata.get("chunk_schema_version") == CHUNK_SCHEMA_VERSION
-                and expected_count == len(paper_records)
-            )
-            if unchanged:
-                reused += len(paper_records)
-            else:
-                changed_papers.append(paper_id)
-
-        stale_ids = [
-            record_id
-            for record_id, record in current.items()
-            if rebuilt
-            or str(record.get("metadata", {}).get("paper_id", "")) not in sources
-            or str(record.get("metadata", {}).get("paper_id", "")) in changed_papers
-        ]
-
-        pending: list[tuple[PaperChunk, PaperProfile, str]] = []
-        for paper_id in changed_papers:
-            profile = self.catalog.get(paper_id)
-            for chunk in extract_paper_chunks(
-                profile,
-                sources[paper_id],
-                chunk_size=self.chunk_size,
-                chunk_overlap=self.chunk_overlap,
-            ):
-                pending.append((chunk, profile, chunk.embedding_text(profile)))
-
-        vectors = self.embedding.embed([item[2] for item in pending]) if pending else []
-        if len(vectors) != len(pending):
+    def _records_for_chunks(
+        self,
+        chunks: list[PaperChunk],
+        vectors: list[list[float]],
+    ) -> list[dict]:
+        if len(vectors) != len(chunks):
             raise ValueError("Embedding provider returned an invalid chunk matrix")
-
-        counts = Counter(chunk.paper_id for chunk, _, _ in pending)
-        new_records = []
-        for (chunk, _profile, _embedding_text), vector in zip(pending, vectors):
+        records = []
+        for chunk, vector in zip(chunks, vectors):
             if len(vector) != self.embedding_dimension:
-                raise ValueError("Embedding provider returned a chunk vector with the wrong dimension")
-            new_records.append(
+                raise ValueError(
+                    "Embedding provider returned a chunk vector with the wrong dimension"
+                )
+            records.append(
                 {
                     "id": chunk.chunk_id,
                     "vector": vector,
@@ -624,7 +593,7 @@ class PaperChunkRetriever:
                         "content_hash": hashlib.sha256(
                             chunk.text.encode("utf-8")
                         ).hexdigest(),
-                        "paper_chunk_count": counts[chunk.paper_id],
+                        "paper_chunk_count": len(chunks),
                         "chunk_size": self.chunk_size,
                         "chunk_overlap": self.chunk_overlap,
                         "chunk_schema_version": CHUNK_SCHEMA_VERSION,
@@ -633,19 +602,177 @@ class PaperChunkRetriever:
                     },
                 }
             )
+        return records
 
-        new_ids = {record["id"] for record in new_records}
-        obsolete_ids = sorted(set(stale_ids) - new_ids)
-        if new_records:
-            self.vector_store.upsert(new_records)
-        if obsolete_ids:
-            self.vector_store.delete(obsolete_ids)
+    def _extract_and_embed(
+        self, profile: PaperProfile, source: Path
+    ) -> tuple[list[PaperChunk], list[dict]]:
+        chunks = extract_paper_chunks(
+            profile,
+            source,
+            chunk_size=self.chunk_size,
+            chunk_overlap=self.chunk_overlap,
+        )
+        vectors = self.embedding.embed(
+            [chunk.embedding_text(profile) for chunk in chunks]
+        )
+        return chunks, self._records_for_chunks(chunks, vectors)
+
+    def _sync_index(self) -> ChunkIndexSync:
+        sources = self._primary_sources()
+        source_hashes = {paper_id: sha256_file(path) for paper_id, path in sources.items()}
+        current_ids = set(self.vector_store.list_ids())
+        records = self.vector_store.get_by_ids(sorted(current_ids)) if current_ids else []
+        current = {record["id"]: record for record in records if record and record.get("id")}
+        by_paper: dict[str, list[dict]] = {}
+        for record in current.values():
+            metadata = record.get("metadata", {})
+            by_paper.setdefault(str(metadata.get("paper_id", "")), []).append(record)
+
+        dimension_rebuild = any(
+            record.get("metadata", {}).get("embedding_dimension")
+            != self.embedding_dimension
+            for record in current.values()
+        )
+        rebuilt = dimension_rebuild or any(
+            record.get("metadata", {}).get("embedding_model") != self.embedding_model
+            for record in current.values()
+        )
+        changed_papers: list[str] = []
+        reused = 0
+        reused_papers = 0
+        for paper_id in sources:
+            paper_records = by_paper.get(paper_id, [])
+            unchanged = (
+                not dimension_rebuild
+                and bool(paper_records)
+                and all(
+                    record.get("metadata", {}).get("source_hash")
+                    == source_hashes[paper_id]
+                    and record.get("metadata", {}).get("chunk_size")
+                    == self.chunk_size
+                    and record.get("metadata", {}).get("chunk_overlap")
+                    == self.chunk_overlap
+                    and record.get("metadata", {}).get("chunk_schema_version")
+                    == CHUNK_SCHEMA_VERSION
+                    and record.get("metadata", {}).get("embedding_model")
+                    == self.embedding_model
+                    and record.get("metadata", {}).get("embedding_dimension")
+                    == self.embedding_dimension
+                    and int(
+                        record.get("metadata", {}).get("paper_chunk_count", 0)
+                        or 0
+                    )
+                    == len(paper_records)
+                    for record in paper_records
+                )
+            )
+            if unchanged:
+                reused += len(paper_records)
+                reused_papers += 1
+            else:
+                changed_papers.append(paper_id)
+
+        removed_record_ids = [
+            record_id
+            for record_id, record in current.items()
+            if str(record.get("metadata", {}).get("paper_id", "")) not in sources
+        ]
+        deleted = 0
+        embedded = 0
+
+        if dimension_rebuild:
+            begin_rebuild = getattr(self.vector_store, "begin_rebuild", None)
+            upsert_rebuild = getattr(self.vector_store, "upsert_rebuild", None)
+            commit_rebuild = getattr(self.vector_store, "commit_rebuild", None)
+            abort_rebuild = getattr(self.vector_store, "abort_rebuild", None)
+            if not all(
+                callable(operation)
+                for operation in (
+                    begin_rebuild,
+                    upsert_rebuild,
+                    commit_rebuild,
+                    abort_rebuild,
+                )
+            ):
+                raise RuntimeError(
+                    "Changing the embedding dimension requires a vector store "
+                    "with atomic staging support; use a new empty collection"
+                )
+
+            # Chroma collections have a fixed vector dimension. Build the new
+            # index one paper at a time in an isolated collection, then swap it
+            # into place only after every embedding and write has succeeded.
+            begin_rebuild()
+            try:
+                for changed_index, paper_id in enumerate(changed_papers, start=1):
+                    profile = self.catalog.get(paper_id)
+                    _chunks, paper_records = self._extract_and_embed(
+                        profile, sources[paper_id]
+                    )
+                    upsert_rebuild(paper_records)
+                    embedded += len(paper_records)
+                    if self.progress_callback:
+                        self.progress_callback(
+                            ChunkIndexProgress(
+                                completed_papers=changed_index,
+                                total_papers=len(sources),
+                                run_completed_papers=changed_index,
+                                run_total_papers=len(changed_papers),
+                                paper_id=paper_id,
+                                paper_chunks=len(paper_records),
+                                embedded_chunks=embedded,
+                                reused_chunks=0,
+                            )
+                        )
+                commit_rebuild()
+            except BaseException:
+                abort_rebuild()
+                raise
+            deleted = len(current_ids)
+            reused = 0
+        else:
+            if removed_record_ids:
+                self.vector_store.delete(removed_record_ids)
+                deleted += len(removed_record_ids)
+            # Commit one complete paper at a time. If a later provider request
+            # fails, completed papers remain durable and are reused on restart.
+            for changed_index, paper_id in enumerate(changed_papers, start=1):
+                profile = self.catalog.get(paper_id)
+                _chunks, paper_records = self._extract_and_embed(
+                    profile, sources[paper_id]
+                )
+                new_ids = {record["id"] for record in paper_records}
+                old_ids = {
+                    str(record.get("id", ""))
+                    for record in by_paper.get(paper_id, [])
+                    if record.get("id")
+                }
+                self.vector_store.upsert(paper_records)
+                obsolete_ids = sorted(old_ids - new_ids)
+                if obsolete_ids:
+                    self.vector_store.delete(obsolete_ids)
+                embedded += len(paper_records)
+                deleted += len(obsolete_ids)
+                if self.progress_callback:
+                    self.progress_callback(
+                        ChunkIndexProgress(
+                            completed_papers=reused_papers + changed_index,
+                            total_papers=len(sources),
+                            run_completed_papers=changed_index,
+                            run_total_papers=len(changed_papers),
+                            paper_id=paper_id,
+                            paper_chunks=len(paper_records),
+                            embedded_chunks=embedded,
+                            reused_chunks=reused,
+                        )
+                    )
         return ChunkIndexSync(
             papers=len(sources),
-            chunks=reused + len(new_records),
-            embedded=len(new_records),
+            chunks=reused + embedded,
+            embedded=embedded,
             reused=reused,
-            deleted=len(obsolete_ids),
+            deleted=deleted,
             rebuilt=rebuilt,
         )
 
@@ -657,17 +784,19 @@ class PaperChunkRetriever:
         paper_ids: tuple[str, ...] = (),
     ) -> list[ChunkSearchResult]:
         expanded_query = expand_chunk_query(query)
-        if expanded_query in self._query_embeddings:
-            query_vector = self._query_embeddings.pop(expanded_query)
-            self._query_embeddings[expanded_query] = query_vector
-        else:
+        with self._query_embedding_lock:
+            query_vector = self._query_embeddings.pop(expanded_query, None)
+            if query_vector is not None:
+                self._query_embeddings[expanded_query] = query_vector
+        if query_vector is None:
             vectors = self.embedding.embed([expanded_query], is_query=True)
             if len(vectors) != 1 or len(vectors[0]) != self.embedding_dimension:
                 raise ValueError("Embedding provider returned an invalid query vector")
             query_vector = vectors[0]
-            self._query_embeddings[expanded_query] = query_vector
-            if len(self._query_embeddings) > 128:
-                self._query_embeddings.popitem(last=False)
+            with self._query_embedding_lock:
+                self._query_embeddings[expanded_query] = query_vector
+                if len(self._query_embeddings) > 128:
+                    self._query_embeddings.popitem(last=False)
         filters = None
         if len(paper_ids) == 1:
             filters = {"paper_id": paper_ids[0]}
