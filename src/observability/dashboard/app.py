@@ -63,7 +63,7 @@ pages = [
 
 def main() -> None:
     st.set_page_config(
-        page_title="Modular RAG Dashboard",
+        page_title="ScholarRAG",
         page_icon="📊",
         layout="wide",
     )

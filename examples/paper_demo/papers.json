@@ -1,0 +1,86 @@
+[
+  {
+    "paper_id": "demo_mesh",
+    "pdf_file": "demo_mesh.pdf",
+    "canonical_title": "DemoMesh: Residual Diffusion for Missing Sensor Readings",
+    "title_zh": "DemoMesh：残差扩散传感读数补全（合成示例）",
+    "tags": "DemoMesh;residual diffusion;imputation;扩散模型;残差;缺失读数;补全",
+    "method_summary": "DemoMesh first interpolates observed sensor readings and then denoises a residual using neighboring sensors. 先插值再做残差扩散。",
+    "datasets": "ToyGrid",
+    "memory_cues": "先插值，再从邻居传感器学习残差；人工合成教学文档。",
+    "pages": [
+      {
+        "heading": "I. METHOD",
+        "paragraphs": [
+          "This is an original synthetic document for software demonstrations. DemoMesh and ToyGrid are fictional. No empirical research results or published scientific claims are presented.",
+          "DemoMesh fills missing sensor readings in two stages. First, linear interpolation creates a preliminary estimate from observed timestamps. Second, a residual diffusion model learns a correction using neighboring sensors. The final reading is the preliminary estimate plus the predicted residual.",
+          "Only observed readings and their masks are supplied to the encoder. Missing readings are excluded from the reconstruction loss. A graph connects spatial neighbors to provide local context. The model does not use future readings during evaluation."
+        ]
+      },
+      {
+        "heading": "II. DATA AND LIMITATIONS",
+        "paragraphs": [
+          "ToyGrid is a fictional demonstration dataset with four sensors and twelve timestamps. It exists only to explain the data flow; it is not a benchmark downloaded from a real deployment.",
+          "For the example evaluation, the input mask hides selected readings while the held-out values remain available to the evaluator. Mean absolute error compares the predictions with those held-out values. No numerical accuracy result is claimed.",
+          "The demonstration assumes synchronized sensors. Clock drift, sensor failures and adaptation to a new city are outside its scope. This document contains no medical evidence and cannot support advice about insomnia, medication or treatments."
+        ]
+      }
+    ]
+  },
+  {
+    "paper_id": "demo_recruit",
+    "pdf_file": "demo_recruit.pdf",
+    "canonical_title": "DemoRecruit: Budgeted Participant Recruitment for Crowdsensing",
+    "title_zh": "DemoRecruit：预算约束的群智感知用户招募（合成示例）",
+    "tags": "DemoRecruit;participant recruitment;coverage;budget;用户招募;预算;覆盖率",
+    "method_summary": "DemoRecruit chooses participants by marginal coverage per unit cost until the budget is exhausted. 按新增覆盖与成本之比招募参与者。",
+    "datasets": "ToyRoutes",
+    "memory_cues": "增量覆盖除以成本，预算用完停止；人工合成教学文档。",
+    "pages": [
+      {
+        "heading": "I. PARTICIPANT SELECTION",
+        "paragraphs": [
+          "This is an original synthetic document for software demonstrations. DemoRecruit and ToyRoutes are fictional. The procedure below is illustrative, not a published algorithmic contribution.",
+          "DemoRecruit selects crowdsensing participants under a fixed budget. Each candidate provides an expected route and a requested payment. At each step, the selector computes newly covered cells divided by payment and selects the highest ratio among affordable candidates.",
+          "After each selection the covered-cell set is updated. Participants whose payments exceed the remaining budget are skipped. Selection stops when no affordable participant contributes a new cell. The example does not claim global optimality."
+        ]
+      },
+      {
+        "heading": "II. DATA AND FAILURE CASES",
+        "paragraphs": [
+          "ToyRoutes is a fictional dataset containing six candidate routes over a small grid. The evaluation compares covered cells with the requested payments, rather than measuring sensor-reading reconstruction error.",
+          "If every route covers the same cells, selecting additional participants may add no coverage. The procedure then stops even if budget remains. Route uncertainty and malicious location reports are limitations of this simplified example.",
+          "This document does not contain a trained reinforcement learning policy, real user identifiers or quantitative deployment results."
+        ]
+      }
+    ]
+  },
+  {
+    "paper_id": "demo_privacy",
+    "pdf_file": "demo_privacy.pdf",
+    "canonical_title": "DemoShield: Local Noise for Private Sensor Aggregation",
+    "title_zh": "DemoShield：本地加噪的隐私传感聚合（合成示例）",
+    "tags": "DemoShield;privacy;local noise;aggregation;隐私保护;本地加噪;聚合",
+    "method_summary": "DemoShield clips each reading, adds local Laplace noise and sends only the noisy value for aggregation. 先裁剪再本地加噪，服务端只接收扰动值。",
+    "datasets": "ToyCounts",
+    "memory_cues": "裁剪、本地拉普拉斯噪声、服务端均值；人工合成教学文档。",
+    "pages": [
+      {
+        "heading": "I. LOCAL PERTURBATION",
+        "paragraphs": [
+          "This is an original synthetic document for software demonstrations. DemoShield and ToyCounts are fictional. It describes a simplified mechanism, not a proof or deployed privacy guarantee.",
+          "DemoShield clips each sensor reading into a fixed interval before adding local Laplace noise. A device sends only its noisy value to the server. The server computes the average of received values and does not receive the original individual readings.",
+          "The noise scale is tied to the clipping interval and a privacy parameter. This software example does not specify a numerical privacy parameter or prove a composition bound. It must not be described as a certified privacy system."
+        ]
+      },
+      {
+        "heading": "II. EVALUATION AND LIMITATIONS",
+        "paragraphs": [
+          "ToyCounts is a fictional set of scalar counts for demonstration. Evaluation compares the aggregate of perturbed counts with the reference aggregate of unperturbed counts. It does not evaluate participant recruitment or missing-reading interpolation.",
+          "Increasing noise can reduce the utility of the aggregate. A small number of participants makes individual noise harder to average out. These are qualitative limitations; the document claims no numerical improvement.",
+          "The example does not discuss homomorphic encryption, federated optimization or cryptographic security proofs."
+        ]
+      }
+    ]
+  }
+]

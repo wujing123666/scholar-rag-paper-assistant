@@ -19,8 +19,9 @@ from src.paper_assistant.service import (
     PaperSearchResponse,
     build_paper_assistant_service,
 )
+from src.paper_assistant.web_config import citation_pdf_path, dataset_paths_from_environment
 
-REQUEST_LOG_PATH = Path("logs/paper_requests.jsonl")
+REQUEST_LOG_PATH = Path(os.getenv("SCHOLARRAG_REQUEST_LOG") or "logs/paper_requests.jsonl")
 
 
 def _positive_env_int(name: str, default: int) -> int:
@@ -37,6 +38,11 @@ def _positive_env_float(name: str, default: float) -> float:
     except ValueError:
         return default
     return value if value > 0 else default
+
+
+def _choice_index(name: str, choices: tuple[str, ...]) -> int:
+    value = os.getenv(name, choices[0])
+    return choices.index(value) if value in choices else 0
 
 
 @st.cache_resource(show_spinner=False)
@@ -99,15 +105,17 @@ def _build_config() -> PaperAssistantConfig:
             paper_reranker = st.selectbox(
                 "论文相关性判定",
                 ("fastembed", "none"),
-                index=0,
+                index=_choice_index("SCHOLARRAG_PAPER_RERANKER", ("fastembed", "none")),
                 help="Hybrid先召回候选论文，再用本地Cross-Encoder排序并判断是否应拒答。",
             )
             reranker = st.selectbox(
-                "正文重排", ("fastembed", "none"), index=0
+                "正文重排", ("fastembed", "none"),
+                index=_choice_index("SCHOLARRAG_CHUNK_RERANKER", ("fastembed", "none")),
             )
         with col_b:
             verification = st.selectbox(
-                "Claim验证", ("consensus", "single", "off"), index=0
+                "Claim验证", ("consensus", "single", "off"),
+                index=_choice_index("SCHOLARRAG_CLAIM_VERIFICATION", ("consensus", "single", "off")),
             )
             second_policy = st.selectbox(
                 "第二评审策略", ("risk_based", "all"), index=0
@@ -131,6 +139,7 @@ def _build_config() -> PaperAssistantConfig:
             _cached_answer_service.clear()
             st.success("缓存的服务实例已清除，下次查询会重新加载。")
     return PaperAssistantConfig(
+        **dataset_paths_from_environment(),
         settings_path=Path(settings_path.strip() or default_settings),
         fallback_settings_path=(Path(fallback_path.strip()) if fallback_path.strip() else None),
         retriever=retriever,
@@ -215,7 +224,10 @@ def _render_verification(report: dict) -> None:
 
 
 def _render_answer(
-    response: PaperAnswerResponse, request_record: dict | None = None
+    response: PaperAnswerResponse,
+    request_record: dict | None = None,
+    *,
+    inbox_path: Path = Path("data/papers/inbox"),
 ) -> None:
     if response.answer.status != "answered":
         st.warning(response.answer.answer)
@@ -234,6 +246,7 @@ def _render_answer(
     evidence_by_chunk = {
         result.chunk_id: result for result in response.evidence_results
     }
+    offered_pdfs: set[Path] = set()
     for index, claim in enumerate(response.answer.claims, start=1):
         st.markdown(f"**{index}. {claim.text}**")
         for citation_id in claim.citations:
@@ -248,6 +261,16 @@ def _render_answer(
                 st.caption(
                     f"文件：{citation.pdf_file} · Chunk：{citation.chunk_id}"
                 )
+                pdf = citation_pdf_path(inbox_path, citation.pdf_file)
+                if pdf is not None and pdf not in offered_pdfs:
+                    offered_pdfs.add(pdf)
+                    st.download_button(
+                        f"下载原文 PDF（核对第{citation.page_number}页）",
+                        data=pdf.read_bytes(),
+                        file_name=pdf.name,
+                        mime="application/pdf",
+                        key=f"paper_pdf_{index}_{citation_id}",
+                    )
 
     _render_verification(response.claim_verification)
     with st.expander("运行诊断", expanded=False):
@@ -287,6 +310,14 @@ def render() -> None:
         f"每类最多等待 {answer_state.max_queue_size} 个请求。"
     )
     config = _build_config()
+    # A changed dataset/model must not retain results from the previous configuration.
+    if st.session_state.get("paper_result_config") != config:
+        for key in (
+            "paper_search_response", "paper_search_request_record",
+            "paper_answer_response", "paper_answer_request_record",
+        ):
+            st.session_state.pop(key, None)
+        st.session_state["paper_result_config"] = config
     search_tab, answer_tab = st.tabs(("🔎 找论文", "💬 论文问答"))
 
     with search_tab:
@@ -397,4 +428,5 @@ def render() -> None:
             _render_answer(
                 cached_answer,
                 st.session_state.get("paper_answer_request_record"),
+                inbox_path=config.inbox_path,
             )

@@ -1,0 +1,8 @@
+{"id":"demo_q01","description":"DemoMesh residual diffusion missing readings","expected_paper_id":"demo_mesh","split":"synthetic_demo","difficulty":"keyword"}
+{"id":"demo_q02","description":"DemoMesh ToyGrid interpolation","expected_paper_id":"demo_mesh","split":"synthetic_demo","difficulty":"keyword"}
+{"id":"demo_q03","description":"DemoRecruit budget participant recruitment","expected_paper_id":"demo_recruit","split":"synthetic_demo","difficulty":"keyword"}
+{"id":"demo_q04","description":"DemoRecruit marginal coverage payment","expected_paper_id":"demo_recruit","split":"synthetic_demo","difficulty":"keyword"}
+{"id":"demo_q05","description":"DemoShield local Laplace noise aggregation","expected_paper_id":"demo_privacy","split":"synthetic_demo","difficulty":"keyword"}
+{"id":"demo_q06","description":"DemoShield ToyCounts privacy","expected_paper_id":"demo_privacy","split":"synthetic_demo","difficulty":"keyword"}
+{"id":"demo_u01","description":"neutrino oscillation mass hierarchy","expected_paper_id":null,"split":"synthetic_demo","difficulty":"out_of_domain"}
+{"id":"demo_u02","description":"medieval manuscript palaeography","expected_paper_id":null,"split":"synthetic_demo","difficulty":"out_of_domain"}

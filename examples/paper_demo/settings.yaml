@@ -1,0 +1,59 @@
+# Public example: keys are read from environment variables.
+llm:
+  provider: deepseek
+  model: deepseek-chat
+  api_key: null
+  base_url: https://api.deepseek.com
+  temperature: 0.0
+  max_tokens: 4096
+embedding:
+  provider: qwen
+  model: text-embedding-v4
+  dimensions: 1024
+  base_url: https://dashscope.aliyuncs.com/compatible-mode/v1
+  api_key: null
+vision_llm:
+  enabled: false
+  provider: openai
+  model: gpt-4o
+  api_key: null
+  max_image_size: 2048
+vector_store:
+  provider: chroma
+  mode: local
+  persist_directory: tmp/paper_demo/chroma
+  collection_name: knowledge_hub
+  host: localhost
+  port: 8000
+  ssl: false
+retrieval:
+  dense_top_k: 20
+  sparse_top_k: 20
+  fusion_top_k: 10
+  rrf_k: 60
+rerank:
+  enabled: false
+  provider: none
+  model: cross-encoder/ms-marco-MiniLM-L-6-v2
+  top_k: 5
+evaluation:
+  enabled: false
+  provider: custom
+  metrics:
+  - hit_rate
+  - mrr
+  - faithfulness
+observability:
+  log_level: INFO
+  trace_enabled: true
+  trace_file: ./logs/traces.jsonl
+  structured_logging: true
+ingestion:
+  chunk_size: 1000
+  chunk_overlap: 200
+  splitter: recursive
+  batch_size: 100
+  chunk_refiner:
+    use_llm: true
+  metadata_enricher:
+    use_llm: true

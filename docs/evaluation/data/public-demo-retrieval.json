@@ -1,0 +1,387 @@
+{
+  "purpose": "synthetic_development_retrieval",
+  "config": {
+    "embedding": "text-embedding-v4",
+    "dimensions": 1024,
+    "paper_retriever": "hybrid",
+    "paper_reranker": "none",
+    "chunk_reranker": "none",
+    "candidate_papers": 1,
+    "top_k": 3,
+    "chunk_size": 1200,
+    "chunk_overlap": 180
+  },
+  "paper": {
+    "retriever": "hybrid",
+    "split": "all",
+    "overall": {
+      "queries": 6,
+      "recall_at_1": 1.0,
+      "recall_at_3": 1.0,
+      "mrr": 1.0
+    },
+    "rejection": {
+      "queries": 2,
+      "correctly_rejected": 2,
+      "false_accepts": 0,
+      "accuracy": 1.0
+    },
+    "open_set": {
+      "queries": 8,
+      "correct": 8,
+      "accuracy": 1.0
+    },
+    "retriever_fallback_cases": 0,
+    "by_difficulty": {
+      "keyword": {
+        "queries": 6,
+        "recall_at_1": 1.0,
+        "recall_at_3": 1.0,
+        "mrr": 1.0
+      }
+    },
+    "cases": [
+      {
+        "query_id": "demo_q01",
+        "expected_paper_id": "demo_mesh",
+        "rank": 1,
+        "returned_paper_ids": [
+          "demo_mesh",
+          "demo_privacy",
+          "demo_recruit"
+        ],
+        "split": "synthetic_demo",
+        "difficulty": "keyword",
+        "rejected": false,
+        "top_score": 0.03305563020693362,
+        "min_score": 0.03278688524590164,
+        "effective_retriever": "paper_hybrid_rrf",
+        "fallback_reason": null
+      },
+      {
+        "query_id": "demo_q02",
+        "expected_paper_id": "demo_mesh",
+        "rank": 1,
+        "returned_paper_ids": [
+          "demo_mesh",
+          "demo_recruit",
+          "demo_privacy"
+        ],
+        "split": "synthetic_demo",
+        "difficulty": "keyword",
+        "rejected": false,
+        "top_score": 0.03305563020693362,
+        "min_score": 0.03278688524590164,
+        "effective_retriever": "paper_hybrid_rrf",
+        "fallback_reason": null
+      },
+      {
+        "query_id": "demo_q03",
+        "expected_paper_id": "demo_recruit",
+        "rank": 1,
+        "returned_paper_ids": [
+          "demo_recruit",
+          "demo_privacy",
+          "demo_mesh"
+        ],
+        "split": "synthetic_demo",
+        "difficulty": "keyword",
+        "rejected": false,
+        "top_score": 0.03305563020693362,
+        "min_score": 0.03278688524590164,
+        "effective_retriever": "paper_hybrid_rrf",
+        "fallback_reason": null
+      },
+      {
+        "query_id": "demo_q04",
+        "expected_paper_id": "demo_recruit",
+        "rank": 1,
+        "returned_paper_ids": [
+          "demo_recruit",
+          "demo_privacy",
+          "demo_mesh"
+        ],
+        "split": "synthetic_demo",
+        "difficulty": "keyword",
+        "rejected": false,
+        "top_score": 0.03305563020693362,
+        "min_score": 0.03278688524590164,
+        "effective_retriever": "paper_hybrid_rrf",
+        "fallback_reason": null
+      },
+      {
+        "query_id": "demo_q05",
+        "expected_paper_id": "demo_privacy",
+        "rank": 1,
+        "returned_paper_ids": [
+          "demo_privacy",
+          "demo_recruit",
+          "demo_mesh"
+        ],
+        "split": "synthetic_demo",
+        "difficulty": "keyword",
+        "rejected": false,
+        "top_score": 0.03278688524590164,
+        "min_score": 0.03278688524590164,
+        "effective_retriever": "paper_hybrid_rrf",
+        "fallback_reason": null
+      },
+      {
+        "query_id": "demo_q06",
+        "expected_paper_id": "demo_privacy",
+        "rank": 1,
+        "returned_paper_ids": [
+          "demo_privacy",
+          "demo_recruit",
+          "demo_mesh"
+        ],
+        "split": "synthetic_demo",
+        "difficulty": "keyword",
+        "rejected": false,
+        "top_score": 0.03278688524590164,
+        "min_score": 0.03278688524590164,
+        "effective_retriever": "paper_hybrid_rrf",
+        "fallback_reason": null
+      },
+      {
+        "query_id": "demo_u01",
+        "expected_paper_id": null,
+        "rank": null,
+        "returned_paper_ids": [],
+        "split": "synthetic_demo",
+        "difficulty": "out_of_domain",
+        "rejected": true,
+        "top_score": 0.01639344262295082,
+        "min_score": 0.03278688524590164,
+        "effective_retriever": "paper_hybrid_rrf",
+        "fallback_reason": null
+      },
+      {
+        "query_id": "demo_u02",
+        "expected_paper_id": null,
+        "rank": null,
+        "returned_paper_ids": [],
+        "split": "synthetic_demo",
+        "difficulty": "out_of_domain",
+        "rejected": true,
+        "top_score": 0.01639344262295082,
+        "min_score": 0.03278688524590164,
+        "effective_retriever": "paper_hybrid_rrf",
+        "fallback_reason": null
+      }
+    ]
+  },
+  "chunk": {
+    "mode": "two_stage",
+    "top_k": 3,
+    "reranker_fallbacks": {},
+    "paper_routing": {
+      "queries": 6,
+      "hits": 6,
+      "recall": 1.0
+    },
+    "page": {
+      "queries": 6,
+      "recall_at_1": 0.6666666666666666,
+      "recall_at_3": 1.0,
+      "recall_at_5": 1.0,
+      "mrr": 0.8333333333333334
+    },
+    "evidence": {
+      "queries": 6,
+      "recall_at_1": 0.6666666666666666,
+      "recall_at_3": 1.0,
+      "recall_at_5": 1.0,
+      "mrr": 0.8333333333333334
+    },
+    "cases": [
+      {
+        "query_id": "demo_c01",
+        "expected_paper_id": "demo_mesh",
+        "relevant_pages": [
+          1
+        ],
+        "candidate_paper_ids": [
+          "demo_mesh"
+        ],
+        "paper_routed": true,
+        "page_rank": 1,
+        "evidence_rank": 1,
+        "returned_chunks": [
+          {
+            "rank": 1,
+            "paper_id": "demo_mesh",
+            "page_number": 1,
+            "chunk_id": "paper_chunk:demo_mesh:p0001:c000:e862422eb349",
+            "score": 0.942444,
+            "rerank_score": null
+          },
+          {
+            "rank": 2,
+            "paper_id": "demo_mesh",
+            "page_number": 2,
+            "chunk_id": "paper_chunk:demo_mesh:p0002:c000:aadcf91a29df",
+            "score": 0.771712,
+            "rerank_score": null
+          }
+        ]
+      },
+      {
+        "query_id": "demo_c02",
+        "expected_paper_id": "demo_mesh",
+        "relevant_pages": [
+          2
+        ],
+        "candidate_paper_ids": [
+          "demo_mesh"
+        ],
+        "paper_routed": true,
+        "page_rank": 2,
+        "evidence_rank": 2,
+        "returned_chunks": [
+          {
+            "rank": 1,
+            "paper_id": "demo_mesh",
+            "page_number": 1,
+            "chunk_id": "paper_chunk:demo_mesh:p0001:c000:e862422eb349",
+            "score": 0.911339,
+            "rerank_score": null
+          },
+          {
+            "rank": 2,
+            "paper_id": "demo_mesh",
+            "page_number": 2,
+            "chunk_id": "paper_chunk:demo_mesh:p0002:c000:aadcf91a29df",
+            "score": 0.849547,
+            "rerank_score": null
+          }
+        ]
+      },
+      {
+        "query_id": "demo_c03",
+        "expected_paper_id": "demo_recruit",
+        "relevant_pages": [
+          1
+        ],
+        "candidate_paper_ids": [
+          "demo_recruit"
+        ],
+        "paper_routed": true,
+        "page_rank": 1,
+        "evidence_rank": 1,
+        "returned_chunks": [
+          {
+            "rank": 1,
+            "paper_id": "demo_recruit",
+            "page_number": 1,
+            "chunk_id": "paper_chunk:demo_recruit:p0001:c000:7a748fbc147c",
+            "score": 0.937922,
+            "rerank_score": null
+          },
+          {
+            "rank": 2,
+            "paper_id": "demo_recruit",
+            "page_number": 2,
+            "chunk_id": "paper_chunk:demo_recruit:p0002:c000:fcd54addaacc",
+            "score": 0.771868,
+            "rerank_score": null
+          }
+        ]
+      },
+      {
+        "query_id": "demo_c04",
+        "expected_paper_id": "demo_recruit",
+        "relevant_pages": [
+          1
+        ],
+        "candidate_paper_ids": [
+          "demo_recruit"
+        ],
+        "paper_routed": true,
+        "page_rank": 1,
+        "evidence_rank": 1,
+        "returned_chunks": [
+          {
+            "rank": 1,
+            "paper_id": "demo_recruit",
+            "page_number": 1,
+            "chunk_id": "paper_chunk:demo_recruit:p0001:c000:7a748fbc147c",
+            "score": 0.901401,
+            "rerank_score": null
+          },
+          {
+            "rank": 2,
+            "paper_id": "demo_recruit",
+            "page_number": 2,
+            "chunk_id": "paper_chunk:demo_recruit:p0002:c000:fcd54addaacc",
+            "score": 0.726539,
+            "rerank_score": null
+          }
+        ]
+      },
+      {
+        "query_id": "demo_c05",
+        "expected_paper_id": "demo_privacy",
+        "relevant_pages": [
+          1
+        ],
+        "candidate_paper_ids": [
+          "demo_privacy"
+        ],
+        "paper_routed": true,
+        "page_rank": 1,
+        "evidence_rank": 1,
+        "returned_chunks": [
+          {
+            "rank": 1,
+            "paper_id": "demo_privacy",
+            "page_number": 1,
+            "chunk_id": "paper_chunk:demo_privacy:p0001:c000:546388b98b5a",
+            "score": 0.914478,
+            "rerank_score": null
+          },
+          {
+            "rank": 2,
+            "paper_id": "demo_privacy",
+            "page_number": 2,
+            "chunk_id": "paper_chunk:demo_privacy:p0002:c000:ce0e41a6a036",
+            "score": 0.723748,
+            "rerank_score": null
+          }
+        ]
+      },
+      {
+        "query_id": "demo_c06",
+        "expected_paper_id": "demo_privacy",
+        "relevant_pages": [
+          2
+        ],
+        "candidate_paper_ids": [
+          "demo_privacy"
+        ],
+        "paper_routed": true,
+        "page_rank": 2,
+        "evidence_rank": 2,
+        "returned_chunks": [
+          {
+            "rank": 1,
+            "paper_id": "demo_privacy",
+            "page_number": 1,
+            "chunk_id": "paper_chunk:demo_privacy:p0001:c000:546388b98b5a",
+            "score": 0.897147,
+            "rerank_score": null
+          },
+          {
+            "rank": 2,
+            "paper_id": "demo_privacy",
+            "page_number": 2,
+            "chunk_id": "paper_chunk:demo_privacy:p0002:c000:ce0e41a6a036",
+            "score": 0.833552,
+            "rerank_score": null
+          }
+        ]
+      }
+    ]
+  },
+  "limits": "Small synthetic same-source development set; not an independent benchmark. No answer generation or hallucination measurement."
+}
