@@ -265,4 +265,6 @@ $env:SCHOLARRAG_SETTINGS = "config/settings.local.yaml"
 
 ## 来源与扩展范围
 
+独立网页入口见 [React/FastAPI 工作台运行说明](frontend/README.md)：支持真实检索问答、同一有界 Gate 的后台任务、幂等恢复与页级 PDF 核对；当前上传写库尚未开放。
+
 项目基于 [jerry-ai-dev/MODULAR-RAG-MCP-SERVER](https://github.com/jerry-ai-dev/MODULAR-RAG-MCP-SERVER) 的通用 RAG、MCP 与可观测性底座构建。ScholarRAG 扩展集中在论文档案与入库、论文级和正文级检索、多方面证据召回、结论核验、评测及服务可靠性。原始底座设计文档保留在 [DEV_SPEC.md](DEV_SPEC.md)。

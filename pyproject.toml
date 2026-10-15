@@ -37,6 +37,12 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
+web = [
+    "fastapi>=0.143,<0.144",
+    "pydantic>=2.13,<3",
+    "uvicorn>=0.54,<0.55",
+    "filelock>=4,<5",
+]
 rerank = [
     "fastembed>=0.8,<0.9",
 ]

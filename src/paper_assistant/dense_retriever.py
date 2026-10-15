@@ -51,10 +51,13 @@ class PaperDenseRetriever:
         catalog: PaperCatalog,
         embedding: BaseEmbedding,
         vector_store: BaseVectorStore,
+        *,
+        read_only: bool = False,
     ) -> None:
         self.catalog = catalog
         self.embedding = embedding
         self.vector_store = vector_store
+        self.read_only = read_only
         self.embedding_model = str(
             getattr(
                 embedding,
@@ -143,6 +146,8 @@ class PaperDenseRetriever:
             ):
                 changed.append((record_id, profile, text, content_hash))
 
+        if self.read_only and (changed or stale_ids or rebuilt):
+            raise ValueError("Existing paper index does not match this dataset; rebuild offline")
         deleted = 0
         if dimension_rebuild:
             # Chroma collections have a fixed vector dimension. Do not remove the

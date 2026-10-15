@@ -105,6 +105,12 @@ data/papers/*
 cache/
 logs/
 tmp/
+frontend/node_modules/
+frontend/dist/
+frontend/coverage/
+frontend/.env*
+frontend/*.tsbuildinfo
+data/web/
 *.log
 traces.jsonl
 

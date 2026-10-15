@@ -455,11 +455,13 @@ class PaperChunkRetriever:
         chunk_overlap: int = 180,
         progress_callback: Callable[[ChunkIndexProgress], None] | None = None,
         build_sparse_index: bool = True,
+        read_only: bool = False,
     ) -> None:
         self.catalog = catalog
         self.inbox = Path(inbox)
         self.embedding = embedding
         self.vector_store = vector_store
+        self.read_only = read_only
         self.chunk_size = chunk_size
         self.chunk_overlap = chunk_overlap
         self.progress_callback = progress_callback
@@ -678,6 +680,8 @@ class PaperChunkRetriever:
             for record_id, record in current.items()
             if str(record.get("metadata", {}).get("paper_id", "")) not in sources
         ]
+        if self.read_only and (changed_papers or removed_record_ids or rebuilt):
+            raise ValueError("Existing chunk index does not match this dataset; rebuild offline")
         deleted = 0
         embedded = 0
 
