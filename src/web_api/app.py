@@ -73,11 +73,17 @@ def create_app(settings: WebSettings | None = None, *, registry_factory: Any = R
                 return error_response("JSON_REQUIRED", "请使用JSON请求。", 415)
         session = request.cookies.get("scholarrag_session", "")
         fresh = re.fullmatch(r"[a-f0-9]{64}", session) is None
-        if fresh:
+        initialize = request.method == "GET" and request.url.path == "/api/v1/health"
+        owned_route = request.url.path.startswith("/api/v1/jobs/") or (
+            request.method == "POST" and request.url.path in {"/api/v1/answers", "/api/v1/paper-searches"}
+        )
+        if fresh and owned_route:
+            return error_response("SESSION_REQUIRED", "浏览器会话尚未建立或已失效，请刷新页面后重试。", 409)
+        if fresh and initialize:
             session = secrets.token_hex(32)
-        request.state.owner = hashlib.sha256(session.encode()).hexdigest()
+        request.state.owner = hashlib.sha256(session.encode()).hexdigest() if not fresh or initialize else ""
         response = await call_next(request)
-        if fresh:
+        if fresh and initialize:
             response.set_cookie("scholarrag_session", session, httponly=True,
                                 samesite="lax", max_age=604800, path="/api/v1")
         response.headers["Cache-Control"] = "no-store"

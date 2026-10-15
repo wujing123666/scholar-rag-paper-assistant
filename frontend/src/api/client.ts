@@ -1,4 +1,8 @@
 import type { AnswerJob, ApiHealth, Paper } from "./contracts";
+import type { PendingRequest } from "../storage/pending";
+export { createPendingStore, readPending, writePending, clearPending } from "../storage/pending";
+export type { PendingRequest } from "../storage/pending";
+export { createRequestId } from "./requestId";
 
 export class ApiFailure extends Error {
   constructor(message: string, public status = 0) { super(message); }
@@ -19,7 +23,7 @@ async function json(path: string, init: RequestInit = {}): Promise<unknown> {
   if (!response.ok) throw new ApiFailure(object(value) && typeof value.message === "string" ? value.message : "请求未能完成。", response.status);
   return value;
 }
-export async function loadBackend(): Promise<{ health: ApiHealth; papers: Paper[] }> {
+async function fetchBackend(): Promise<{ health: ApiHealth; papers: Paper[] }> {
   const health = await json("/health");
   if (!object(health) || health.ready !== true || typeof health.dataset_id !== "string" || typeof health.session_id !== "string")
     throw new ApiFailure("服务尚未就绪。");
@@ -32,27 +36,16 @@ export async function loadBackend(): Promise<{ health: ApiHealth; papers: Paper[
   return { health: health as ApiHealth, papers: library.papers as Paper[] };
 }
 
-export type PendingRequest = {
-  key: string; job_id: string | null; kind: "answer" | "search"; query: string; paper_ids: string[];
-  dataset_id: string; session_id: string; created_at: number;
-};
-const PENDING_KEY = "scholarrag.api.pending.v1";
-export function readPending(): PendingRequest | null {
-  try {
-    const value: unknown = JSON.parse(localStorage.getItem(PENDING_KEY) || "null");
-    if (!object(value) || typeof value.key !== "string" || !/^[a-zA-Z0-9_-]{16,80}$/.test(value.key) ||
-      !(value.job_id === null || typeof value.job_id === "string") || !["answer", "search"].includes(String(value.kind)) ||
-      typeof value.query !== "string" || value.query.length > 2000 || !Array.isArray(value.paper_ids) || value.paper_ids.length > 3 ||
-      !value.paper_ids.every(id => typeof id === "string") || typeof value.dataset_id !== "string" ||
-      typeof value.session_id !== "string" || typeof value.created_at !== "number") return null;
-    return value as PendingRequest;
-  } catch { return null; }
-}
-export function writePending(value: PendingRequest | null): boolean {
-  try {
-    if (value) localStorage.setItem(PENDING_KEY, JSON.stringify(value)); else localStorage.removeItem(PENDING_KEY);
-    return true;
-  } catch { return false; }
+let bootstrap: Promise<{ health: ApiHealth; papers: Paper[] }> | null = null;
+export function loadBackend(): Promise<{ health: ApiHealth; papers: Paper[] }> {
+  if (!bootstrap) {
+    // StrictMode/remounts share in-flight initialization, but retries do not cache failures.
+    // Web Locks also serialize first initialization across tabs when supported.
+    const locks = typeof navigator !== "undefined" ? navigator.locks : undefined;
+    bootstrap = (async () => locks ? await locks.request("scholarrag.api.bootstrap.v1", fetchBackend) : await fetchBackend())()
+      .finally(() => { bootstrap = null; });
+  }
+  return bootstrap;
 }
 function job(value: unknown, intent: PendingRequest): AnswerJob {
   if (!object(value) || typeof value.job_id !== "string" || value.dataset_id !== intent.dataset_id || value.kind !== intent.kind ||

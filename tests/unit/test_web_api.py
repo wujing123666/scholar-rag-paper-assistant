@@ -105,6 +105,27 @@ def test_http_idempotency_and_session_ownership(web):
     client.cookies.set("scholarrag_session", cookie)
 
 
+def test_static_requests_never_create_or_replace_api_session(web):
+    client, _, health = web
+    # The API cookie's path excludes these requests, even in the same browser.
+    assert "set-cookie" not in client.get("/").headers
+    assert "set-cookie" not in client.get("/assets/review-missing.js").headers
+    assert client.get("/api/v1/health").json()["session_id"] == health["session_id"]
+
+
+def test_only_health_initializes_a_missing_session(web):
+    client, registry, health = web
+    client.cookies.clear()
+    assert "set-cookie" not in client.get("/api/v1/papers").headers
+    missing = post(client, health)
+    assert missing.status_code == 409 and missing.json()["code"] == "SESSION_REQUIRED"
+    assert "set-cookie" not in missing.headers and registry.calls == 0
+    assert client.get("/api/v1/jobs/unknown").status_code == 409
+    renewed = client.get("/api/v1/health")
+    assert "set-cookie" in renewed.headers and renewed.json()["session_id"] != health["session_id"]
+    assert post(client, renewed.json()).status_code == 202
+
+
 @pytest.mark.parametrize("patch", [{"query": " "}, {"query": "x" * 2001}, {"paper_ids": ["unknown"]},
                                   {"paper_ids": ["a", "b", "c", "d"]}, {"settings_path": "secret"}])
 def test_invalid_request_does_not_reach_rag(web, patch):

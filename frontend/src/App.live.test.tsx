@@ -19,7 +19,7 @@ const answer: AnswerResult = {
 };
 const completed = (): AnswerJob => ({ job_id: "same-job", dataset_id: "api-test", kind: "answer", state: "completed", result: answer, error: null });
 beforeEach(() => {
-  window.history.replaceState({}, "", "/"); localStorage.clear(); api.run.mockReset();
+  window.history.replaceState({}, "", "/"); localStorage.clear(); sessionStorage.clear(); api.run.mockReset();
 });
 afterEach(cleanup);
 function submit() {

@@ -5,13 +5,13 @@ import {
   ShieldCheck, Upload, X,
 } from "lucide-react";
 import type { AnswerJob, AnswerResult, Citation, Paper, QuestionRecord, SearchResult } from "./api/contracts";
-import { ApiFailure, readPending, runRequest, writePending } from "./api/client";
+import { ApiFailure, createPendingStore, createRequestId, runRequest } from "./api/client";
 import type { PendingRequest } from "./api/client";
 import { useBackend } from "./api/useBackend";
 import AnswerView from "./components/AnswerView";
 import PdfReader from "./components/PdfReader";
 import { answerDemo, DATASET_ID, exampleQueries, papers as demoPapers, searchDemoPapers } from "./mocks/demo";
-import { loadHistory, saveHistory } from "./storage/history";
+import { appendHistory, clearHistory, loadHistory, saveHistory } from "./storage/history";
 
 type View = "workspace" | "library" | "import";
 type Mode = "answer" | "search";
@@ -56,28 +56,36 @@ export default function App() {
   const controller = useRef<AbortController | null>(null);
   const recoveredContext = useRef("");
   const [jobState, setJobState] = useState<AnswerJob["state"] | "submitting">("submitting");
+  const [checkpoint] = useState(() => createPendingStore());
   useEffect(() => {
     if (!datasetId) return;
-    setHistory(loadHistory(localStorage, historyContext)); setHistoryReadyKey(contextKey);
+    setHistory(loadHistory(undefined, historyContext)); setHistoryReadyKey(contextKey);
   }, [historyContext, datasetId, contextKey]);
   useEffect(() => {
-    if (datasetId && historyReadyKey === contextKey)
-      setStorageWarning(!saveHistory(history, localStorage, historyContext));
-  }, [history, historyContext, historyReadyKey, datasetId, contextKey]);
+    if (demoMode && datasetId && historyReadyKey === contextKey)
+      setStorageWarning(!saveHistory(history, undefined, historyContext));
+  }, [history, historyContext, historyReadyKey, datasetId, contextKey, demoMode]);
+  useEffect(() => {
+    if (demoMode || !datasetId) return;
+    const refreshHistory = () => setHistory(loadHistory(undefined, historyContext));
+    window.addEventListener("storage", refreshHistory);
+    return () => window.removeEventListener("storage", refreshHistory);
+  }, [demoMode, datasetId, historyContext]);
   useEffect(() => () => controller.current?.abort(), []);
   useEffect(() => {
     if (demoMode || !backend.data || recoveredContext.current === contextKey) return;
     recoveredContext.current = contextKey;
-    const intent = readPending();
+    const intent = checkpoint.read();
     if (!intent) return;
     if (intent.dataset_id !== datasetId || intent.session_id !== sessionId || Date.now() - intent.created_at > 6 * 3600_000 ||
       intent.paper_ids.some(id => !papers.some(p => p.paper_id === id))) {
-      writePending(null); setError("之前的任务属于其他资料库、会话或已超过恢复期限，未自动重新提交。"); return;
+      if (!checkpoint.clear(intent.key)) setStorageWarning(true);
+      setError("之前的任务属于其他资料库、会话或已超过恢复期限，未自动重新提交。"); return;
     }
     pending.current = intent; setMode(intent.kind === "search" ? "search" : "answer");
     setSubmittedQuery(intent.query); setSubmittedScope(intent.paper_ids); setWaitingForCurrent(true);
     void executeLive(intent, ++latestRequest.current);
-  }, [backend.data, contextKey, datasetId, sessionId, demoMode, papers]);
+  }, [backend.data, contextKey, datasetId, sessionId, demoMode, papers, checkpoint]);
 
   const examples = demoMode ? exampleQueries : papers.slice(0, 3).map(paper => ({
     paper_id: paper.paper_id, label: "理解论文方法", query: `请概括《${paper.title}》的核心方法。`,
@@ -89,23 +97,24 @@ export default function App() {
     if (inFlight.current) return;
     inFlight.current = true; setBusy(true); setError(""); setJobState("submitting");
     const abort = new AbortController(); controller.current = abort; pending.current = intent;
-    if (!writePending(intent)) setStorageWarning(true);
+    if (!checkpoint.write(intent)) setStorageWarning(true);
     try {
       const job = await runRequest(intent, progress => {
         intent.job_id = progress.job_id; setJobState(progress.state);
-        if (!writePending(intent)) setStorageWarning(true);
+        if (!checkpoint.write(intent)) setStorageWarning(true);
       }, abort.signal);
       if (job.state !== "completed" || !job.result) {
-        pending.current = null; writePending(null);
+        pending.current = null; if (!checkpoint.clear(intent.key)) setStorageWarning(true);
         throw new ApiFailure(job.error?.message || "任务未能完成，请重新提问。");
       }
       if (intent.kind === "answer") {
         const answer = job.result as AnswerResult;
         const record: QuestionRecord = { id: job.job_id, query: intent.query, paper_ids: intent.paper_ids,
           result: answer, dataset_id: datasetId, created_at: new Date().toISOString() };
-        const stored = loadHistory(localStorage, historyContext);
-        if (!saveHistory([record, ...stored.filter(item => item.id !== record.id)].slice(0, 20), localStorage, historyContext)) setStorageWarning(true);
-        setHistory(items => [record, ...items.filter(item => item.id !== record.id)].slice(0, 20));
+        const saved = appendHistory(record, historyContext);
+        if (!saved) setStorageWarning(true);
+        setHistory(items => saved ? loadHistory(undefined, historyContext) :
+          [record, ...items.filter(item => item.id !== record.id)].slice(0, 20));
         if (request === latestRequest.current) {
           setResult(answer); setActiveId(record.id); setQuestion("");
           if (answer.citations[0]) openCitation(answer.citations[0]);
@@ -113,11 +122,11 @@ export default function App() {
       } else if (request === latestRequest.current) {
         setSearchResults((job.result as SearchResult).papers); setQuestion("");
       }
-      pending.current = null; writePending(null);
+      pending.current = null; if (!checkpoint.clear(intent.key)) setStorageWarning(true);
     } catch (reason) {
       if (abort.signal.aborted) return;
       if (reason instanceof ApiFailure && [404, 409, 422, 429].includes(reason.status)) {
-        pending.current = null; writePending(null);
+        pending.current = null; if (!checkpoint.clear(intent.key)) setStorageWarning(true);
       }
       setError(reason instanceof Error ? reason.message : "请求未能完成。");
     } finally { inFlight.current = false; setBusy(false); setWaitingForCurrent(false); }
@@ -182,12 +191,15 @@ export default function App() {
     if (!demoMode && (!backend.data || inFlight.current)) return;
     if (!demoMode && pending.current) { setError("还有任务未确认结果，请先恢复任务，避免重复调用。"); return; }
     if (query.length > 2000) { setError("问题请控制在 2000 字以内。"); return; }
+    let key: string;
+    try { key = createRequestId(); }
+    catch (reason) { setError(reason instanceof Error ? reason.message : "无法创建请求编号，请重试。"); return; }
     const request = ++latestRequest.current;
     setBusy(true); setWaitingForCurrent(true); setError(""); setScopeOpen(false); setSubmittedQuery(query); setSubmittedScope([...scope]);
     setResult(null); setSearchResults(null); setActiveId(null); setActiveCitation(null); setActivePaper(null);
     resetWorkspacePosition();
     if (!demoMode) {
-      const intent: PendingRequest = { key: crypto.randomUUID(), job_id: null, kind: mode === "answer" ? "answer" : "search",
+      const intent: PendingRequest = { key, job_id: null, kind: mode === "answer" ? "answer" : "search",
         query, paper_ids: [...scope], dataset_id: datasetId, session_id: sessionId, created_at: Date.now() };
       await executeLive(intent, request); return;
     }
@@ -201,7 +213,7 @@ export default function App() {
         const answer = answerDemo({ query, paper_ids: scope });
         setResult(answer);
         const record: QuestionRecord = {
-          id: crypto.randomUUID(), query, paper_ids: [...scope], result: answer,
+          id: key, query, paper_ids: [...scope], result: answer,
           created_at: new Date().toISOString(), dataset_id: DATASET_ID,
         };
         setHistory(items => [record, ...items].slice(0, 20)); setActiveId(record.id);
@@ -235,7 +247,10 @@ export default function App() {
           title={record.query}><span className="history-dot" /><span>{record.query}</span></button>) :
           <p className="history-empty">你的问题记录会保存在<br />当前浏览器中。</p>}
       </div>
-      {history.length > 0 && <button className="clear-history" onClick={() => { setHistory([]); setActiveId(null); }}>{demoMode ? "清空示例记录" : "清空本地记录"}</button>}
+      {history.length > 0 && <button className="clear-history" onClick={() => {
+        if (!clearHistory(historyContext)) setStorageWarning(true);
+        setHistory([]); setActiveId(null);
+      }}>{demoMode ? "清空示例记录" : "清空本地记录"}</button>}
       <div className="sidebar-bottom"><div className="dataset-mark"><span className="dataset-dot" /><div><strong>{demoMode ? "公开示例资料库" : backend.data?.health.label || "正在连接资料库"}</strong><small>{demoMode ? "3 份原创合成文档" : `${papers.length} 篇论文 · 只读检索`}</small></div></div>
         <button className="help-button" onClick={() => help.current?.showModal()}><Settings2 size={16} />使用说明<ArrowRight size={14} /></button>
       </div>
@@ -258,7 +273,7 @@ export default function App() {
       {!demoMode && backend.error && <div className="connection-error" role="alert">{backend.error}<button onClick={backend.retry}>重新连接</button></div>}
       {error && !submittedQuery && <div className="connection-error" role="alert">{error}</div>}
       {!demoMode && pending.current && !busy && <div className="task-recovery" role="status">有一个任务尚未确认结果。<button onClick={resumeTask}>恢复任务</button></div>}
-      {storageWarning && <p className="storage-warning" role="status">浏览器无法保存记录，关闭页面后本次示例可能丢失。</p>}
+      {storageWarning && <p className="storage-warning" role="status">浏览器无法保存记录，关闭页面后记录或任务恢复信息可能丢失。</p>}
 
       {view === "workspace" ? <div className={`workspace ${readerOpen ? "" : "reader-collapsed"}`}>
         <main className="conversation">
