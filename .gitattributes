@@ -1,3 +1,7 @@
 # PDFs may contain only ASCII bytes; never normalize their line endings.
 *.pdf binary
 *.PDF binary
+
+# Generated contracts must be identical on Windows and Linux.
+frontend/openapi.json text eol=lf
+frontend/src/api/generated.ts text eol=lf
