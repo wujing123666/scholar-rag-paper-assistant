@@ -66,3 +66,65 @@ def test_paper_reranker_rejects_invalid_scores(scores):
 
     with pytest.raises(ValueError, match="Cross-Encoder"):
         reranker.rerank("query", candidates, top_k=2)
+
+
+def test_shared_reranker_serializes_lazy_model_inference():
+    import threading
+    from concurrent.futures import ThreadPoolExecutor
+
+    from src.paper_assistant.paper_reranker import LazySynchronizedCrossEncoder
+
+    class LazyModel:
+        def __init__(self):
+            self.barrier = threading.Barrier(2)
+            self.state_lock = threading.Lock()
+            self.active = 0
+            self.peak = 0
+
+        def rerank(self, query, documents, batch_size=64):
+            with self.state_lock:
+                self.active += 1
+                self.peak = max(self.peak, self.active)
+            try:
+                # A broken wrapper allows both lazy inference bodies through.
+                # Correct serialization makes the first wait expire, then lets
+                # the next call proceed after the first iterator is exhausted.
+                try:
+                    self.barrier.wait(timeout=0.2)
+                except threading.BrokenBarrierError:
+                    pass
+                yield 0.7 if query == "first" else 0.2
+            finally:
+                with self.state_lock:
+                    self.active -= 1
+
+    model = LazyModel()
+    reranker = LazySynchronizedCrossEncoder("fake-no-network")
+    reranker._model = model
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        first = executor.submit(lambda: list(reranker.rerank("first", ["doc"])))
+        second = executor.submit(lambda: list(reranker.rerank("second", ["doc"])))
+        assert first.result(timeout=5) == [0.7]
+        assert second.result(timeout=5) == [0.2]
+    assert model.peak == 1
+    assert model.active == 0
+
+
+def test_lazy_inference_failure_releases_shared_reranker_lock():
+    from src.paper_assistant.paper_reranker import LazySynchronizedCrossEncoder
+
+    class LazyModel:
+        def rerank(self, query, documents, batch_size=64):
+            if query == "fail":
+                raise RuntimeError("simulated lazy inference failure")
+            yield 0.5
+
+    reranker = LazySynchronizedCrossEncoder("fake-no-network")
+    reranker._model = LazyModel()
+    with pytest.raises(RuntimeError, match="lazy inference failure"):
+        list(reranker.rerank("fail", ["doc"]))
+    from concurrent.futures import ThreadPoolExecutor
+
+    with ThreadPoolExecutor(max_workers=1) as executor:
+        result = executor.submit(lambda: list(reranker.rerank("ok", ["doc"])))
+        assert result.result(timeout=5) == [0.5]

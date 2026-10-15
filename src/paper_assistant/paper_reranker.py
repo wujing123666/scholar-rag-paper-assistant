@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import math
 import threading
+from collections.abc import Iterable
 from dataclasses import replace
 from pathlib import Path
 from typing import Protocol
@@ -15,7 +16,7 @@ from src.paper_assistant.retriever import PaperSearchResult
 class CrossEncoderModel(Protocol):
     def rerank(
         self, query: str, documents: list[str], batch_size: int = 64
-    ) -> object: ...
+    ) -> Iterable[float]: ...
 
 
 class LazySynchronizedCrossEncoder:
@@ -34,7 +35,7 @@ class LazySynchronizedCrossEncoder:
 
     def rerank(
         self, query: str, documents: list[str], batch_size: int = 64
-    ) -> object:
+    ) -> list[float]:
         with self._lock:
             if self._model is None:
                 from fastembed.rerank.cross_encoder import TextCrossEncoder
@@ -43,10 +44,14 @@ class LazySynchronizedCrossEncoder:
                     model_name=self.model_name,
                     cache_dir=str(self.cache_dir) if self.cache_dir else None,
                 )
-            return self._model.rerank(
-                query,
-                documents,
-                batch_size=batch_size,
+            # FastEmbed yields scores lazily: inference happens while consuming
+            # the iterator, so it must finish before releasing the shared lock.
+            return list(
+                self._model.rerank(
+                    query,
+                    documents,
+                    batch_size=batch_size,
+                )
             )
 
 
