@@ -6,6 +6,20 @@ export type HistoryContext = { datasetId: string; papers: Paper[]; source: "demo
 const DEMO_CONTEXT: HistoryContext = { datasetId: DATASET_ID, papers, source: "demo" };
 const keyFor = (context: HistoryContext) => context.source === "demo" ? KEY :
   `scholarrag.api.history.v1:${context.datasetId}:${context.sessionId}`;
+type HistoryReader = Pick<Storage, "getItem"> & Partial<Pick<Storage, "length" | "key">>;
+export function getHistoryStorage(): Storage | null {
+  try { return window.localStorage; } catch { return null; }
+}
+const recordKey = (context: HistoryContext, id: string) => `${keyFor(context)}:record:${encodeURIComponent(id)}`;
+function recordKeys(storage: HistoryReader, context: HistoryContext): string[] {
+  if (typeof storage.length !== "number" || !storage.key) return [];
+  const keys: string[] = [];
+  for (let index = 0; index < storage.length; index++) {
+    const key = storage.key(index);
+    if (key?.startsWith(`${keyFor(context)}:record:`)) keys.push(key);
+  }
+  return keys;
+}
 const object = (value: unknown): value is Record<string, unknown> =>
   !!value && typeof value === "object" && !Array.isArray(value);
 const strings = (value: unknown): value is string[] => Array.isArray(value) && value.every(v => typeof v === "string");
@@ -36,15 +50,54 @@ function validRecord(item: unknown, context: HistoryContext): item is QuestionRe
     strings(claim.citations) && claim.citations.every(id => ids.has(id)));
 }
 
-export function loadHistory(storage: Pick<Storage, "getItem"> = localStorage, context: HistoryContext = DEMO_CONTEXT): QuestionRecord[] {
+export function loadHistory(storage: HistoryReader | null = getHistoryStorage(), context: HistoryContext = DEMO_CONTEXT): QuestionRecord[] {
   try {
-    const parsed: unknown = JSON.parse(storage.getItem(keyFor(context)) || "[]");
-    return Array.isArray(parsed) ? parsed.filter(item => validRecord(item, context)).slice(0, LIMIT) : [];
+    if (!storage) return [];
+    let parsed: unknown = [];
+    try { parsed = JSON.parse(storage.getItem(keyFor(context)) || "[]"); } catch { /* Legacy snapshot may be damaged. */ }
+    const legacy = Array.isArray(parsed) ? parsed.filter(item => validRecord(item, context)).slice(0, LIMIT) : [];
+    if (context.source === "demo") return legacy;
+    const records = new Map<string, QuestionRecord>(legacy.map(item => [item.id, item]));
+    for (const key of recordKeys(storage, context)) {
+      try {
+        const item: unknown = JSON.parse(storage.getItem(key) || "null");
+        if (validRecord(item, context) && key === recordKey(context, item.id)) records.set(item.id, item);
+      } catch { /* Ignore a damaged record without losing unrelated answers. */ }
+    }
+    return [...records.values()].sort((a, b) => Date.parse(b.created_at) - Date.parse(a.created_at) || b.id.localeCompare(a.id)).slice(0, LIMIT);
   } catch { return []; }
 }
-export function saveHistory(records: QuestionRecord[], storage: Pick<Storage, "setItem"> = localStorage, context: HistoryContext = DEMO_CONTEXT): boolean {
+export function saveHistory(records: QuestionRecord[], storage: Pick<Storage, "setItem"> | null = getHistoryStorage(), context: HistoryContext = DEMO_CONTEXT): boolean {
   try {
+    if (!storage) return false;
     storage.setItem(keyFor(context), JSON.stringify(records.filter(item => validRecord(item, context)).slice(0, LIMIT)));
+    return true;
+  } catch { return false; }
+}
+
+/** Each API answer owns one key; stale tab snapshots cannot replace another answer. */
+export function appendHistory(record: QuestionRecord, context: HistoryContext, storage: Storage | null = getHistoryStorage()): boolean {
+  try {
+    if (!storage || !validRecord(record, context)) return false;
+    if (context.source === "demo") return saveHistory([record, ...loadHistory(storage, context)], storage, context);
+    const existing = loadHistory({ getItem: key => storage.getItem(key) }, context);
+    storage.setItem(recordKey(context, record.id), JSON.stringify(record));
+    for (const previous of existing) {
+      const key = recordKey(context, previous.id);
+      if (storage.getItem(key) === null) storage.setItem(key, JSON.stringify(previous));
+    }
+    storage.removeItem(keyFor(context));
+    const candidates = recordKeys(storage, context);
+    const keep = new Set(loadHistory(storage, context).map(item => recordKey(context, item.id)));
+    for (const key of candidates) if (!keep.has(key)) storage.removeItem(key);
+    return true;
+  } catch { return false; }
+}
+export function clearHistory(context: HistoryContext, storage: Storage | null = getHistoryStorage()): boolean {
+  try {
+    if (!storage) return false;
+    storage.removeItem(keyFor(context));
+    for (const key of recordKeys(storage, context)) storage.removeItem(key);
     return true;
   } catch { return false; }
 }
