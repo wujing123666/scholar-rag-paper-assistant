@@ -30,7 +30,9 @@ jobs:
       - name: Install tested dependencies
         run: python -m pip install -e ".[dev,rerank]" -c requirements-ci.txt
       - name: Unit tests (no external model credentials)
-        run: python -m pytest tests/unit -q --basetemp=tmp/ci-pytest
+        run: |
+          python -c "from pathlib import Path; Path('tmp').mkdir(exist_ok=True)"
+          python -m pytest tests/unit -q --basetemp=tmp/ci-pytest
       - name: Public dataset and source-page smoke
         run: python -m scripts.check_paper_demo --output tmp/ci-demo.json
       - name: Recalculate published metrics
