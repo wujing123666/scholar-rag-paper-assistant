@@ -7,7 +7,7 @@ import threading
 import time
 import uuid
 from collections.abc import Callable
-from concurrent.futures import Future, ThreadPoolExecutor
+from concurrent.futures import Future, InvalidStateError, ThreadPoolExecutor
 from dataclasses import asdict, dataclass
 from datetime import UTC, datetime
 from pathlib import Path
@@ -136,6 +136,18 @@ class RequestGate:
         **kwargs: Any,
     ) -> RequestExecution[T]:
         """Submit one task, wait for it, and return result plus queue diagnostics."""
+        return self.submit(function, *args, result_classifier=result_classifier, **kwargs).result()
+
+    def submit(
+        self,
+        function: Callable[..., T],
+        /,
+        *args: Any,
+        result_classifier: Callable[[T], tuple[str | None, str | None]] | None = None,
+        on_start: Callable[[], None] | None = None,
+        **kwargs: Any,
+    ) -> Future[RequestExecution[T]]:
+        """Admit immediately using the same bounded executor as ``run``."""
         request_id = uuid.uuid4().hex
         submitted_wall = datetime.now(UTC).isoformat()
         submitted_at = self._monotonic()
@@ -166,6 +178,7 @@ class RequestGate:
                 submitted_wall,
                 submitted_at,
                 result_classifier,
+                on_start,
             )
         except Exception:
             with self._state_lock:
@@ -173,16 +186,39 @@ class RequestGate:
             self._capacity.release()
             raise
 
-        outcome = future.result()
-        if outcome.error is not None:
-            if outcome.record.status == "queue_timeout":
-                raise RequestQueueWaitTimeoutError(
-                    "request expired while waiting in the queue", outcome.record
-                ) from outcome.error
-            raise RequestExecutionError(
-                "admitted request failed", outcome.record
-            ) from outcome.error
-        return RequestExecution(cast(T, outcome.value), outcome.record)
+        public: Future[RequestExecution[T]] = Future()
+
+        def completed(raw: Future[_TaskOutcome[T]]) -> None:
+            if raw.cancelled():
+                # Cancelled queued work never enters _execute's finally block.
+                with self._state_lock:
+                    self._queued -= 1
+                self._capacity.release()
+                self._write_record(self._new_record(
+                    request_id=request_id, submitted_at=submitted_wall,
+                    status="cancelled", queue_wait=self._monotonic() - submitted_at,
+                    execution=0.0, total=self._monotonic() - submitted_at,
+                ))
+                public.cancel()
+                return
+            try:
+                outcome = raw.result()
+                if outcome.error is not None:
+                    error_class = (RequestQueueWaitTimeoutError if outcome.record.status == "queue_timeout"
+                                   else RequestExecutionError)
+                    raise error_class("admitted request did not complete", outcome.record) from outcome.error
+                public.set_result(RequestExecution(cast(T, outcome.value), outcome.record))
+            except InvalidStateError:
+                pass  # Caller stopped waiting; running work still owns its capacity.
+            except BaseException as error:
+                try:
+                    public.set_exception(error)
+                except InvalidStateError:
+                    pass
+
+        public.add_done_callback(lambda done: future.cancel() if done.cancelled() else None)
+        future.add_done_callback(completed)
+        return public
 
     def snapshot(self) -> RequestGateSnapshot:
         with self._state_lock:
@@ -210,6 +246,7 @@ class RequestGate:
         submitted_wall: str,
         submitted_at: float,
         result_classifier: Callable[[T], tuple[str | None, str | None]] | None,
+        on_start: Callable[[], None] | None,
     ) -> _TaskOutcome[T]:
         started_at = self._monotonic()
         queue_wait = max(0.0, started_at - submitted_at)
@@ -232,6 +269,8 @@ class RequestGate:
                     self._queue_timeouts += 1
                 return _TaskOutcome(None, error, record)
             try:
+                if on_start is not None:
+                    on_start()
                 value = function(*args, **kwargs)
             except Exception as error:
                 finished_at = self._monotonic()

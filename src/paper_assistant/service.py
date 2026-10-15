@@ -88,6 +88,7 @@ class PaperAssistantConfig:
     claim_second_judge_policy: str = "risk_based"
     claim_cache_path: Path = Path("data/cache/claim_judgements.sqlite3")
     disable_claim_cache: bool = False
+    read_only_indexes: bool = False
     retry_policy: RetryPolicy = field(default_factory=RetryPolicy)
 
     def validate(self) -> None:
@@ -894,8 +895,11 @@ class PaperAssistantService:
 
 def build_paper_assistant_service(
     config: PaperAssistantConfig,
+    *,
+    store_factory: Callable[..., Any] | None = None,
 ) -> PaperAssistantService:
     """Build a service whose answer-only dependencies are loaded on first use."""
+    store_factory = store_factory or ChromaStore
     config.validate()
     catalog = PaperCatalog.from_csv(config.catalog_path)
     paper_reranker = _build_paper_reranker(config)
@@ -906,7 +910,7 @@ def build_paper_assistant_service(
     else:
         try:
             embedding = _build_qwen_embedding(config)
-            profile_store = ChromaStore(
+            profile_store = store_factory(
                 persist_directory=config.chroma_path,
                 collection_name=DEFAULT_PAPER_COLLECTION,
                 mode=config.chroma_mode,
@@ -914,7 +918,9 @@ def build_paper_assistant_service(
                 port=config.chroma_port,
                 ssl=config.chroma_ssl,
             )
-            dense = PaperDenseRetriever(catalog, embedding, profile_store)
+            dense = PaperDenseRetriever(
+                catalog, embedding, profile_store, **({"read_only": True} if config.read_only_indexes else {})
+            )
             paper_retriever = (
                 dense
                 if config.retriever == "dense"
@@ -923,7 +929,7 @@ def build_paper_assistant_service(
                 )
             )
         except Exception as error:
-            if config.retriever != "hybrid":
+            if config.retriever != "hybrid" or config.read_only_indexes:
                 raise
             paper_retriever = PaperBM25Retriever(catalog)
             paper_fallback = (
@@ -978,7 +984,7 @@ def build_paper_assistant_service(
     def load_answer_dependencies() -> PaperAnswerDependencies:
         state = load_llms()
         answer_embedding = embedding or _build_qwen_embedding(config)
-        chunk_store = ChromaStore(
+        chunk_store = store_factory(
             persist_directory=config.chroma_path,
             collection_name=DEFAULT_CHUNK_COLLECTION,
             mode=config.chroma_mode,
@@ -993,6 +999,7 @@ def build_paper_assistant_service(
             chunk_store,
             chunk_size=config.chunk_size,
             chunk_overlap=config.chunk_overlap,
+            **({"read_only": True} if config.read_only_indexes else {}),
         )
         chunk_reranker = None
         if config.chunk_reranker == "fastembed":
