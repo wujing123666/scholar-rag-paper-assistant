@@ -1,0 +1,19 @@
+# Direct dependency baseline for Python 3.12; used as pip constraints, not a full transitive lock.
+# These versions are exercised locally. CI must pass on GitHub before its badge is claimed green.
+pyyaml==6.0.3
+langchain-text-splitters==1.1.2
+langchain-community==0.3.31
+chromadb==1.5.9
+mcp==1.30.0
+jieba==0.42.1
+markitdown==0.1.8
+pymupdf==1.28.2
+streamlit==1.64.0
+ragas==0.4.3
+datasets==5.0.1
+openai==1.109.1
+fastembed==0.8.1
+pytest==9.1.1
+pytest-cov==7.1.0
+pytest-asyncio==1.4.0
+pytest-mock==3.15.1

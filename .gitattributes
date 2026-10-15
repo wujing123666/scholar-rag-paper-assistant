@@ -1,0 +1,3 @@
+# PDFs may contain only ASCII bytes; never normalize their line endings.
+*.pdf binary
+*.PDF binary

@@ -1,0 +1,6 @@
+{"id":"demo_c01","query":"How does DemoMesh fill missing readings?","expected_paper_id":"demo_mesh","relevant_pages":[1],"evidence_terms":["linear interpolation","predicted residual"],"min_evidence_terms":2}
+{"id":"demo_c02","query":"What data does DemoMesh evaluate on?","expected_paper_id":"demo_mesh","relevant_pages":[2],"evidence_terms":["ToyGrid","twelve timestamps"],"min_evidence_terms":2}
+{"id":"demo_c03","query":"How does DemoRecruit select participants?","expected_paper_id":"demo_recruit","relevant_pages":[1],"evidence_terms":["newly covered cells","payment"],"min_evidence_terms":2}
+{"id":"demo_c04","query":"When does DemoRecruit stop?","expected_paper_id":"demo_recruit","relevant_pages":[1],"evidence_terms":["no affordable participant","new cell"],"min_evidence_terms":2}
+{"id":"demo_c05","query":"What does the DemoShield server receive?","expected_paper_id":"demo_privacy","relevant_pages":[1],"evidence_terms":["only its noisy value","average"],"min_evidence_terms":2}
+{"id":"demo_c06","query":"What limits DemoShield utility?","expected_paper_id":"demo_privacy","relevant_pages":[2],"evidence_terms":["Increasing noise","small number"],"min_evidence_terms":2}
